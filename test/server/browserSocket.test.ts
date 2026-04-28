@@ -235,6 +235,42 @@ describe('attachBrowserSocket bang command RPCs', () => {
   });
 });
 
+describe('attachBrowserSocket fs RPC wrappers', () => {
+  it('forwards read directory requests through the bounded webui RPC', async () => {
+    const result = { entries: [{ name: 'src', isDirectory: true }] };
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue(result);
+    const { ws } = await makeHarness(request);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 30, method: 'webui/fs/readDirectory', params: { path: ' /work/project ' } }));
+    const response = await nextMessage(ws);
+
+    expect(request).toHaveBeenCalledWith('fs/readDirectory', { path: '/work/project' });
+    expect(response).toEqual({ type: 'rpc/result', id: 30, result });
+  });
+
+  it('creates files by writing empty base64 data', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ ok: true });
+    const { ws } = await makeHarness(request);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 31, method: 'webui/fs/createFile', params: { path: '/work/project/new.txt' } }));
+    const response = await nextMessage(ws);
+
+    expect(request).toHaveBeenCalledWith('fs/writeFile', { path: '/work/project/new.txt', dataBase64: '' });
+    expect(response).toEqual({ type: 'rpc/result', id: 31, result: { ok: true } });
+  });
+
+  it('rejects write file requests without string base64 data', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws } = await makeHarness(request);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 32, method: 'webui/fs/writeFile', params: { path: '/work/project/file.txt', dataBase64: 42 } }));
+    const response = await nextMessage(ws);
+
+    expect(request).not.toHaveBeenCalled();
+    expect(response).toEqual({ type: 'rpc/error', id: 32, error: 'dataBase64 is required' });
+  });
+});
+
 describe('attachBrowserSocket queue and turn RPCs', () => {
   it('enqueues, updates, and removes queued messages', async () => {
     const request = vi.fn<CodexAppServer['request']>();

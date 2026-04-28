@@ -7,6 +7,7 @@ import { CodexAppServer } from './appServer.js';
 import { createAuthToken, authCookie, hashToken, isTokenValid, parseTokenFromCookie } from './auth.js';
 import { attachBrowserSocket } from './browserSocket.js';
 import { readConfig } from './config.js';
+import { resolveExistingPathInsideRoot, resolveWritablePathInsideRoot } from './fileTransfer.js';
 import { HostStateStore } from './hostState.js';
 import { logError, logInfo } from './logger.js';
 
@@ -33,6 +34,45 @@ function authorized(req: express.Request): boolean {
   const cookieToken = parseTokenFromCookie(req.headers.cookie);
   return isTokenValid(token, queryToken) || isTokenValid(token, cookieToken);
 }
+
+function getQueryPath(req: express.Request): string | null {
+  return typeof req.query.path === 'string' && req.query.path.trim() ? req.query.path : null;
+}
+
+function getActiveCwd(): string | null {
+  return stateStore.read().activeCwd;
+}
+
+app.get('/api/download', async (req, res) => {
+  if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });
+  const activeCwd = getActiveCwd();
+  if (!activeCwd) return res.status(409).json({ error: 'no active cwd' });
+  const filePath = getQueryPath(req);
+  if (!filePath) return res.status(400).json({ error: 'path is required' });
+
+  try {
+    const resolved = await resolveExistingPathInsideRoot(activeCwd, filePath);
+    return res.download(resolved);
+  } catch (error) {
+    return res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
+
+app.post('/api/upload', express.raw({ type: 'application/octet-stream', limit: '50mb' }), async (req, res) => {
+  if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });
+  const activeCwd = getActiveCwd();
+  if (!activeCwd) return res.status(409).json({ error: 'no active cwd' });
+  const filePath = getQueryPath(req);
+  if (!filePath) return res.status(400).json({ error: 'path is required' });
+
+  try {
+    const resolved = await resolveWritablePathInsideRoot(activeCwd, filePath);
+    await fs.promises.writeFile(resolved, Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0));
+    return res.json({ ok: true });
+  } catch (error) {
+    return res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
+  }
+});
 
 app.use(express.json({ limit: '2mb' }));
 

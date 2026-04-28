@@ -2,6 +2,7 @@
 
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
+import { Simulate } from 'react-dom/test-utils';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import InputBox from '../../src/components/InputBox';
 
@@ -9,6 +10,30 @@ import InputBox from '../../src/components/InputBox';
 
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
+
+function deferred<T>() {
+  let resolve: (value: T) => void = () => undefined;
+  const promise = new Promise<T>((done) => {
+    resolve = done;
+  });
+  return { promise, resolve };
+}
+
+function controllableThenable<T>() {
+  let resolveHandler: ((value: T) => unknown) | null = null;
+  const promise = {
+    then(resolve: (value: T) => unknown) {
+      resolveHandler = resolve;
+      return { catch: () => undefined };
+    },
+  } as unknown as Promise<T>;
+  return {
+    promise,
+    resolve(value: T) {
+      resolveHandler?.(value);
+    },
+  };
+}
 
 function renderInputBox(overrides: Partial<React.ComponentProps<typeof InputBox>> = {}) {
   container = document.createElement('div');
@@ -104,5 +129,30 @@ describe('InputBox', () => {
     expect(dispatch).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'webui-bang-output' }));
     expect(textarea?.value).toBe('!pwd');
     expect(document.querySelector('.input-error')?.textContent).toBe('! commands are disabled while Codex is working');
+  });
+
+  it('ignores stale file autocomplete responses after draft no longer matches', async () => {
+    const readDirectory = controllableThenable<unknown>();
+    const rpc = vi.fn((method: string) => {
+      if (method === 'webui/fs/readDirectory') return readDirectory.promise;
+      return Promise.reject(new Error(`unexpected method ${method}`));
+    });
+    renderInputBox({ rpc, draftOverride: '@', activeCwd: '/repo' });
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const textarea = document.querySelector<HTMLTextAreaElement>('textarea');
+    await act(async () => {
+      if (!textarea) throw new Error('missing textarea');
+      const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype, 'value')?.set;
+      valueSetter?.call(textarea, 'normal text');
+      Simulate.change(textarea);
+      readDirectory.resolve({ entries: [{ name: 'stale.txt', path: '/repo/stale.txt', isFile: true }] });
+    });
+
+    expect(document.querySelector('.file-autocomplete')).toBeNull();
   });
 });

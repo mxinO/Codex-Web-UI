@@ -78,6 +78,11 @@ function getRequiredString(params: unknown, key: string): string | null {
   return value.length > 0 ? value : null;
 }
 
+function getString(params: unknown, key: string): string | null {
+  if (!isRecord(params) || typeof params[key] !== 'string') return null;
+  return params[key];
+}
+
 function getStringPath(value: unknown, path: string[]): string | null {
   let current = value;
   for (const key of path) {
@@ -346,6 +351,83 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             buildBangCommandParams(command, state.activeCwd, deps.config.commandTimeoutMs, deps.config.commandOutputBytes),
             deps.config.commandTimeoutMs + 2_000,
           );
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/fs/readDirectory') {
+          const filePath = getRequiredString(request.params, 'path');
+          if (!filePath) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+            return;
+          }
+
+          const result = await deps.codex.request('fs/readDirectory', { path: filePath });
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/fs/readFile') {
+          const filePath = getRequiredString(request.params, 'path');
+          if (!filePath) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+            return;
+          }
+
+          const result = await deps.codex.request('fs/readFile', { path: filePath });
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/fs/writeFile') {
+          const filePath = getRequiredString(request.params, 'path');
+          const dataBase64 = getString(request.params, 'dataBase64');
+          if (!filePath) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+            return;
+          }
+          if (dataBase64 === null) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'dataBase64 is required' });
+            return;
+          }
+
+          const result = await deps.codex.request('fs/writeFile', { path: filePath, dataBase64 });
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/fs/createDirectory') {
+          const filePath = getRequiredString(request.params, 'path');
+          if (!filePath) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+            return;
+          }
+
+          const result = await deps.codex.request('fs/createDirectory', { path: filePath });
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/fs/createFile') {
+          const filePath = getRequiredString(request.params, 'path');
+          if (!filePath) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+            return;
+          }
+
+          const result = await deps.codex.request('fs/writeFile', { path: filePath, dataBase64: '' });
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/fs/getMetadata') {
+          const filePath = getRequiredString(request.params, 'path');
+          if (!filePath) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+            return;
+          }
+
+          const result = await deps.codex.request('fs/getMetadata', { path: filePath });
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }

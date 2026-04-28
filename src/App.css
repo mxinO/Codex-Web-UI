@@ -138,6 +138,22 @@ body {
   flex-direction: column;
 }
 
+.workspace-layout {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  overflow: hidden;
+}
+
+.workspace-main {
+  position: relative;
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
 .disconnect-banner {
   padding: 10px 16px;
   border-bottom: 1px solid var(--border);
@@ -328,6 +344,53 @@ body {
   background: var(--bg-primary);
 }
 
+.file-autocomplete {
+  grid-column: 1 / -1;
+  max-height: 180px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-secondary);
+}
+
+.file-autocomplete-row {
+  display: grid;
+  grid-template-columns: minmax(96px, 0.4fr) minmax(0, 1fr);
+  gap: 8px;
+  width: 100%;
+  min-height: 28px;
+  padding: 4px 8px;
+  border: 0;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.file-autocomplete-row:last-child {
+  border-bottom: 0;
+}
+
+.file-autocomplete-row:hover,
+.file-autocomplete-row:focus-visible {
+  background: var(--bg-hover);
+}
+
+.file-autocomplete-row span,
+.file-autocomplete-row small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-autocomplete-row small {
+  color: var(--text-secondary);
+}
+
 .input-panel textarea {
   grid-column: 1 / 2;
   width: 100%;
@@ -503,6 +566,234 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.file-explorer {
+  flex: 0 0 300px;
+  width: 300px;
+  min-width: 240px;
+  max-width: 36vw;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: var(--bg-secondary);
+  overflow: hidden;
+}
+
+.file-explorer-header,
+.file-toolbar,
+.file-current {
+  flex: 0 0 auto;
+  min-width: 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.file-explorer-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+}
+
+.file-root {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.file-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px;
+}
+
+.file-action,
+.file-compact {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  text-decoration: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.file-action {
+  min-height: 28px;
+  padding: 0 8px;
+}
+
+.file-compact {
+  width: 34px;
+  height: 24px;
+  padding: 0 4px;
+}
+
+.file-action:hover:not(:disabled),
+.file-action:focus-visible:not(:disabled),
+.file-compact:hover,
+.file-compact:focus-visible {
+  background: var(--bg-hover);
+}
+
+.file-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.file-upload {
+  position: relative;
+  overflow: hidden;
+}
+
+.file-upload input {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+.file-current {
+  padding: 6px 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-error,
+.file-empty {
+  padding: 8px;
+  font-size: 12px;
+}
+
+.file-error {
+  flex: 0 0 auto;
+  color: var(--red);
+  overflow-wrap: anywhere;
+}
+
+.file-empty {
+  color: var(--text-secondary);
+}
+
+.file-list {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.file-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  min-height: 30px;
+  padding: 2px 6px;
+  gap: 4px;
+}
+
+.file-row:hover {
+  background: var(--bg-hover);
+}
+
+.file-name {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  min-height: 26px;
+  padding: 0 4px;
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.file-name--directory {
+  color: var(--text-accent);
+}
+
+.file-kind {
+  color: var(--text-secondary);
+  font-size: 10px;
+  text-transform: uppercase;
+}
+
+.file-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.file-editor-modal {
+  width: min(1160px, 94vw);
+  height: min(820px, 88vh);
+  min-height: 360px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 12px 32px rgb(0 0 0 / 28%);
+  overflow: hidden;
+}
+
+.file-editor-header {
+  text-transform: none;
+}
+
+.file-editor-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-editor-actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+}
+
+.file-editor-error {
+  flex: 0 0 auto;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--red);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.file-editor-body {
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .modal-overlay {
@@ -687,6 +978,18 @@ body {
     padding: 0 10px;
   }
 
+  .workspace-layout {
+    flex-direction: column;
+  }
+
+  .file-explorer {
+    flex: 0 0 min(34vh, 260px);
+    width: 100%;
+    max-width: none;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+
   .cwd {
     display: none;
   }
@@ -717,9 +1020,21 @@ body {
     grid-template-columns: minmax(0, 1fr);
   }
 
+  .input-panel textarea {
+    grid-column: 1 / -1;
+  }
+
   .input-actions {
     grid-column: 1 / -1;
     justify-content: flex-end;
+  }
+
+  .file-autocomplete-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .file-autocomplete-row small {
+    display: none;
   }
 }
 

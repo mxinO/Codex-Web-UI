@@ -3,6 +3,8 @@ import AuthOverlay from './components/AuthOverlay';
 import ChatTimeline from './components/ChatTimeline';
 import CwdPicker from './components/CwdPicker';
 import DetailModal from './components/DetailModal';
+import FileEditorModal from './components/FileEditorModal';
+import FileExplorer from './components/FileExplorer';
 import Header from './components/Header';
 import InputBox from './components/InputBox';
 import QueueCard from './components/QueueCard';
@@ -14,6 +16,60 @@ import { useTheme } from './hooks/useTheme';
 import { appendEphemeralBangItem, bangOutputEventToTimelineItem, getBangCommandOutputDetail } from './lib/bangCommands';
 import type { TimelineItem } from './lib/timeline';
 import type { CodexThread } from './types/codex';
+
+interface OpenEditor {
+  path: string;
+  readOnly: boolean;
+  content: string;
+  modifiedAtMs: number | null;
+}
+
+function decodeUtf8Base64(value: string): string {
+  const binary = window.atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) {
+    bytes[index] = binary.charCodeAt(index);
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+function encodeUtf8Base64(value: string): string {
+  const bytes = new TextEncoder().encode(value);
+  let binary = '';
+  const chunkSize = 8192;
+  for (let index = 0; index < bytes.length; index += chunkSize) {
+    const chunk = bytes.subarray(index, index + chunkSize);
+    binary += String.fromCharCode(...chunk);
+  }
+  return window.btoa(binary);
+}
+
+function getNestedRecord(value: unknown, key: string): Record<string, unknown> | null {
+  if (typeof value !== 'object' || value === null) return null;
+  const child = (value as Record<string, unknown>)[key];
+  return typeof child === 'object' && child !== null ? (child as Record<string, unknown>) : null;
+}
+
+function extractBase64(result: unknown): string {
+  if (typeof result !== 'object' || result === null) return '';
+  const record = result as Record<string, unknown>;
+  const data = getNestedRecord(result, 'data');
+  const value = record.dataBase64 ?? record.contentBase64 ?? data?.dataBase64 ?? data?.contentBase64;
+  return typeof value === 'string' ? value : '';
+}
+
+function extractModifiedAtMs(result: unknown): number | null {
+  const readValue = (record: Record<string, unknown> | null): unknown =>
+    record?.modifiedAtMs ?? record?.mtimeMs ?? record?.mtime_ms ?? record?.modifiedAt ?? record?.mtime;
+  const record = typeof result === 'object' && result !== null ? (result as Record<string, unknown>) : null;
+  const value = readValue(record) ?? readValue(getNestedRecord(result, 'data')) ?? readValue(getNestedRecord(result, 'metadata'));
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value === 'string') {
+    const parsed = Date.parse(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  return null;
+}
 
 export default function App() {
   const socket = useCodexSocket();
@@ -29,6 +85,7 @@ export default function App() {
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [detailItem, setDetailItem] = useState<TimelineItem | null>(null);
   const [composerDraft, setComposerDraft] = useState<string | null>(null);
+  const [editor, setEditor] = useState<OpenEditor | null>(null);
   const [ephemeralItems, setEphemeralItems] = useState<TimelineItem[]>([]);
   const bangCounterRef = useRef(0);
 
@@ -114,6 +171,39 @@ export default function App() {
     }
   };
 
+  const openFile = async (path: string, readOnly: boolean) => {
+    setSessionError(null);
+    try {
+      const contentResult = await socket.rpc<unknown>('webui/fs/readFile', { path });
+      const metadataResult = await socket.rpc<unknown>('webui/fs/getMetadata', { path });
+      setEditor({
+        path,
+        readOnly,
+        content: decodeUtf8Base64(extractBase64(contentResult)),
+        modifiedAtMs: extractModifiedAtMs(metadataResult),
+      });
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const saveFile = async (path: string, content: string) => {
+    const currentMetadata = await socket.rpc<unknown>('webui/fs/getMetadata', { path });
+    const currentModifiedAtMs = extractModifiedAtMs(currentMetadata);
+    if (
+      editor?.modifiedAtMs !== null &&
+      currentModifiedAtMs !== null &&
+      editor?.modifiedAtMs !== undefined &&
+      currentModifiedAtMs > editor.modifiedAtMs + 1 &&
+      !window.confirm('This file changed on disk after it was opened. Overwrite it?')
+    ) {
+      return;
+    }
+
+    await socket.rpc('webui/fs/writeFile', { path, dataBase64: encodeUtf8Base64(content) });
+    setEditor(null);
+  };
+
   return (
     <div className="app-shell">
       <Header
@@ -126,54 +216,68 @@ export default function App() {
       />
       <main className="main-panel">
         {socket.connectionState === 'disconnected' && <div className="disconnect-banner">Connection lost - reconnecting...</div>}
-        <div className="session-actions">
-          <button className="text-button primary" type="button" onClick={loadSessions} disabled={socket.connectionState !== 'connected' || sessionLoading}>
-            {sessionLoading ? 'Loading...' : 'Sessions'}
-          </button>
-          {sessionError && <span className="action-error">{sessionError}</span>}
-          <SessionPicker
-            threads={threads}
-            visible={sessionPickerOpen}
-            busy={sessionLoading}
-            onClose={() => setSessionPickerOpen(false)}
-            onSelect={(threadId) => void resumeSession(threadId)}
-            onNew={() => {
-              setSessionPickerOpen(false);
-              setCwdPickerOpen(true);
-            }}
-          />
-        </div>
-        <div className="main-content">
-          {activeThreadId ? (
-            <ChatTimeline
-              items={timeline.items.concat(ephemeralItems)}
-              onLoadOlder={timeline.loadOlder}
-              hasOlder={timeline.hasOlder}
-              loading={timeline.loading}
-              onOpenDetail={setDetailItem}
-            />
-          ) : (
-            <div className="empty-state">No active session loaded.</div>
-          )}
-          {queuedMessages.length > 0 && (
-            <div className="queue-list">
-              {queuedMessages.map((message) => (
-                <QueueCard key={message.id} message={message} onEdit={(item) => void editQueued(item)} onRemove={(id) => void removeQueued(id)} />
-              ))}
+        <div className="workspace-layout">
+          {state?.activeCwd && <FileExplorer root={state.activeCwd} rpc={socket.rpc} onOpenFile={(path, readOnly) => void openFile(path, readOnly)} />}
+          <section className="workspace-main" aria-label="Chat workspace">
+            <div className="session-actions">
+              <button className="text-button primary" type="button" onClick={loadSessions} disabled={socket.connectionState !== 'connected' || sessionLoading}>
+                {sessionLoading ? 'Loading...' : 'Sessions'}
+              </button>
+              {sessionError && <span className="action-error">{sessionError}</span>}
+              <SessionPicker
+                threads={threads}
+                visible={sessionPickerOpen}
+                busy={sessionLoading}
+                onClose={() => setSessionPickerOpen(false)}
+                onSelect={(threadId) => void resumeSession(threadId)}
+                onNew={() => {
+                  setSessionPickerOpen(false);
+                  setCwdPickerOpen(true);
+                }}
+              />
             </div>
-          )}
+            <div className="main-content">
+              {activeThreadId ? (
+                <ChatTimeline
+                  items={timeline.items.concat(ephemeralItems)}
+                  onLoadOlder={timeline.loadOlder}
+                  hasOlder={timeline.hasOlder}
+                  loading={timeline.loading}
+                  onOpenDetail={setDetailItem}
+                />
+              ) : (
+                <div className="empty-state">No active session loaded.</div>
+              )}
+              {queuedMessages.length > 0 && (
+                <div className="queue-list">
+                  {queuedMessages.map((message) => (
+                    <QueueCard key={message.id} message={message} onEdit={(item) => void editQueued(item)} onRemove={(id) => void removeQueued(id)} />
+                  ))}
+                </div>
+              )}
+            </div>
+            <InputBox
+              rpc={socket.rpc}
+              threadId={activeThreadId}
+              isRunning={Boolean(state?.activeTurnId)}
+              activeCwd={state?.activeCwd ?? null}
+              draftOverride={composerDraft}
+              disabled={socket.connectionState !== 'connected'}
+              onDraftConsumed={() => setComposerDraft(null)}
+              onEnqueue={enqueue}
+            />
+          </section>
         </div>
-        <InputBox
-          rpc={socket.rpc}
-          threadId={activeThreadId}
-          isRunning={Boolean(state?.activeTurnId)}
-          activeCwd={state?.activeCwd ?? null}
-          draftOverride={composerDraft}
-          disabled={socket.connectionState !== 'connected'}
-          onDraftConsumed={() => setComposerDraft(null)}
-          onEnqueue={enqueue}
-        />
       </main>
+      {editor && (
+        <FileEditorModal
+          path={editor.path}
+          initialContent={editor.content}
+          readOnly={editor.readOnly}
+          onClose={() => setEditor(null)}
+          onSave={(content) => saveFile(editor.path, content)}
+        />
+      )}
       {cwdPickerOpen && (
         <CwdPicker
           initialCwd={state?.activeCwd ?? ''}
