@@ -362,6 +362,8 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   let closed = false;
   let queuedStartInFlight: { threadId: string; queuedMessage: QueuedMessage } | null = null;
   const pendingServerRequests = new Map<string, JsonRpcServerRequest>();
+  const resumedThreadIds = new Set<string>();
+  const resumeThreadPromises = new Map<string, Promise<void>>();
 
   const broadcastHello = (state: HostRuntimeState = deps.stateStore.read()) => {
     for (const client of wss.clients) {
@@ -388,6 +390,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const ensureCodexStarted = (): Promise<void> | null => {
     const health = deps.codex.health();
     if (health.connected && !health.dead) return null;
+    resumedThreadIds.clear();
     return deps.codex.start().then(() => {
       const appServerUrl = deps.codex.getUrl();
       const appServerPid = deps.codex.getPid();
@@ -407,8 +410,28 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     return starting ? starting.then(call) : call();
   };
 
+  const ensureThreadResumed = (threadId: string): Promise<void> => {
+    if (resumedThreadIds.has(threadId)) return Promise.resolve();
+    const existing = resumeThreadPromises.get(threadId);
+    if (existing) return existing;
+
+    let resumePromise: Promise<void>;
+    resumePromise = requestCodex('thread/resume', { threadId, persistExtendedHistory: true })
+      .then(() => {
+        resumedThreadIds.add(threadId);
+      })
+      .finally(() => {
+        if (resumeThreadPromises.get(threadId) === resumePromise) {
+          resumeThreadPromises.delete(threadId);
+        }
+      });
+    resumeThreadPromises.set(threadId, resumePromise);
+    return resumePromise;
+  };
+
   const startTurn = async ({ threadId, text, options }: TurnStartParams) => {
     const state = deps.stateStore.read();
+    await ensureThreadResumed(threadId);
     return requestCodex<{ turn: { id: string } }>(
       'turn/start',
       applyTurnRunOptions(
@@ -494,6 +517,11 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   });
 
   const unsubscribeHealthChange = deps.codex.onHealthChange(() => {
+    const health = deps.codex.health();
+    if (!health.connected || health.dead) {
+      resumedThreadIds.clear();
+      resumeThreadPromises.clear();
+    }
     broadcastHello();
   });
 
@@ -571,9 +599,11 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }, runOptionsFromParams(request.params));
           const result = await requestCodex('thread/start', params);
           const activeCwd = extractThreadCwd(result) ?? cwd;
+          const activeThreadId = extractThreadId(result);
+          if (activeThreadId) resumedThreadIds.add(activeThreadId);
           const state = deps.stateStore.update((state) => ({
             ...state,
-            activeThreadId: extractThreadId(result),
+            activeThreadId,
             activeTurnId: null,
             activeCwd,
             recentCwds: rememberCwd(state.recentCwds, activeCwd),
@@ -595,6 +625,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             persistExtendedHistory: true,
           }, runOptionsFromParams(request.params));
           const result = await requestCodex('thread/resume', params);
+          resumedThreadIds.add(threadId);
           const activeCwd = extractThreadCwd(result) ?? deps.stateStore.read().activeCwd;
           const state = deps.stateStore.update((state) => ({
             ...state,
@@ -768,6 +799,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
+          await ensureThreadResumed(params.threadId);
           const result = await requestCodex('thread/turns/list', params);
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
@@ -838,6 +870,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             throw new Error('no active turn to interrupt');
           }
 
+          await ensureThreadResumed(state.activeThreadId);
           const result = await requestCodex('turn/interrupt', {
             threadId: state.activeThreadId,
             turnId: state.activeTurnId,

@@ -144,6 +144,14 @@ async function waitForRequest(request: ReturnType<typeof vi.fn>): Promise<void> 
   throw new Error('request was not called');
 }
 
+async function waitForRequestCalls(request: ReturnType<typeof vi.fn>, count: number): Promise<void> {
+  for (let attempt = 0; attempt < 10; attempt += 1) {
+    if (request.mock.calls.length >= count) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+  throw new Error(`request was called ${request.mock.calls.length} times, expected ${count}`);
+}
+
 afterEach(() => {
   for (const cleanup of cleanups.splice(0)) cleanup();
 });
@@ -789,6 +797,7 @@ describe('attachBrowserSocket app-server lifecycle', () => {
     expect(hello).toMatchObject({ type: 'server/hello', appServerHealth: { connected: true, dead: false, error: null } });
     expect(response).toEqual({ type: 'rpc/result', id: 40, result: { data: [] } });
     expect(start).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'thread/turns/list']);
     expect(start.mock.invocationCallOrder[0]).toBeLessThan(request.mock.invocationCallOrder[0]);
   });
 
@@ -816,6 +825,7 @@ describe('attachBrowserSocket app-server lifecycle', () => {
 
     expect(await response).toEqual({ type: 'rpc/result', id: 41, result: { data: [] } });
     expect(start).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'thread/turns/list']);
   });
 
   it('broadcasts app-server health changes while browser clients are idle', async () => {
@@ -831,6 +841,29 @@ describe('attachBrowserSocket app-server lifecycle', () => {
       appServerHealth: { connected: false, dead: true, error: 'Codex app-server WebSocket closed' },
     });
     expect(request).not.toHaveBeenCalled();
+  });
+
+  it('resumes the active thread before starting a turn after app-server restart', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project' } } as T;
+      if (method === 'turn/start') return { turn: { id: 'turn-1' } } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, start, health } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeCwd: '/work/project' });
+    health.mockReturnValue({ connected: false, dead: true, error: 'Codex app-server exited', readyzUrl: null, url: null });
+    start.mockImplementationOnce(async () => {
+      health.mockReturnValue({ connected: true, dead: false, error: null, readyzUrl: 'http://127.0.0.1:1/readyz', url: 'ws://127.0.0.1:1' });
+    });
+
+    const response = nextRpcResponse(ws, 42);
+    ws.send(JSON.stringify({ type: 'rpc', id: 42, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'hello' } }));
+
+    expect(await response).toEqual({ type: 'rpc/result', id: 42, result: { turn: { id: 'turn-1' } } });
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'turn/start']);
+    expect(start.mock.invocationCallOrder[0]).toBeLessThan(request.mock.invocationCallOrder[0]);
+    expect(request.mock.invocationCallOrder[0]).toBeLessThan(request.mock.invocationCallOrder[1]);
   });
 });
 
@@ -940,7 +973,9 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     const startPromise = new Promise<unknown>((resolve) => {
       resolveStart = resolve;
     });
-    const request = vi.fn<CodexAppServer['request']>().mockReturnValue(startPromise);
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) =>
+      method === 'thread/resume' ? Promise.resolve({} as T) : (startPromise as Promise<T>),
+    );
     const { stateStore, notify } = await makeHarness(request);
     stateStore.write({
       ...stateStore.read(),
@@ -952,8 +987,11 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
     notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
 
-    expect(request).toHaveBeenCalledTimes(1);
-    expect(request).toHaveBeenCalledWith('turn/start', {
+    await waitForRequestCalls(request, 2);
+
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', persistExtendedHistory: true });
+    expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'next', text_elements: [] }],
     });
@@ -983,7 +1021,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     });
 
     notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
-    await flushPromises();
+    await waitForRequestCalls(request, 2);
 
     expect(request).toHaveBeenCalledWith('turn/start', {
       threadId: 'thread-1',
@@ -1019,7 +1057,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     });
 
     notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
-    await flushPromises();
+    await waitForRequestCalls(request, 2);
 
     expect(request).toHaveBeenCalledWith('turn/start', {
       threadId: 'thread-1',
@@ -1034,7 +1072,9 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     const startPromise = new Promise<unknown>((resolve) => {
       resolveStart = resolve;
     });
-    const request = vi.fn<CodexAppServer['request']>().mockReturnValue(startPromise);
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) =>
+      method === 'thread/resume' ? Promise.resolve({} as T) : (startPromise as Promise<T>),
+    );
     const { stateStore, notify } = await makeHarness(request);
     const secondQueued = { id: 'queued-2', text: 'second', createdAt: 2 };
     stateStore.write({
@@ -1050,8 +1090,11 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
     notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
 
-    expect(request).toHaveBeenCalledTimes(1);
-    expect(request).toHaveBeenCalledWith('turn/start', {
+    await waitForRequestCalls(request, 2);
+
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', persistExtendedHistory: true });
+    expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'first', text_elements: [] }],
     });
@@ -1065,7 +1108,9 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
   it('restores a claimed queued message when queued turn start fails', async () => {
     const claimed = { id: 'queued-1', text: 'first', createdAt: 1 };
     const secondQueued = { id: 'queued-2', text: 'second', createdAt: 2 };
-    const request = vi.fn<CodexAppServer['request']>().mockRejectedValue(new Error('start failed'));
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) =>
+      method === 'thread/resume' ? Promise.resolve({} as T) : Promise.reject(new Error('start failed')),
+    );
     const { stateStore, notify } = await makeHarness(request);
     stateStore.write({
       ...stateStore.read(),
@@ -1075,9 +1120,9 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     });
 
     notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
-    await flushPromises();
+    await waitForRequestCalls(request, 2);
 
-    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledTimes(2);
     expect(stateStore.read()).toMatchObject({
       activeThreadId: 'thread-1',
       activeTurnId: null,
