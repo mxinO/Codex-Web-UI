@@ -81,6 +81,7 @@ export function useCodexSocket() {
   const [notifications, setNotifications] = useState<unknown[]>([]);
   const [requests, setRequests] = useState<unknown[]>([]);
   const [reconnectEpoch, setReconnectEpoch] = useState(0);
+  const [authRetryEpoch, setAuthRetryEpoch] = useState(0);
   const wsRef = useRef<WebSocket | null>(null);
   const nextIdRef = useRef(1);
   const pendingRef = useRef(new Map<number, PendingRpc>());
@@ -100,6 +101,21 @@ export function useCodexSocket() {
     }
     pendingRef.current.clear();
   }, []);
+
+  const submitToken = useCallback(
+    async (token: string) => {
+      const trimmed = token.trim();
+      if (!trimmed) throw new Error('Token is required');
+
+      const response = await fetch(`/api/auth?token=${encodeURIComponent(trimmed)}`, { credentials: 'same-origin' });
+      if (!response.ok) throw new Error('Invalid token');
+
+      stripTokenFromUrl();
+      setTrackedConnectionState('connecting');
+      setAuthRetryEpoch((value) => value + 1);
+    },
+    [setTrackedConnectionState],
+  );
 
   useEffect(() => {
     let stopped = false;
@@ -213,7 +229,7 @@ export function useCodexSocket() {
       wsRef.current?.close();
       wsRef.current = null;
     };
-  }, [rejectPending, setTrackedConnectionState]);
+  }, [authRetryEpoch, rejectPending, setTrackedConnectionState]);
 
   const rpc = useCallback(<T,>(method: string, params?: unknown, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) => {
     const ws = wsRef.current;
@@ -237,5 +253,5 @@ export function useCodexSocket() {
     });
   }, []);
 
-  return { connectionState, hello, notifications, requests, reconnectEpoch, rpc };
+  return { connectionState, hello, notifications, requests, reconnectEpoch, rpc, submitToken };
 }

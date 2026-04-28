@@ -1460,6 +1460,18 @@ input:focus-visible {
   line-height: 1.5;
 }
 
+.auth-token-field {
+  display: grid;
+  gap: 6px;
+  margin-top: 16px;
+}
+
+.auth-error {
+  margin-top: 10px;
+  color: var(--red);
+  font-size: 13px;
+}
+
 .cwd-picker {
   width: min(620px, 100%);
 }

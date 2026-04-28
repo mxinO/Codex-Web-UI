@@ -108,6 +108,35 @@ describe('useCodexSocket', () => {
     expect(ws.sent.at(-1)).toBe(JSON.stringify({ type: 'rpc', id: 1, method: 'slow.method', params: { value: 1 } }));
   });
 
+  it('recovers from auth-error after a manually entered token is accepted', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('{}', { status: 401 }))
+      .mockResolvedValueOnce(new Response('{}', { status: 200 }))
+      .mockResolvedValueOnce(new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+    window.history.replaceState(null, '', '/app');
+
+    await renderHook();
+
+    expect(currentSocket?.connectionState).toBe('auth-error');
+    expect(MockWebSocket.instances).toHaveLength(0);
+
+    await act(async () => {
+      await currentSocket?.submitToken('new-token');
+    });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/auth?token=new-token', { credentials: 'same-origin' });
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/auth', { credentials: 'same-origin' });
+    expect(MockWebSocket.instances).toHaveLength(1);
+
+    act(() => {
+      MockWebSocket.instances[0].open();
+    });
+
+    expect(currentSocket?.connectionState).toBe('connected');
+  });
+
   it('stores app-server requests from the browser socket', async () => {
     await renderHook();
     const ws = MockWebSocket.instances[0];

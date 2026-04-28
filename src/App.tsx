@@ -529,7 +529,7 @@ export default function App() {
           onConfirm={(cwd) => void startSession(cwd)}
         />
       )}
-      <AuthOverlay visible={socket.connectionState === 'auth-error'} />
+      <AuthOverlay visible={socket.connectionState === 'auth-error'} onSubmitToken={socket.submitToken} />
       <DetailModal item={detailItem} onClose={() => setDetailItem(null)} />
     </div>
   );
