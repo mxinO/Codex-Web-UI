@@ -632,6 +632,49 @@ describe('attachBrowserSocket bang command RPCs', () => {
 });
 
 describe('attachBrowserSocket fs RPC wrappers', () => {
+  it('browses directories for new session cwd selection without requiring an active cwd', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws } = await makeHarness(request);
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-browse-'));
+    mkdirSync(join(workspace, 'src'));
+    writeFileSync(join(workspace, 'README.md'), 'readme');
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 29, method: 'webui/fs/browseDirectory', params: { path: workspace } }));
+    const response = await nextMessage(ws);
+
+    expect(request).not.toHaveBeenCalled();
+    expect(response).toEqual({
+      type: 'rpc/result',
+      id: 29,
+      result: {
+        path: workspace,
+        parent: tmpdir(),
+        truncated: false,
+        entries: [{ name: 'src', path: join(workspace, 'src'), isDirectory: true }],
+      },
+    });
+  });
+
+  it('caps browsed directory entries for large folders', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws } = await makeHarness(request);
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-browse-large-'));
+    for (let index = 0; index < 501; index += 1) {
+      mkdirSync(join(workspace, `dir-${index}`));
+    }
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 30, method: 'webui/fs/browseDirectory', params: { path: workspace } }));
+    const response = await nextMessage(ws);
+    const result = response.result as { entries?: unknown[]; truncated?: boolean };
+
+    expect(request).not.toHaveBeenCalled();
+    expect(response.type).toBe('rpc/result');
+    expect(result.entries).toHaveLength(500);
+    expect(result.truncated).toBe(true);
+  });
+
   it('forwards read directory requests through the bounded webui RPC', async () => {
     const result = { entries: [{ name: 'src', isDirectory: true }] };
     const request = vi.fn<CodexAppServer['request']>().mockResolvedValue(result);

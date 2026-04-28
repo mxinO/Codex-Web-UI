@@ -45,6 +45,12 @@ function thread(overrides: Partial<CodexThread>): CodexThread {
   };
 }
 
+type CwdPickerRpc = React.ComponentProps<typeof CwdPicker>['rpc'];
+
+function asCwdRpc(mock: unknown): CwdPickerRpc {
+  return mock as CwdPickerRpc;
+}
+
 describe('SessionPicker', () => {
   it('renders session actions and empty state only when visible', () => {
     render(<SessionPicker threads={[]} visible onClose={vi.fn()} onSelect={vi.fn()} onNew={vi.fn()} />);
@@ -109,5 +115,44 @@ describe('CwdPicker', () => {
     const start = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Start');
 
     expect(start?.disabled).toBe(true);
+  });
+
+  it('browses folders and uses the selected cwd for new sessions', async () => {
+    const onConfirm = vi.fn();
+    const rpc = vi.fn((method: string, params?: unknown) => {
+      const path = (params as { path?: string } | undefined)?.path;
+      if (method === 'webui/fs/browseDirectory' && path === '/work') {
+        return Promise.resolve({ entries: [{ name: 'project', path: '/work/project', isDirectory: true }] });
+      }
+      if (method === 'webui/fs/browseDirectory' && path === '/work/project') {
+        return Promise.resolve({ entries: [] });
+      }
+      return Promise.reject(new Error(`unexpected ${method} ${path}`));
+    });
+
+    render(<CwdPicker initialCwd="/work" rpc={asCwdRpc(rpc)} onCancel={vi.fn()} onConfirm={onConfirm} />);
+
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const folder = document.querySelector<HTMLButtonElement>('[aria-label="Open folder project"]');
+    expect(folder).toBeInstanceOf(HTMLButtonElement);
+
+    await act(async () => {
+      folder?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector<HTMLInputElement>('.text-input')?.value).toBe('/work/project');
+
+    const start = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Start');
+    act(() => {
+      start?.click();
+    });
+
+    expect(onConfirm).toHaveBeenCalledWith('/work/project');
   });
 });

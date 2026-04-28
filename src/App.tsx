@@ -507,7 +507,8 @@ export default function App() {
       )}
       {cwdPickerOpen && (
         <CwdPicker
-          initialCwd={state?.activeCwd ?? ''}
+          initialCwd={state?.activeCwd ?? '/'}
+          rpc={socket.rpc}
           busy={sessionLoading}
           onCancel={() => setCwdPickerOpen(false)}
           onConfirm={(cwd) => void startSession(cwd)}

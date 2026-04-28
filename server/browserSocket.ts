@@ -1,4 +1,6 @@
+import fs from 'node:fs/promises';
 import type http from 'node:http';
+import nodePath from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { isTokenValid, parseTokenFromCookie } from './auth.js';
 import type { CodexAppServer } from './appServer.js';
@@ -97,6 +99,7 @@ function getString(params: unknown, key: string): string | null {
 const REASONING_EFFORTS = new Set<CodexReasoningEffort>(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
 const SANDBOX_MODES = new Set<CodexSandboxMode>(['read-only', 'workspace-write', 'danger-full-access']);
 const COLLABORATION_MODES = new Set<CodexCollaborationMode>(['default', 'plan']);
+const BROWSE_DIRECTORY_LIMIT = 500;
 
 function getOptionalString(params: unknown, key: string): string | null {
   if (!isRecord(params) || !hasOwn(params, key)) return null;
@@ -300,6 +303,36 @@ async function resolveReadableRpcPath(deps: BrowserSocketDeps, filePath: string)
 
 async function resolveWritableRpcPath(deps: BrowserSocketDeps, filePath: string): Promise<string> {
   return resolveWritablePathInsideRoot(activeWorkspaceRoot(deps), filePath);
+}
+
+function browseBasePath(deps: BrowserSocketDeps): string {
+  return deps.stateStore.read().activeCwd ?? process.env.HOME ?? process.cwd();
+}
+
+async function browseDirectory(deps: BrowserSocketDeps, requestedPath: string) {
+  const basePath = browseBasePath(deps);
+  const candidate = nodePath.isAbsolute(requestedPath) ? requestedPath : nodePath.resolve(basePath, requestedPath);
+  const resolvedPath = await fs.realpath(candidate);
+  const stats = await fs.stat(resolvedPath);
+  if (!stats.isDirectory()) throw new Error('path is not a directory');
+
+  const entries: Array<{ name: string; path: string; isDirectory: true }> = [];
+  const directory = await fs.opendir(resolvedPath);
+  let truncated = false;
+  for await (const entry of directory) {
+    if (!entry.isDirectory()) continue;
+    if (entries.length >= BROWSE_DIRECTORY_LIMIT) {
+      truncated = true;
+      break;
+    }
+    entries.push({ name: entry.name, path: nodePath.join(resolvedPath, entry.name), isDirectory: true });
+  }
+  return {
+    path: resolvedPath,
+    parent: nodePath.dirname(resolvedPath),
+    truncated,
+    entries: entries.sort((a, b) => a.name.localeCompare(b.name)),
+  };
 }
 
 function turnListParams(params: unknown): { threadId: string; cursor: unknown; limit: number; sortDirection: string } | string {
@@ -607,6 +640,13 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           pendingServerRequests.delete(requestKey(params.requestId));
           send(ws, { type: 'rpc/result', id: request.id, result: { ok: true } });
           broadcastRequestResolved(pendingRequest.id);
+          return;
+        }
+
+        if (request.method === 'webui/fs/browseDirectory') {
+          const filePath = getRequiredString(request.params, 'path') ?? browseBasePath(deps);
+          const result = await browseDirectory(deps, filePath);
+          send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
 

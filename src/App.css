@@ -1253,6 +1253,73 @@ body {
   line-height: 1.5;
 }
 
+.cwd-picker {
+  width: min(620px, 100%);
+}
+
+.cwd-browser {
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  overflow: hidden;
+}
+
+.cwd-browser-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+}
+
+.cwd-browser-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.cwd-browser-list {
+  max-height: min(300px, 34vh);
+  overflow-y: auto;
+  padding: 4px;
+}
+
+.cwd-folder-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr);
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 30px;
+  padding: 0 8px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.cwd-folder-row:hover,
+.cwd-folder-row:focus-visible {
+  background: var(--bg-hover);
+}
+
+.cwd-folder-row span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 @media (max-width: 720px) {
   .topbar {
     padding: 0 10px;
