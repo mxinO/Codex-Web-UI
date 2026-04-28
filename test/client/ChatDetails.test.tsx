@@ -11,6 +11,7 @@ import type { TimelineItem } from '../../src/lib/timeline';
 
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
+const onApprovalDecision = async () => undefined;
 
 function render(node: React.ReactNode) {
   container = document.createElement('div');
@@ -45,7 +46,7 @@ describe('ChatItem details', () => {
   it('renders assistant markdown', async () => {
     const item: TimelineItem = { id: 'a1', kind: 'assistant', timestamp: 1, text: '**Ready**\n\n- item', phase: null };
 
-    render(<ChatItem item={item} onOpenDetail={vi.fn()} />);
+    render(<ChatItem item={item} onOpenDetail={vi.fn()} onApprovalDecision={onApprovalDecision} />);
     expect(document.querySelector('.detail-loading')?.textContent).toBe('Loading markdown...');
 
     await act(async () => {
@@ -70,7 +71,7 @@ describe('ChatItem details', () => {
       exitCode: 0,
     };
 
-    render(<ChatItem item={item} onOpenDetail={onOpenDetail} />);
+    render(<ChatItem item={item} onOpenDetail={onOpenDetail} onApprovalDecision={onApprovalDecision} />);
 
     act(() => {
       document.querySelector<HTMLButtonElement>('.tool-card')?.click();
@@ -96,8 +97,8 @@ describe('ChatItem details', () => {
 
     render(
       <>
-        <ChatItem item={fileItem} onOpenDetail={onOpenDetail} />
-        <ChatItem item={toolItem} onOpenDetail={onOpenDetail} />
+        <ChatItem item={fileItem} onOpenDetail={onOpenDetail} onApprovalDecision={onApprovalDecision} />
+        <ChatItem item={toolItem} onOpenDetail={onOpenDetail} onApprovalDecision={onApprovalDecision} />
       </>,
     );
 
@@ -127,6 +128,33 @@ describe('DetailModal', () => {
     expect(pre?.textContent).toContain('"kind": "fileChange"');
     expect(pre?.textContent).toContain('"path": "src/App.tsx"');
     expect(document.querySelector('.detail-loading')?.textContent).not.toBe('Loading diff...');
+  });
+
+  it('renders file change diffs when before and after content are available', async () => {
+    const item: TimelineItem = {
+      id: 'f1',
+      kind: 'fileChange',
+      timestamp: 1,
+      item: {
+        type: 'fileChange',
+        id: 'raw-file',
+        status: 'ok',
+        changes: [{ path: 'src/App.tsx', before: 'old text', after: 'new text' }],
+      },
+    };
+
+    render(<DetailModal item={item} onClose={vi.fn()} />);
+
+    expect(document.querySelector('.detail-loading')?.textContent).toBe('Loading diff...');
+    expect(document.querySelector('.detail-pre')).toBeNull();
+
+    await act(async () => {
+      await import('../../src/components/DiffViewer');
+    });
+    await flushLazy();
+
+    expect(document.querySelector('[aria-label="Before"]')?.textContent).toContain('old text');
+    expect(document.querySelector('[aria-label="After"]')?.textContent).toContain('new text');
   });
 
   it('caps large JSON details and renders dialog semantics', () => {

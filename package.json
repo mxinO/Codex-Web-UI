@@ -8,13 +8,12 @@
     "dev:client": "vite --host 127.0.0.1",
     "dev:server": "tsx watch server/index.ts --mock",
     "start": "tsx scripts/start.ts",
-    "build": "vite build && tsc -p tsconfig.server.json --noEmit",
+    "build": "vite build && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.server.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
     "probe:continuity": "tsx scripts/probe-continuity.ts"
   },
   "dependencies": {
-    "@monaco-editor/react": "^4.7.0",
     "cookie": "^0.7.2",
     "express": "^4.21.2",
     "katex": "^0.16.22",

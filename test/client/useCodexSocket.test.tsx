@@ -126,6 +126,58 @@ describe('useCodexSocket', () => {
     expect(currentSocket?.requests).toEqual([{ jsonrpc: '2.0', id: 'approval-1', method: 'item/fileChange/requestApproval', params: { path: 'file.ts' } }]);
   });
 
+  it('restores pending app-server requests from server hello', async () => {
+    const pending = { jsonrpc: '2.0', id: 'approval-hello', method: 'item/fileChange/requestApproval', params: { path: 'file.ts' } };
+    await renderHook();
+    const ws = MockWebSocket.instances[0];
+    act(() => {
+      ws.open();
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'server/hello',
+            hostname: 'host-a',
+            state: { activeThreadId: 'thread-1', activeTurnId: null, activeCwd: '/repo', theme: 'dark', queue: [] },
+            requests: [pending],
+          }),
+        }),
+      );
+    });
+
+    expect(currentSocket?.requests).toEqual([pending]);
+  });
+
+  it('increments reconnect epoch and clears stale notifications after reconnect', async () => {
+    await renderHook();
+    const first = MockWebSocket.instances[0];
+    act(() => {
+      first.open();
+      first.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'codex/notification', message: { method: 'item/agentMessage/delta', params: { delta: 'stale' } } }),
+        }),
+      );
+    });
+    expect(currentSocket?.notifications).toHaveLength(1);
+    expect(currentSocket?.reconnectEpoch).toBe(0);
+
+    act(() => {
+      first.close();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+      await Promise.resolve();
+    });
+
+    const second = MockWebSocket.instances[1];
+    act(() => {
+      second.open();
+    });
+
+    expect(currentSocket?.reconnectEpoch).toBe(1);
+    expect(currentSocket?.notifications).toEqual([]);
+  });
+
   it('caps app-server request history at 50 items', async () => {
     await renderHook();
     const ws = MockWebSocket.instances[0];

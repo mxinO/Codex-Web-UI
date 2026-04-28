@@ -14,6 +14,7 @@ import { useQueue, type ClientQueuedMessage } from './hooks/useQueue';
 import { useThreadTimeline } from './hooks/useThreadTimeline';
 import { useTheme } from './hooks/useTheme';
 import { appendEphemeralBangItem, bangOutputEventToTimelineItem, getBangCommandOutputDetail } from './lib/bangCommands';
+import { parseSlashCommand } from './lib/slashCommands';
 import { approvalItemsFromRequests, liveStreamingItemFromNotifications, notificationMatchesActiveTurn, requestKey, type TimelineItem } from './lib/timeline';
 import type { CodexThread } from './types/codex';
 
@@ -42,6 +43,24 @@ function encodeUtf8Base64(value: string): string {
     binary += String.fromCharCode(...chunk);
   }
   return window.btoa(binary);
+}
+
+function localStorageValue(key: string): string | null {
+  try {
+    const value = window.localStorage.getItem(key);
+    return value && value.trim() ? value : null;
+  } catch {
+    return null;
+  }
+}
+
+function setLocalStorageValue(key: string, value: string | null): void {
+  try {
+    if (value) window.localStorage.setItem(key, value);
+    else window.localStorage.removeItem(key);
+  } catch {
+    // Ignore storage failures; these labels are client-side UI state.
+  }
 }
 
 function getNestedRecord(value: unknown, key: string): Record<string, unknown> | null {
@@ -88,6 +107,9 @@ export default function App() {
   const [editor, setEditor] = useState<OpenEditor | null>(null);
   const [ephemeralItems, setEphemeralItems] = useState<TimelineItem[]>([]);
   const [answeredApprovals, setAnsweredApprovals] = useState<Set<string>>(() => new Set());
+  const [model, setModelState] = useState<string | null>(() => localStorageValue('codex-web-ui:model'));
+  const [mode, setModeState] = useState<string | null>(() => localStorageValue('codex-web-ui:mode'));
+  const [effort, setEffortState] = useState<string | null>(() => localStorageValue('codex-web-ui:effort'));
   const bangCounterRef = useRef(0);
   const lastNotification = socket.notifications.at(-1);
   const liveStreamingItem = useMemo(
@@ -123,6 +145,11 @@ export default function App() {
   }, [activeThreadId, lastNotification, state?.activeTurnId, timeline.reload]);
 
   useEffect(() => {
+    if (!activeThreadId || socket.connectionState !== 'connected' || socket.reconnectEpoch === 0) return;
+    void timeline.reload();
+  }, [activeThreadId, socket.connectionState, socket.reconnectEpoch, timeline.reload]);
+
+  useEffect(() => {
     const handleBangOutput = (event: Event) => {
       const detail = getBangCommandOutputDetail(event);
       if (!detail) return;
@@ -139,7 +166,22 @@ export default function App() {
     return () => window.removeEventListener('webui-bang-output', handleBangOutput);
   }, [activeThreadId]);
 
-  const loadSessions = async () => {
+  const setModel = useCallback((value: string | null) => {
+    setModelState(value);
+    setLocalStorageValue('codex-web-ui:model', value);
+  }, []);
+
+  const setMode = useCallback((value: string | null) => {
+    setModeState(value);
+    setLocalStorageValue('codex-web-ui:mode', value);
+  }, []);
+
+  const setEffort = useCallback((value: string | null) => {
+    setEffortState(value);
+    setLocalStorageValue('codex-web-ui:effort', value);
+  }, []);
+
+  const loadSessions = useCallback(async () => {
     setSessionLoading(true);
     setSessionError(null);
     try {
@@ -151,7 +193,62 @@ export default function App() {
     } finally {
       setSessionLoading(false);
     }
-  };
+  }, [socket.rpc]);
+
+  useEffect(() => {
+    const handleSlashCommand = (event: Event) => {
+      if (!(event instanceof CustomEvent) || typeof event.detail?.input !== 'string') return;
+      const { command, value } = parseSlashCommand(event.detail.input);
+
+      if (command === '/help') {
+        setSessionError('Commands: /new, /resume, /model <name>, /effort <level>, /mode <value>, /sandbox <value>, /status');
+        return;
+      }
+      if (command === '/status') {
+        setSessionError(`Session ${activeThreadId ?? 'none'}; model ${model ?? 'default'}; effort ${effort ?? 'default'}; mode ${mode ?? 'default'}`);
+        return;
+      }
+      if (command === '/new') {
+        setSessionPickerOpen(false);
+        setCwdPickerOpen(true);
+        return;
+      }
+      if (command === '/resume') {
+        void loadSessions();
+        return;
+      }
+      if (command === '/model') {
+        if (!value) {
+          setSessionError('Usage: /model <name>');
+          return;
+        }
+        setModel(value);
+        setSessionError(`Model set to ${value}`);
+        return;
+      }
+      if (command === '/effort') {
+        if (!value) {
+          setSessionError('Usage: /effort <level>');
+          return;
+        }
+        setEffort(value);
+        setSessionError(`Effort set to ${value}`);
+        return;
+      }
+      if (command === '/mode' || command === '/sandbox') {
+        if (!value) {
+          setSessionError(`Usage: ${command} <value>`);
+          return;
+        }
+        const nextMode = command === '/sandbox' ? `sandbox:${value}` : value;
+        setMode(nextMode);
+        setSessionError(`Mode set to ${nextMode}`);
+      }
+    };
+
+    window.addEventListener('webui-slash-command', handleSlashCommand);
+    return () => window.removeEventListener('webui-slash-command', handleSlashCommand);
+  }, [activeThreadId, effort, loadSessions, mode, model, setEffort, setMode, setModel]);
 
   const startSession = async (cwd: string) => {
     setSessionLoading(true);
@@ -253,6 +350,9 @@ export default function App() {
         connectionState={socket.connectionState}
         activeThreadId={state?.activeThreadId ?? null}
         cwd={state?.activeCwd ?? null}
+        model={model}
+        mode={mode}
+        effort={effort}
         theme={theme}
         onToggleTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
       />

@@ -11,6 +11,12 @@ interface ChatItemProps {
   onApprovalDecision: (item: Extract<TimelineItem, { kind: 'approval' }>, decision: unknown) => Promise<void>;
 }
 
+function itemString(value: unknown, key: string, fallback: string): string {
+  if (typeof value !== 'object' || value === null) return fallback;
+  const candidate = (value as Record<string, unknown>)[key];
+  return typeof candidate === 'string' && candidate.trim() ? candidate : fallback;
+}
+
 export default function ChatItem({ item, onOpenDetail, onApprovalDecision }: ChatItemProps) {
   if (item.kind === 'user') {
     return (
@@ -70,7 +76,7 @@ export default function ChatItem({ item, onOpenDetail, onApprovalDecision }: Cha
     return (
       <div className="chat-row chat-row--system">
         <button className="tool-card" type="button" onClick={() => onOpenDetail(item)}>
-          File change: {item.item.status}
+          File change: {itemString(item.item, 'status', 'updated')}
         </button>
       </div>
     );
@@ -79,7 +85,7 @@ export default function ChatItem({ item, onOpenDetail, onApprovalDecision }: Cha
   return (
     <div className="chat-row chat-row--system">
       <button className="tool-card" type="button" onClick={() => onOpenDetail(item)}>
-        Tool: {item.item.type}
+        Tool: {itemString(item.item, 'type', 'unknown')}
       </button>
     </div>
   );

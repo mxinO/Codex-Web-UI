@@ -121,8 +121,15 @@ server.listen(config.port, config.host, () => {
   logInfo(`Open in browser: ${url}`);
 });
 
-process.on('SIGINT', () => {
+let shuttingDown = false;
+function shutdown(signal: NodeJS.Signals) {
+  if (shuttingDown) return;
+  shuttingDown = true;
   browserSockets.close();
   codex.stop();
   server.close(() => process.exit(0));
-});
+  setTimeout(() => process.exit(signal === 'SIGTERM' ? 143 : 130), 5000).unref();
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));

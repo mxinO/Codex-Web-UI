@@ -10,6 +10,7 @@ import type { CodexTurn } from '../../src/types/codex';
 
 type HookResult = ReturnType<typeof useThreadTimeline>;
 type RpcResult = { data: CodexTurn[]; nextCursor?: string | null; next_cursor?: string | null };
+type TimelineRpc = Parameters<typeof useThreadTimeline>[1];
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -44,6 +45,14 @@ function makeTurn(id: string, text = id): CodexTurn {
 
 function makeTurns(prefix: string, count: number): CodexTurn[] {
   return Array.from({ length: count }, (_, index) => makeTurn(`${prefix}-${index}`, `${prefix}-${index}`));
+}
+
+function asRpc(mock: unknown): TimelineRpc {
+  return mock as TimelineRpc;
+}
+
+function itemText(item: NonNullable<HookResult>['items'][number]): string {
+  return item.kind === 'assistant' || item.kind === 'user' || item.kind === 'notice' || item.kind === 'streaming' ? item.text : '';
 }
 
 function Harness({ activeThreadId, rpc }: { activeThreadId: string | null; rpc: <T>(method: string, params?: unknown) => Promise<T> }) {
@@ -82,7 +91,7 @@ describe('useThreadTimeline', () => {
     const first = deferred<RpcResult>();
     const rpc = vi.fn(() => first.promise);
 
-    await renderHook('thread-1', rpc);
+    await renderHook('thread-1', asRpc(rpc));
     await act(async () => {
       first.resolve({ data: [makeTurn('newer'), makeTurn('older')], next_cursor: 'older-cursor' });
       await first.promise;
@@ -94,7 +103,7 @@ describe('useThreadTimeline', () => {
       sortDirection: 'desc',
       cursor: null,
     });
-    expect(currentTimeline?.items.map((item) => item.text)).toEqual(['older', 'newer']);
+    expect(currentTimeline?.items.map(itemText)).toEqual(['older', 'newer']);
     expect(currentTimeline?.hasOlder).toBe(true);
   });
 
@@ -103,7 +112,7 @@ describe('useThreadTimeline', () => {
     const older = deferred<RpcResult>();
     const rpc = vi.fn().mockReturnValueOnce(latest.promise).mockReturnValueOnce(older.promise);
 
-    await renderHook('thread-1', rpc);
+    await renderHook('thread-1', asRpc(rpc));
     await act(async () => {
       latest.resolve({ data: makeTurns('latest', 5), nextCursor: 'cursor-1' });
       await latest.promise;
@@ -131,7 +140,7 @@ describe('useThreadTimeline', () => {
     const latestAgain = deferred<RpcResult>();
     const rpc = vi.fn().mockReturnValueOnce(latest.promise).mockReturnValueOnce(older.promise).mockReturnValueOnce(latestAgain.promise);
 
-    await renderHook('thread-1', rpc);
+    await renderHook('thread-1', asRpc(rpc));
     await act(async () => {
       latest.resolve({ data: [makeTurn('latest-initial')], nextCursor: 'cursor-1' });
       await latest.promise;
@@ -169,8 +178,8 @@ describe('useThreadTimeline', () => {
     const newThread = deferred<RpcResult>();
     const rpc = vi.fn().mockReturnValueOnce(oldThread.promise).mockReturnValueOnce(newThread.promise);
 
-    await renderHook('old-thread', rpc);
-    await rerenderHook('new-thread', rpc);
+    await renderHook('old-thread', asRpc(rpc));
+    await rerenderHook('new-thread', asRpc(rpc));
     await act(async () => {
       newThread.resolve({ data: [makeTurn('new-thread-turn')], nextCursor: null });
       await newThread.promise;
@@ -189,7 +198,7 @@ describe('useThreadTimeline', () => {
     const newLatest = deferred<RpcResult>();
     const rpc = vi.fn().mockReturnValueOnce(latest.promise).mockReturnValueOnce(oldOlder.promise).mockReturnValueOnce(newLatest.promise);
 
-    await renderHook('thread-1', rpc);
+    await renderHook('thread-1', asRpc(rpc));
     await act(async () => {
       latest.resolve({ data: [makeTurn('thread-1-latest')], nextCursor: 'cursor-1' });
       await latest.promise;
@@ -197,7 +206,7 @@ describe('useThreadTimeline', () => {
     await act(async () => {
       currentTimeline?.loadOlder();
     });
-    await rerenderHook('thread-2', rpc);
+    await rerenderHook('thread-2', asRpc(rpc));
     await act(async () => {
       newLatest.resolve({ data: [makeTurn('thread-2-latest')], nextCursor: null });
       await newLatest.promise;

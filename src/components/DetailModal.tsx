@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useRef, type KeyboardEvent } from 'react';
 import type { TimelineItem } from '../lib/timeline';
 
 const MarkdownView = lazy(() => import('./MarkdownView'));
+const DiffViewer = lazy(() => import('./DiffViewer'));
 const DETAIL_LIMIT = 200_000;
 const MAX_DEPTH = 8;
 const MAX_ARRAY_ITEMS = 100;
@@ -120,6 +121,75 @@ function stringifyDetail(value: unknown): string {
   }
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function firstStringAt(value: unknown, paths: string[][]): string | null {
+  for (const path of paths) {
+    let current = value;
+    for (const key of path) {
+      if (!isRecord(current)) {
+        current = null;
+        break;
+      }
+      current = current[key];
+    }
+    if (typeof current === 'string') return current;
+  }
+  return null;
+}
+
+function firstRecordChange(value: unknown): unknown {
+  if (!isRecord(value)) return null;
+  if (Array.isArray(value.changes)) return value.changes.find(isRecord) ?? null;
+  if (Array.isArray(value.data)) return value.data.find(isRecord) ?? null;
+  return value;
+}
+
+function languageFromPath(filePath: string | null): string {
+  const extension = filePath?.split('.').pop()?.toLowerCase();
+  if (extension === 'ts' || extension === 'tsx') return 'typescript';
+  if (extension === 'js' || extension === 'jsx') return 'javascript';
+  if (extension === 'json') return 'json';
+  if (extension === 'css') return 'css';
+  if (extension === 'md' || extension === 'markdown') return 'markdown';
+  if (extension === 'py') return 'python';
+  if (extension === 'sh' || extension === 'bash') return 'shell';
+  return 'plaintext';
+}
+
+function fileChangeDiff(value: unknown): { before: string; after: string; language: string } | null {
+  const change = firstRecordChange(value);
+  if (!change) return null;
+
+  const before = firstStringAt(change, [
+    ['before'],
+    ['oldText'],
+    ['old_text'],
+    ['previousText'],
+    ['previous_text'],
+    ['original'],
+    ['beforeContent'],
+    ['before_content'],
+  ]);
+  const after = firstStringAt(change, [
+    ['after'],
+    ['newText'],
+    ['new_text'],
+    ['updatedText'],
+    ['updated_text'],
+    ['modified'],
+    ['afterContent'],
+    ['after_content'],
+  ]);
+
+  if (before === null || after === null) return null;
+
+  const filePath = firstStringAt(change, [['path'], ['file'], ['filePath'], ['file_path']]);
+  return { before, after, language: languageFromPath(filePath) };
+}
+
 function getFocusableElements(element: HTMLElement): HTMLElement[] {
   return Array.from(
     element.querySelectorAll<HTMLElement>('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'),
@@ -173,10 +243,15 @@ export default function DetailModal({ item, onClose }: { item: TimelineItem | nu
     }
   };
 
+  const diff = item.kind === 'fileChange' ? fileChangeDiff(item.item) : null;
   const body =
     item.kind === 'assistant' ? (
       <Suspense fallback={<div className="detail-loading">Loading markdown...</div>}>
         <MarkdownView content={item.text} />
+      </Suspense>
+    ) : diff ? (
+      <Suspense fallback={<div className="detail-loading">Loading diff...</div>}>
+        <DiffViewer before={diff.before} after={diff.after} language={diff.language} />
       </Suspense>
     ) : item.kind === 'fileChange' ? (
       <pre className="detail-pre">{stringifyDetail({ kind: item.kind, metadata: item.item })}</pre>

@@ -67,9 +67,32 @@ export function notificationMatchesActiveTurn(notification: unknown, scope: Time
   return false;
 }
 
-function userText(item: Extract<CodexItem, { type: 'userMessage' }>): string {
-  const content = Array.isArray(item.content) ? item.content : [];
-  return content.map((part) => part.text ?? part.path ?? part.url ?? '').join('');
+function stringField(value: unknown, key: string, fallback = ''): string {
+  if (!isRecord(value)) return fallback;
+  const candidate = value[key];
+  return typeof candidate === 'string' ? candidate : fallback;
+}
+
+function nullableStringField(value: unknown, key: string): string | null {
+  if (!isRecord(value)) return null;
+  const candidate = value[key];
+  return typeof candidate === 'string' ? candidate : null;
+}
+
+function numberOrNullField(value: unknown, key: string): number | null {
+  if (!isRecord(value)) return null;
+  const candidate = value[key];
+  return typeof candidate === 'number' && Number.isFinite(candidate) ? candidate : null;
+}
+
+function userText(item: CodexItem): string {
+  const content: unknown[] = isRecord(item) && Array.isArray((item as Record<string, unknown>).content) ? ((item as Record<string, unknown>).content as unknown[]) : [];
+  return content
+    .map((part) => {
+      if (!isRecord(part)) return '';
+      return stringField(part, 'text') || stringField(part, 'path') || stringField(part, 'url');
+    })
+    .join('');
 }
 
 function safeItemId(turn: CodexTurn, item: CodexItem, index: number): string {
@@ -83,26 +106,26 @@ export function turnToTimelineItems(turn: CodexTurn): TimelineItem[] {
   return items.map((item, index) => {
     const id = safeItemId(turn, item, index);
     if (item.type === 'userMessage') return { id, kind: 'user', timestamp, text: userText(item) };
-    if (item.type === 'agentMessage') return { id, kind: 'assistant', timestamp, text: item.text, phase: item.phase };
+    if (item.type === 'agentMessage') return { id, kind: 'assistant', timestamp, text: stringField(item, 'text'), phase: nullableStringField(item, 'phase') };
     if (item.type === 'commandExecution') {
       return {
         id,
         kind: 'command',
         timestamp,
-        command: item.command,
-        cwd: item.cwd,
-        output: item.aggregatedOutput ?? '',
-        status: item.status,
-        exitCode: item.exitCode,
+        command: stringField(item, 'command'),
+        cwd: stringField(item, 'cwd'),
+        output: stringField(item, 'aggregatedOutput'),
+        status: stringField(item, 'status', 'unknown'),
+        exitCode: numberOrNullField(item, 'exitCode'),
       };
     }
     if (item.type === 'fileChange') return { id, kind: 'fileChange', timestamp, item };
     if (item.type === 'reasoning') {
-      const summary = Array.isArray(item.summary) ? item.summary : [];
-      const content = Array.isArray(item.content) ? item.content : [];
+      const summary = Array.isArray(item.summary) ? item.summary.filter((entry): entry is string => typeof entry === 'string') : [];
+      const content = Array.isArray(item.content) ? item.content.filter((entry): entry is string => typeof entry === 'string') : [];
       return { id, kind: 'notice', timestamp, text: [...summary, ...content].join('\n') };
     }
-    if (item.type === 'plan') return { id, kind: 'notice', timestamp, text: item.text };
+    if (item.type === 'plan') return { id, kind: 'notice', timestamp, text: stringField(item, 'text') };
     return { id, kind: 'tool', timestamp, item };
   });
 }

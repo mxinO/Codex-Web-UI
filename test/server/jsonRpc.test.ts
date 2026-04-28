@@ -24,6 +24,15 @@ describe('JsonRpcPeer', () => {
     await expect(promise).resolves.toEqual({ pong: true });
   });
 
+  it('resolves app-server responses that omit jsonrpc', async () => {
+    const socket = new FakeSocket();
+    const peer = new JsonRpcPeer(socket as never);
+    const promise = peer.request('initialize');
+    const sent = JSON.parse(socket.sent[0]);
+    socket.emit('message', JSON.stringify({ id: sent.id, result: { server: 'ready' } }));
+    await expect(promise).resolves.toEqual({ server: 'ready' });
+  });
+
   it('emits notifications', async () => {
     const socket = new FakeSocket();
     const peer = new JsonRpcPeer(socket as never);
@@ -31,6 +40,15 @@ describe('JsonRpcPeer', () => {
     peer.onNotification((msg) => seen.push(msg));
     socket.emit('message', JSON.stringify({ jsonrpc: '2.0', method: 'thread/started', params: { id: 't' } }));
     expect(seen).toEqual([{ jsonrpc: '2.0', method: 'thread/started', params: { id: 't' } }]);
+  });
+
+  it('normalizes notifications that omit jsonrpc', async () => {
+    const socket = new FakeSocket();
+    const peer = new JsonRpcPeer(socket as never);
+    const seen: unknown[] = [];
+    peer.onNotification((msg) => seen.push(msg));
+    socket.emit('message', JSON.stringify({ method: 'turn/completed', params: { threadId: 't' } }));
+    expect(seen).toEqual([{ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: 't' } }]);
   });
 
   it('emits server requests and sends responses', () => {
@@ -50,6 +68,17 @@ describe('JsonRpcPeer', () => {
       id: 'approval-1',
       result: { approved: true },
     });
+  });
+
+  it('normalizes server requests that omit jsonrpc', () => {
+    const socket = new FakeSocket();
+    const peer = new JsonRpcPeer(socket as never);
+    const seen: unknown[] = [];
+    peer.onServerRequest((msg) => seen.push(msg));
+
+    socket.emit('message', JSON.stringify({ id: 'approval-1', method: 'approval/requested' }));
+
+    expect(seen).toEqual([{ jsonrpc: '2.0', id: 'approval-1', method: 'approval/requested' }]);
   });
 
   it('sends server request error responses', () => {

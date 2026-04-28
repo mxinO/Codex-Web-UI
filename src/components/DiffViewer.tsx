@@ -1,14 +1,14 @@
-import { DiffEditor } from '@monaco-editor/react';
-
 export default function DiffViewer({ before, after, language }: { before: string; after: string; language?: string }) {
   return (
-    <DiffEditor
-      height="70vh"
-      language={language ?? 'plaintext'}
-      theme={document.documentElement.dataset.theme === 'light' ? 'light' : 'vs-dark'}
-      original={before}
-      modified={after}
-      options={{ readOnly: true, minimap: { enabled: false }, scrollBeyondLastLine: false, renderSideBySide: true }}
-    />
+    <div className="diff-viewer" data-language={language ?? 'plaintext'}>
+      <section className="diff-pane" aria-label="Before">
+        <div className="diff-title">Before</div>
+        <pre>{before}</pre>
+      </section>
+      <section className="diff-pane" aria-label="After">
+        <div className="diff-title">After</div>
+        <pre>{after}</pre>
+      </section>
+    </div>
   );
 }

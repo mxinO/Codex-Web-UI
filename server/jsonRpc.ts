@@ -145,20 +145,21 @@ export class JsonRpcPeer {
       return;
     }
 
-    if (!this.isRecord(message) || message.jsonrpc !== '2.0') return;
+    if (!this.isRecord(message) || ('jsonrpc' in message && message.jsonrpc !== '2.0')) return;
+    const normalized = { jsonrpc: '2.0' as const, ...message };
 
-    if (this.isResponse(message)) {
-      this.handleResponse(message);
+    if (this.isResponse(normalized)) {
+      this.handleResponse(normalized);
       return;
     }
 
-    if (this.isServerRequest(message)) {
-      for (const handler of this.serverRequestHandlers) handler(message);
+    if (this.isServerRequest(normalized)) {
+      for (const handler of this.serverRequestHandlers) handler(normalized);
       return;
     }
 
-    if (this.isNotification(message)) {
-      for (const handler of this.notificationHandlers) handler(message);
+    if (this.isNotification(normalized)) {
+      for (const handler of this.notificationHandlers) handler(normalized);
     }
   }
 

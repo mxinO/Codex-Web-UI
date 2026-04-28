@@ -9,6 +9,11 @@ import FileExplorer from '../../src/components/FileExplorer';
 
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
+type FileExplorerRpc = React.ComponentProps<typeof FileExplorer>['rpc'];
+
+function asRpc(mock: unknown): FileExplorerRpc {
+  return mock as FileExplorerRpc;
+}
 
 function deferred<T>() {
   let resolve: (value: T) => void = () => undefined;
@@ -73,7 +78,7 @@ describe('FileExplorer', () => {
       return Promise.reject(new Error(`unexpected path ${path}`));
     });
 
-    renderFileExplorer(rpc, '/repo-a');
+    renderFileExplorer(asRpc(rpc), '/repo-a');
 
     await act(async () => {
       initialRootLoad.resolve({ entries: [{ name: 'a', path: '/repo-a/a', isDirectory: true }] });
@@ -111,11 +116,11 @@ describe('FileExplorer', () => {
     });
     vi.spyOn(window, 'prompt').mockReturnValue('new.txt');
 
-    renderFileExplorer(rpc, '/repo-a');
+    renderFileExplorer(asRpc(rpc), '/repo-a');
     act(() => {
       buttonByText('New File').click();
     });
-    rerenderFileExplorer(rpc, '/repo-b');
+    rerenderFileExplorer(asRpc(rpc), '/repo-b');
 
     await act(async () => {
       rootBLoad.resolve({ entries: [{ name: 'b.txt', path: '/repo-b/b.txt', isFile: true }] });

@@ -10,6 +10,11 @@ import InputBox from '../../src/components/InputBox';
 
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
+type InputRpc = React.ComponentProps<typeof InputBox>['rpc'];
+
+function asRpc(mock: unknown): InputRpc {
+  return mock as InputRpc;
+}
 
 function deferred<T>() {
   let resolve: (value: T) => void = () => undefined;
@@ -131,13 +136,49 @@ describe('InputBox', () => {
     expect(document.querySelector('.input-error')?.textContent).toBe('! commands are disabled while Codex is working');
   });
 
+  it('dispatches supported slash commands', async () => {
+    const dispatch = vi.spyOn(window, 'dispatchEvent');
+    renderInputBox({ draftOverride: '/model gpt-5.4' });
+    const textarea = document.querySelector<HTMLTextAreaElement>('textarea');
+    const submit = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Send');
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await act(async () => {
+      submit?.click();
+      await Promise.resolve();
+    });
+
+    const slashEvent = dispatch.mock.calls.map(([event]) => event).find((event) => event.type === 'webui-slash-command') as CustomEvent | undefined;
+    expect(slashEvent?.detail).toMatchObject({ input: '/model gpt-5.4', command: '/model', turnActive: false });
+    expect(textarea?.value).toBe('');
+  });
+
+  it('rejects unsupported slash commands and preserves the draft', async () => {
+    renderInputBox({ draftOverride: '/compact' });
+    const textarea = document.querySelector<HTMLTextAreaElement>('textarea');
+    const submit = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Send');
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await act(async () => {
+      submit?.click();
+      await Promise.resolve();
+    });
+
+    expect(textarea?.value).toBe('/compact');
+    expect(document.querySelector('.input-error')?.textContent).toBe('/compact is not supported in the web UI');
+  });
+
   it('ignores stale file autocomplete responses after draft no longer matches', async () => {
     const readDirectory = controllableThenable<unknown>();
     const rpc = vi.fn((method: string) => {
       if (method === 'webui/fs/readDirectory') return readDirectory.promise;
       return Promise.reject(new Error(`unexpected method ${method}`));
     });
-    renderInputBox({ rpc, draftOverride: '@', activeCwd: '/repo' });
+    renderInputBox({ rpc: asRpc(rpc), draftOverride: '@', activeCwd: '/repo' });
 
     await act(async () => {
       await Promise.resolve();

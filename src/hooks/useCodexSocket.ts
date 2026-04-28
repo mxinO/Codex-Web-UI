@@ -10,8 +10,9 @@ interface ServerHello {
     activeTurnId: string | null;
     activeCwd: string | null;
     theme: 'dark' | 'light';
-    queue: Array<{ id: string; text: string; createdAt: number }>;
+      queue: Array<{ id: string; text: string; createdAt: number }>;
   };
+  requests?: unknown[];
 }
 
 type ServerMessage =
@@ -69,11 +70,13 @@ export function useCodexSocket() {
   const [hello, setHello] = useState<ServerHello | null>(null);
   const [notifications, setNotifications] = useState<unknown[]>([]);
   const [requests, setRequests] = useState<unknown[]>([]);
+  const [reconnectEpoch, setReconnectEpoch] = useState(0);
   const wsRef = useRef<WebSocket | null>(null);
   const nextIdRef = useRef(1);
   const pendingRef = useRef(new Map<number, PendingRpc>());
   const connectionStateRef = useRef<ConnectionState>('connecting');
   const reconnectTimerRef = useRef<number | null>(null);
+  const hasConnectedRef = useRef(false);
 
   const setTrackedConnectionState = useCallback((state: ConnectionState) => {
     connectionStateRef.current = state;
@@ -99,7 +102,7 @@ export function useCodexSocket() {
     };
 
     const scheduleReconnect = () => {
-      if (stopped || connectionStateRef.current === 'auth-error') return;
+      if (stopped) return;
       clearReconnectTimer();
       reconnectTimerRef.current = window.setTimeout(() => {
         reconnectTimerRef.current = null;
@@ -109,7 +112,7 @@ export function useCodexSocket() {
     };
 
     const connect = async () => {
-      if (stopped || connectionStateRef.current === 'auth-error') return;
+      if (stopped) return;
 
       setTrackedConnectionState('connecting');
 
@@ -139,6 +142,11 @@ export function useCodexSocket() {
       ws.onopen = () => {
         if (stopped) return;
         retry = 250;
+        if (hasConnectedRef.current) {
+          setNotifications([]);
+          setReconnectEpoch((value) => value + 1);
+        }
+        hasConnectedRef.current = true;
         setTrackedConnectionState('connected');
         ws.send(JSON.stringify({ type: 'client/hello' }));
       };
@@ -150,6 +158,7 @@ export function useCodexSocket() {
 
         if (message.type === 'server/hello') {
           setHello(message);
+          setRequests(message.requests ?? []);
         } else if (message.type === 'auth/error') {
           setTrackedConnectionState('auth-error');
           rejectPending(new Error('authentication failed'));
@@ -218,5 +227,5 @@ export function useCodexSocket() {
     });
   }, []);
 
-  return { connectionState, hello, notifications, requests, rpc };
+  return { connectionState, hello, notifications, requests, reconnectEpoch, rpc };
 }

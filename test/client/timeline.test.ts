@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { approvalItemsFromRequests, liveStreamingItemFromNotifications, notificationMatchesActiveTurn, requestKey, turnToTimelineItems, trimTimelineWindow } from '../../src/lib/timeline';
+import type { TimelineItem } from '../../src/lib/timeline';
 import type { CodexTurn } from '../../src/types/codex';
 
 describe('timeline', () => {
@@ -116,6 +117,7 @@ describe('timeline', () => {
       { jsonrpc: '2.0', id: '1', method: 'item/fileChange/requestApproval', params: { path: 'string.ts' } },
     ];
 
-    expect(approvalItemsFromRequests(requests, new Set([requestKey(1)])).map((item) => item.requestId)).toEqual(['1']);
+    const approvals = approvalItemsFromRequests(requests, new Set([requestKey(1)])).filter((item): item is Extract<TimelineItem, { kind: 'approval' }> => item.kind === 'approval');
+    expect(approvals.map((item) => item.requestId)).toEqual(['1']);
   });
 });

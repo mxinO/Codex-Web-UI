@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -16,6 +16,7 @@ interface RpcMessage {
   result?: unknown;
   error?: string;
   requestId?: number | string;
+  requests?: unknown[];
 }
 
 const cleanups: Array<() => void> = [];
@@ -80,7 +81,7 @@ async function makeHarness(request: TestRequest) {
     serverRequestHandler?.(message);
   };
 
-  return { ws, stateStore, notify, requestFromServer, respond };
+  return { ws, stateStore, notify, requestFromServer, respond, port };
 }
 
 function nextMessage(ws: WebSocket): Promise<RpcMessage> {
@@ -219,6 +220,28 @@ describe('attachBrowserSocket app-server requests', () => {
         method: 'item/commandExecution/requestApproval',
         params: { command: 'npm test' },
       },
+    });
+  });
+
+  it('replays pending app-server requests to reconnecting browser clients', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { port, requestFromServer } = await makeHarness(request);
+    const pending = {
+      jsonrpc: '2.0' as const,
+      id: 'approval-replay',
+      method: 'item/fileChange/requestApproval',
+      params: { path: 'file.ts' },
+    };
+
+    requestFromServer(pending);
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const hello = nextMessage(ws);
+    await new Promise<void>((resolve) => ws.once('open', resolve));
+    cleanups.push(() => ws.close());
+
+    expect(await hello).toMatchObject({
+      type: 'server/hello',
+      requests: [pending],
     });
   });
 
@@ -537,23 +560,31 @@ describe('attachBrowserSocket fs RPC wrappers', () => {
   it('forwards read directory requests through the bounded webui RPC', async () => {
     const result = { entries: [{ name: 'src', isDirectory: true }] };
     const request = vi.fn<CodexAppServer['request']>().mockResolvedValue(result);
-    const { ws } = await makeHarness(request);
+    const { ws, stateStore } = await makeHarness(request);
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-workspace-'));
+    mkdirSync(join(workspace, 'src'));
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    stateStore.write({ ...stateStore.read(), activeCwd: workspace });
 
-    ws.send(JSON.stringify({ type: 'rpc', id: 30, method: 'webui/fs/readDirectory', params: { path: ' /work/project ' } }));
+    ws.send(JSON.stringify({ type: 'rpc', id: 30, method: 'webui/fs/readDirectory', params: { path: ` ${workspace} ` } }));
     const response = await nextMessage(ws);
 
-    expect(request).toHaveBeenCalledWith('fs/readDirectory', { path: '/work/project' });
+    expect(request).toHaveBeenCalledWith('fs/readDirectory', { path: workspace });
     expect(response).toEqual({ type: 'rpc/result', id: 30, result });
   });
 
   it('creates files by writing empty base64 data', async () => {
     const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ ok: true });
-    const { ws } = await makeHarness(request);
+    const { ws, stateStore } = await makeHarness(request);
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-workspace-'));
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    stateStore.write({ ...stateStore.read(), activeCwd: workspace });
+    const filePath = join(workspace, 'new.txt');
 
-    ws.send(JSON.stringify({ type: 'rpc', id: 31, method: 'webui/fs/createFile', params: { path: '/work/project/new.txt' } }));
+    ws.send(JSON.stringify({ type: 'rpc', id: 31, method: 'webui/fs/createFile', params: { path: filePath } }));
     const response = await nextMessage(ws);
 
-    expect(request).toHaveBeenCalledWith('fs/writeFile', { path: '/work/project/new.txt', dataBase64: '' });
+    expect(request).toHaveBeenCalledWith('fs/writeFile', { path: filePath, dataBase64: '' });
     expect(response).toEqual({ type: 'rpc/result', id: 31, result: { ok: true } });
   });
 
@@ -566,6 +597,34 @@ describe('attachBrowserSocket fs RPC wrappers', () => {
 
     expect(request).not.toHaveBeenCalled();
     expect(response).toEqual({ type: 'rpc/error', id: 32, error: 'dataBase64 is required' });
+  });
+
+  it('rejects filesystem requests outside the active workspace', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request);
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-workspace-'));
+    const outside = mkdtempSync(join(tmpdir(), 'codex-webui-outside-'));
+    writeFileSync(join(outside, 'secret.txt'), 'secret');
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(outside, { recursive: true, force: true }));
+    stateStore.write({ ...stateStore.read(), activeCwd: workspace });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 33, method: 'webui/fs/readFile', params: { path: join(outside, 'secret.txt') } }));
+    const response = await nextMessage(ws);
+
+    expect(request).not.toHaveBeenCalled();
+    expect(response).toEqual({ type: 'rpc/error', id: 33, error: 'path is outside active workspace' });
+  });
+
+  it('rejects unsupported app-server passthrough methods', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws } = await makeHarness(request);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 34, method: 'fs/readFile', params: { path: '/etc/passwd' } }));
+    const response = await nextMessage(ws);
+
+    expect(request).not.toHaveBeenCalled();
+    expect(response).toEqual({ type: 'rpc/error', id: 34, error: 'unsupported RPC method: fs/readFile' });
   });
 });
 
@@ -625,8 +684,8 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }],
     });
 
-    notify('turn/completed');
-    notify('turn/completed');
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
 
     expect(request).toHaveBeenCalledTimes(1);
     expect(request).toHaveBeenCalledWith('turn/start', {
@@ -658,8 +717,8 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       ],
     });
 
-    notify('turn/completed');
-    notify('turn/completed');
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
 
     expect(request).toHaveBeenCalledTimes(1);
     expect(request).toHaveBeenCalledWith('turn/start', {
@@ -685,7 +744,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       queue: [claimed, secondQueued],
     });
 
-    notify('turn/completed');
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
     await flushPromises();
 
     expect(request).toHaveBeenCalledTimes(1);
@@ -702,7 +761,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     const queued = [{ id: 'queued-1', text: 'next', createdAt: 1 }];
     stateStore.write({ ...stateStore.read(), activeThreadId: null, activeTurnId: 'turn-old', queue: queued });
 
-    notify('turn/completed');
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
 
     expect(request).not.toHaveBeenCalled();
     expect(stateStore.read()).toMatchObject({ activeTurnId: null, queue: queued });
@@ -722,11 +781,53 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }],
     });
 
-    notify('turn/completed');
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
     stateStore.update((state) => ({ ...state, activeThreadId: 'thread-2', activeTurnId: null }));
     resolveStart({ turn: { id: 'turn-from-thread-1' } });
     await flushPromises();
 
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-2', activeTurnId: null, queue: [] });
+  });
+
+  it('ignores stale completion notifications from a different active session', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { stateStore, notify } = await makeHarness(request);
+    const queued = [{ id: 'queued-1', text: 'next', createdAt: 1 }];
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-current',
+      activeTurnId: 'turn-current',
+      queue: queued,
+    });
+
+    notify('turn/completed', { threadId: 'thread-old', turnId: 'turn-old' });
+
+    expect(request).not.toHaveBeenCalled();
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-current',
+      activeTurnId: 'turn-current',
+      queue: queued,
+    });
+  });
+
+  it('ignores stale completion notifications for a previous turn in the active session', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { stateStore, notify } = await makeHarness(request);
+    const queued = [{ id: 'queued-1', text: 'next', createdAt: 1 }];
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-current',
+      queue: queued,
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+
+    expect(request).not.toHaveBeenCalled();
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-current',
+      queue: queued,
+    });
   });
 });

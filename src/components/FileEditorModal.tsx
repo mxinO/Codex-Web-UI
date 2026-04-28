@@ -1,4 +1,3 @@
-import { Editor } from '@monaco-editor/react';
 import { useEffect, useMemo, useState } from 'react';
 
 interface FileEditorModalProps {
@@ -93,19 +92,14 @@ export default function FileEditorModal({ path, initialContent, readOnly, onClos
         </div>
         {error && <div className="file-editor-error">{error}</div>}
         <div className="file-editor-body">
-          <Editor
-            height="100%"
-            language={language}
-            theme={theme}
+          <textarea
+            className="file-editor-textarea"
+            aria-label={`${language} file contents`}
             value={content}
-            onChange={(value) => setContent(value ?? '')}
-            options={{
-              readOnly,
-              minimap: { enabled: false },
-              scrollBeyondLastLine: false,
-              wordWrap: 'on',
-              automaticLayout: true,
-            }}
+            onChange={(event) => setContent(event.target.value)}
+            readOnly={readOnly}
+            spellCheck={false}
+            data-theme={theme}
           />
         </div>
       </div>
