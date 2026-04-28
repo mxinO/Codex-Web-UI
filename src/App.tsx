@@ -1,9 +1,11 @@
 import { useState } from 'react';
 import AuthOverlay from './components/AuthOverlay';
+import ChatTimeline from './components/ChatTimeline';
 import CwdPicker from './components/CwdPicker';
 import Header from './components/Header';
 import SessionPicker from './components/SessionPicker';
 import { useCodexSocket } from './hooks/useCodexSocket';
+import { useThreadTimeline } from './hooks/useThreadTimeline';
 import { useTheme } from './hooks/useTheme';
 import type { CodexThread } from './types/codex';
 
@@ -11,6 +13,8 @@ export default function App() {
   const socket = useCodexSocket();
   const { theme, setTheme } = useTheme();
   const state = socket.hello?.state;
+  const activeThreadId = state?.activeThreadId ?? null;
+  const timeline = useThreadTimeline(activeThreadId, socket.rpc);
   const [threads, setThreads] = useState<CodexThread[]>([]);
   const [sessionPickerOpen, setSessionPickerOpen] = useState(false);
   const [cwdPickerOpen, setCwdPickerOpen] = useState(false);
@@ -84,7 +88,11 @@ export default function App() {
             }}
           />
         </div>
-        <div className="empty-state">No active session loaded.</div>
+        {activeThreadId ? (
+          <ChatTimeline items={timeline.items} onLoadOlder={timeline.loadOlder} hasOlder={timeline.hasOlder} loading={timeline.loading} />
+        ) : (
+          <div className="empty-state">No active session loaded.</div>
+        )}
       </main>
       {cwdPickerOpen && (
         <CwdPicker
