@@ -1,3 +1,4 @@
+import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import type http from 'node:http';
 import nodePath from 'node:path';
@@ -6,7 +7,7 @@ import { isTokenValid, parseTokenFromCookie } from './auth.js';
 import type { CodexAppServer } from './appServer.js';
 import { isInteractiveCommandBlocked, runBangCommand } from './bangCommand.js';
 import type { ServerConfig } from './config.js';
-import { resolveExistingPathInsideRoot, resolveWritablePathInsideRoot } from './fileTransfer.js';
+import { assertPathInsideRoot, resolveExistingPathInsideRoot, resolveWritablePathInsideRoot } from './fileTransfer.js';
 import type { HostStateStore } from './hostState.js';
 import type { JsonRpcServerRequest } from './jsonRpc.js';
 import { logWarn } from './logger.js';
@@ -100,6 +101,9 @@ const REASONING_EFFORTS = new Set<CodexReasoningEffort>(['none', 'minimal', 'low
 const SANDBOX_MODES = new Set<CodexSandboxMode>(['read-only', 'workspace-write', 'danger-full-access']);
 const COLLABORATION_MODES = new Set<CodexCollaborationMode>(['default', 'plan']);
 const BROWSE_DIRECTORY_LIMIT = 500;
+const FILE_DIFF_SNAPSHOT_MAX_BYTES = 1024 * 1024;
+const FILE_DIFF_SNAPSHOT_TTL_MS = 10 * 60 * 1000;
+const FILE_DIFF_SNAPSHOT_MAX_ENTRIES = 50;
 
 function getOptionalString(params: unknown, key: string): string | null {
   if (!isRecord(params) || !hasOwn(params, key)) return null;
@@ -350,6 +354,252 @@ function turnListParams(params: unknown): { threadId: string; cursor: unknown; l
   };
 }
 
+interface FileSnapshot {
+  before: string | null;
+  createdAt: number;
+}
+
+interface FileDiffParams {
+  threadId: string | null;
+  turnId: string | null;
+  path: string;
+  changes: unknown[];
+}
+
+function stringValue(value: unknown, key: string): string | null {
+  if (!isRecord(value) || typeof value[key] !== 'string') return null;
+  const text = value[key].trim();
+  return text ? text : null;
+}
+
+function changePath(change: unknown): string | null {
+  return stringValue(change, 'path') ?? stringValue(change, 'file') ?? stringValue(change, 'filePath') ?? stringValue(change, 'file_path');
+}
+
+function fileChangePaths(value: unknown): string[] {
+  const paths = new Set<string>();
+  const direct = changePath(value);
+  if (direct) paths.add(direct);
+  if (isRecord(value) && Array.isArray(value.changes)) {
+    for (const change of value.changes) {
+      const path = changePath(change);
+      if (path) paths.add(path);
+    }
+  }
+  return Array.from(paths);
+}
+
+function fileDiffParams(params: unknown): FileDiffParams | string {
+  if (!isRecord(params)) return 'file diff params are required';
+  const path = changePath(params) ?? (Array.isArray(params.changes) ? params.changes.map(changePath).find((item): item is string => Boolean(item)) : null);
+  if (!path) return 'path is required';
+  return {
+    threadId: stringValue(params, 'threadId') ?? stringValue(params, 'thread_id'),
+    turnId: stringValue(params, 'turnId') ?? stringValue(params, 'turn_id'),
+    path,
+    changes: Array.isArray(params.changes) ? params.changes.filter(isRecord) : [],
+  };
+}
+
+function snapshotKey(threadId: string | null, turnId: string | null, filePath: string): string {
+  return `${threadId ?? ''}\0${turnId ?? ''}\0${filePath}`;
+}
+
+function readSnapshotFile(filePath: string): string | null {
+  try {
+    const stats = fsSync.statSync(filePath);
+    if (!stats.isFile() || stats.size > FILE_DIFF_SNAPSHOT_MAX_BYTES) return null;
+    return fsSync.readFileSync(filePath, 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+function isPathInsideRoot(resolvedRoot: string, resolvedTarget: string): boolean {
+  const relative = nodePath.relative(resolvedRoot, resolvedTarget);
+  return relative === '' || (!relative.startsWith('..') && !nodePath.isAbsolute(relative));
+}
+
+function resolveSnapshotPathInsideRoot(root: string, target: string): string {
+  const realRoot = fsSync.realpathSync(root);
+  const lexicalTarget = assertPathInsideRoot(root, target);
+
+  try {
+    const realTarget = fsSync.realpathSync(lexicalTarget);
+    if (!isPathInsideRoot(realRoot, realTarget)) throw new Error('path is outside active workspace');
+    return realTarget;
+  } catch (error) {
+    if (typeof error !== 'object' || error === null || (error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  }
+
+  const realParent = fsSync.realpathSync(nodePath.dirname(lexicalTarget));
+  if (!isPathInsideRoot(realRoot, realParent)) throw new Error('path is outside active workspace');
+  return lexicalTarget;
+}
+
+async function readCurrentFileForDiff(filePath: string): Promise<string> {
+  try {
+    const stats = await fs.stat(filePath);
+    if (!stats.isFile() || stats.size > FILE_DIFF_SNAPSHOT_MAX_BYTES) return '';
+    return await fs.readFile(filePath, 'utf8');
+  } catch (error) {
+    if (typeof error === 'object' && error !== null && (error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+    throw error;
+  }
+}
+
+async function resolveDiffPathInsideRoot(deps: BrowserSocketDeps, filePath: string): Promise<string> {
+  const resolvedPath = await resolveWritableRpcPath(deps, filePath);
+  try {
+    return await fs.realpath(resolvedPath);
+  } catch (error) {
+    if (typeof error === 'object' && error !== null && (error as NodeJS.ErrnoException).code === 'ENOENT') return resolvedPath;
+    throw error;
+  }
+}
+
+function diffText(change: unknown): string | null {
+  return getStringPath(change, ['diff']) ?? getStringPath(change, ['patch']) ?? getStringPath(change, ['unifiedDiff']) ?? getStringPath(change, ['unified_diff']);
+}
+
+function changeKindType(change: unknown): string | null {
+  return getStringPath(change, ['kind', 'type']) ?? getStringPath(change, ['type']);
+}
+
+function isPatch(text: string): boolean {
+  return /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/m.test(text);
+}
+
+function splitContentLines(text: string): string[] {
+  if (!text) return [];
+  const lines = text.split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  return lines;
+}
+
+function joinContentLines(lines: string[], trailingNewline: boolean): string {
+  if (lines.length === 0) return '';
+  return `${lines.join('\n')}${trailingNewline ? '\n' : ''}`;
+}
+
+function applyUnifiedPatch(content: string, patch: string): string | null {
+  const source = splitContentLines(content);
+  const output: string[] = [];
+  let sourceIndex = 0;
+  let trailingNewline = content.endsWith('\n');
+  const lines = patch.split('\n');
+  let index = 0;
+  let applied = false;
+
+  while (index < lines.length) {
+    const header = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(lines[index]);
+    if (!header) {
+      index += 1;
+      continue;
+    }
+
+    applied = true;
+    const oldStart = Number(header[1]);
+    const targetIndex = oldStart > 0 ? oldStart - 1 : 0;
+    while (sourceIndex < targetIndex && sourceIndex < source.length) {
+      output.push(source[sourceIndex]);
+      sourceIndex += 1;
+    }
+
+    index += 1;
+    while (index < lines.length && !lines[index].startsWith('@@ ')) {
+      const line = lines[index];
+      if (line === '\\ No newline at end of file') {
+        trailingNewline = false;
+        index += 1;
+        continue;
+      }
+      if (!line) {
+        index += 1;
+        continue;
+      }
+      const marker = line[0];
+      const text = line.slice(1);
+      if (marker === ' ') {
+        output.push(text);
+        sourceIndex += 1;
+      } else if (marker === '-') {
+        sourceIndex += 1;
+      } else if (marker === '+') {
+        output.push(text);
+        trailingNewline = true;
+      }
+      index += 1;
+    }
+  }
+
+  if (!applied) return null;
+  while (sourceIndex < source.length) {
+    output.push(source[sourceIndex]);
+    sourceIndex += 1;
+  }
+  return joinContentLines(output, trailingNewline);
+}
+
+function reconstructAddedFileDiff(changes: unknown[]): { before: string; after: string } | null {
+  const first = changes[0];
+  const firstDiff = diffText(first);
+  if (changeKindType(first) !== 'add' || firstDiff === null || isPatch(firstDiff)) return null;
+
+  let after = firstDiff;
+  for (const change of changes.slice(1)) {
+    const patch = diffText(change);
+    if (!patch || !isPatch(patch)) continue;
+    const next = applyUnifiedPatch(after, patch);
+    if (next === null) return null;
+    after = next;
+  }
+
+  return { before: '', after };
+}
+
+function firstTextAt(change: unknown, keys: string[]): string | null {
+  for (const key of keys) {
+    const value = getStringPath(change, [key]);
+    if (value !== null) return value;
+  }
+  return null;
+}
+
+function explicitBeforeAfterDiff(changes: unknown[]): { before: string; after: string } | null {
+  const beforeKeys = ['before', 'oldText', 'old_text', 'previousText', 'previous_text', 'original', 'beforeContent', 'before_content'];
+  const afterKeys = ['after', 'newText', 'new_text', 'updatedText', 'updated_text', 'modified', 'afterContent', 'after_content'];
+  const first = changes.find((change) => firstTextAt(change, beforeKeys) !== null);
+  const last = [...changes].reverse().find((change) => firstTextAt(change, afterKeys) !== null);
+  if (!first || !last) return null;
+  const before = firstTextAt(first, beforeKeys);
+  const after = firstTextAt(last, afterKeys);
+  return before !== null && after !== null ? { before, after } : null;
+}
+
+function patchSnippetDiff(changes: unknown[]): { before: string; after: string } | null {
+  const beforeParts: string[] = [];
+  const afterParts: string[] = [];
+  for (const change of changes) {
+    const patch = diffText(change);
+    if (!patch || !isPatch(patch)) continue;
+    const beforeLines: string[] = [];
+    const afterLines: string[] = [];
+    for (const line of patch.split('\n')) {
+      if (!line || line.startsWith('@@ ') || line === '\\ No newline at end of file') continue;
+      const marker = line[0];
+      const text = line.slice(1);
+      if (marker === ' ' || marker === '-') beforeLines.push(text);
+      if (marker === ' ' || marker === '+') afterLines.push(text);
+    }
+    beforeParts.push(beforeLines.join('\n'));
+    afterParts.push(afterLines.join('\n'));
+  }
+
+  if (beforeParts.length === 0 && afterParts.length === 0) return null;
+  return { before: beforeParts.join('\n~~~ ... ~~~\n'), after: afterParts.join('\n~~~ ... ~~~\n') };
+}
+
 function extractResolvedRequestId(message: { method: string; params?: unknown }): number | string | null {
   if (!/request.*resolved|serverRequest.*resolved/i.test(message.method)) return null;
   if (!isRecord(message.params)) return null;
@@ -365,6 +615,74 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const pendingServerRequests = new Map<string, JsonRpcServerRequest>();
   const resumedThreadIds = new Set<string>();
   const resumeThreadPromises = new Map<string, Promise<void>>();
+  const fileSnapshots = new Map<string, FileSnapshot>();
+
+  const pruneFileSnapshots = () => {
+    const now = Date.now();
+    for (const [key, snapshot] of fileSnapshots) {
+      if (now - snapshot.createdAt > FILE_DIFF_SNAPSHOT_TTL_MS) fileSnapshots.delete(key);
+    }
+    while (fileSnapshots.size > FILE_DIFF_SNAPSHOT_MAX_ENTRIES) {
+      const oldest = fileSnapshots.keys().next().value;
+      if (typeof oldest !== 'string') break;
+      fileSnapshots.delete(oldest);
+    }
+  };
+
+  const captureFileChangeSnapshots = (params: unknown) => {
+    const state = deps.stateStore.read();
+    if (!state.activeCwd) return;
+    pruneFileSnapshots();
+
+    for (const filePath of fileChangePaths(params)) {
+      let resolvedPath: string;
+      try {
+        resolvedPath = resolveSnapshotPathInsideRoot(state.activeCwd, filePath);
+      } catch {
+        continue;
+      }
+      const key = snapshotKey(state.activeThreadId, state.activeTurnId, resolvedPath);
+      if (fileSnapshots.has(key)) continue;
+      if (fileSnapshots.size >= FILE_DIFF_SNAPSHOT_MAX_ENTRIES) break;
+      fileSnapshots.set(key, { before: readSnapshotFile(resolvedPath), createdAt: Date.now() });
+    }
+  };
+
+  const findFileSnapshot = (threadId: string | null, turnId: string | null, filePath: string): FileSnapshot | null => {
+    pruneFileSnapshots();
+    return (
+      fileSnapshots.get(snapshotKey(threadId, turnId, filePath)) ??
+      fileSnapshots.get(snapshotKey(null, turnId, filePath)) ??
+      fileSnapshots.get(snapshotKey(threadId, null, filePath)) ??
+      fileSnapshots.get(snapshotKey(null, null, filePath)) ??
+      null
+    );
+  };
+
+  const buildFileChangeDiff = async (params: FileDiffParams) => {
+    const resolvedPath = await resolveDiffPathInsideRoot(deps, params.path);
+    const snapshot = findFileSnapshot(params.threadId, params.turnId, resolvedPath);
+    if (snapshot) {
+      return {
+        path: resolvedPath,
+        before: snapshot.before ?? '',
+        after: await readCurrentFileForDiff(resolvedPath),
+        source: 'snapshot',
+      };
+    }
+
+    const reconstructed = explicitBeforeAfterDiff(params.changes) ?? reconstructAddedFileDiff(params.changes) ?? patchSnippetDiff(params.changes);
+    if (reconstructed) {
+      return { path: resolvedPath, ...reconstructed, source: 'reconstructed' };
+    }
+
+    return {
+      path: resolvedPath,
+      before: '',
+      after: await readCurrentFileForDiff(resolvedPath),
+      source: 'current',
+    };
+  };
 
   const broadcastHello = (state: HostRuntimeState = deps.stateStore.read()) => {
     for (const client of wss.clients) {
@@ -513,6 +831,9 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   });
 
   const unsubscribeServerRequest = deps.codex.onServerRequest((message) => {
+    if (message.method === 'item/fileChange/requestApproval') {
+      captureFileChangeSnapshots(message.params);
+    }
     pendingServerRequests.set(requestKey(message.id), message);
     for (const client of wss.clients) send(client, { type: 'codex/request', message });
   });
@@ -793,6 +1114,18 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
           const resolvedPath = await resolveReadableRpcPath(deps, filePath);
           const result = await requestCodex('fs/getMetadata', { path: resolvedPath });
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/fileChange/diff') {
+          const params = fileDiffParams(request.params);
+          if (typeof params === 'string') {
+            send(ws, { type: 'rpc/error', id: request.id, error: params });
+            return;
+          }
+
+          const result = await buildFileChangeDiff(params);
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }

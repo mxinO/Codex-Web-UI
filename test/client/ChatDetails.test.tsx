@@ -248,7 +248,84 @@ describe('DetailModal', () => {
     expect(document.querySelector('[aria-label="After"]')?.textContent).toContain('new text');
   });
 
-  it('renders Codex patch diffs from grouped file changes', async () => {
+  it('renders grouped add-and-update file changes as one final before/after diff', async () => {
+    const item: TimelineItem = {
+      id: 'f1',
+      kind: 'fileChange',
+      timestamp: 1,
+      filePath: '/repo/retry.txt',
+      changeCount: 5,
+      item: {
+        type: 'fileChange',
+        id: 'raw-file',
+        status: 'completed',
+        changes: [
+          {
+            path: '/repo/retry.txt',
+            kind: { type: 'add' },
+            diff: 'File edit retry\n\nEdit 1: Initial file created.\n',
+          },
+          {
+            path: '/repo/retry.txt',
+            kind: { type: 'update', move_path: null },
+            diff: '@@ -3 +3,2 @@\n Edit 1: Initial file created.\n+Edit 2: Added a second line.\n',
+          },
+          {
+            path: '/repo/retry.txt',
+            kind: { type: 'update', move_path: null },
+            diff: '@@ -1,2 +1,2 @@\n-File edit retry\n+File edit retry - updated title\n \n',
+          },
+          {
+            path: '/repo/retry.txt',
+            kind: { type: 'update', move_path: null },
+            diff: '@@ -4 +4,2 @@\n Edit 2: Added a second line.\n+Edit 3: Added a third line after changing the title.\n',
+          },
+          {
+            path: '/repo/retry.txt',
+            kind: { type: 'update', move_path: null },
+            diff: '@@ -5 +5,3 @@\n Edit 3: Added a third line after changing the title.\n+\n+Done: Multiple edits were applied successfully.\n',
+          },
+        ],
+      },
+    };
+
+    render(<DetailModal item={item} onClose={vi.fn()} />);
+
+    await act(async () => {
+      await import('../../src/components/DiffViewer');
+    });
+    await flushLazy();
+
+    expect(document.querySelector('[aria-label="Patch"]')).toBeNull();
+    expect(document.querySelector('[aria-label="Before"]')?.textContent).toBe('');
+    expect(document.querySelector('[aria-label="After"]')?.textContent).toBe(
+      'File edit retry - updated title\n\nEdit 1: Initial file created.\nEdit 2: Added a second line.\nEdit 3: Added a third line after changing the title.\n\nDone: Multiple edits were applied successfully.\n',
+    );
+  });
+
+  it('shows diff load errors instead of falling back to raw patch logs', async () => {
+    const item: TimelineItem = {
+      id: 'f1',
+      kind: 'fileChange',
+      timestamp: 1,
+      filePath: '/repo/retry.txt',
+      diffError: 'path is outside active workspace',
+      item: {
+        type: 'fileChange',
+        id: 'raw-file',
+        status: 'completed',
+        changes: [{ path: '/repo/retry.txt', diff: 'raw edit log that is not a patch' }],
+      },
+    };
+
+    render(<DetailModal item={item} onClose={vi.fn()} />);
+
+    expect(document.querySelector('[aria-label="Patch"]')).toBeNull();
+    expect(document.querySelector('.detail-pre')?.textContent).toContain('Unable to load file diff: path is outside active workspace');
+    expect(document.querySelector('.detail-pre')?.textContent).not.toBe('raw edit log that is not a patch');
+  });
+
+  it('renders Codex patch hunks as side-by-side diff snippets', async () => {
     const item: TimelineItem = {
       id: 'f1',
       kind: 'fileChange',
@@ -275,9 +352,9 @@ describe('DetailModal', () => {
     });
     await flushLazy();
 
-    const patch = document.querySelector('[aria-label="Patch"]');
-    expect(patch?.textContent).toContain('-old');
-    expect(patch?.textContent).toContain('+three');
+    expect(document.querySelector('[aria-label="Patch"]')).toBeNull();
+    expect(document.querySelector('[aria-label="Before"]')?.textContent).toContain('old');
+    expect(document.querySelector('[aria-label="After"]')?.textContent).toContain('three');
   });
 
   it('caps large JSON details and renders dialog semantics', () => {

@@ -111,6 +111,17 @@ function extractModifiedAtMs(result: unknown): number | null {
   return null;
 }
 
+function fileChangeTurnId(item: Extract<TimelineItem, { kind: 'fileChange' }>): string | null {
+  const marker = ':file:';
+  const markerIndex = item.id.indexOf(marker);
+  return markerIndex > 0 ? item.id.slice(0, markerIndex) : null;
+}
+
+function fileChangeRawChanges(item: Extract<TimelineItem, { kind: 'fileChange' }>): unknown[] {
+  const changes = (item.item as Record<string, unknown>).changes;
+  return Array.isArray(changes) ? changes : [];
+}
+
 export default function App() {
   const socket = useCodexSocket();
   const { theme, setTheme } = useTheme();
@@ -257,6 +268,31 @@ export default function App() {
     setPendingUserItems((items) => [...items, { id, kind: 'user', timestamp: Date.now(), text }]);
     return () => setPendingUserItems((items) => items.filter((item) => item.id !== id));
   }, []);
+
+  const openDetailItem = useCallback((item: TimelineItem) => {
+    if (item.kind !== 'fileChange') {
+      setDetailItem(item);
+      return;
+    }
+
+    const loadingItem: TimelineItem = { ...item, diffLoading: true, diffError: undefined, resolvedDiff: undefined };
+    setDetailItem(loadingItem);
+
+    void socket
+      .rpc<{ before: string; after: string; path?: string | null }>('webui/fileChange/diff', {
+        threadId: activeThreadId,
+        turnId: fileChangeTurnId(item),
+        path: item.filePath,
+        changes: fileChangeRawChanges(item),
+      })
+      .then((diff) => {
+        setDetailItem((current) => (current?.id === item.id ? { ...item, resolvedDiff: diff } : current));
+      })
+      .catch((error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        setDetailItem((current) => (current?.id === item.id ? { ...item, diffError: message } : current));
+      });
+  }, [activeThreadId, socket.rpc]);
 
   const startSession = useCallback(async (cwd: string) => {
     setSessionLoading(true);
@@ -487,7 +523,7 @@ export default function App() {
                   hasOlder={timeline.hasOlder}
                   showJumpToLatest={!timeline.isViewingLatest}
                   loading={timeline.loading}
-                  onOpenDetail={setDetailItem}
+                  onOpenDetail={openDetailItem}
                   onApprovalDecision={respondToApproval}
                   onQueuedEdit={(message) => void editQueued(message as ClientQueuedMessage)}
                   onQueuedRemove={(id) => void removeQueued(id)}

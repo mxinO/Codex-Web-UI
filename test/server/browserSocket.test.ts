@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -460,6 +460,197 @@ describe('attachBrowserSocket app-server requests', () => {
 
     expect(respond).toHaveBeenCalledTimes(1);
     expect(duplicateResponse).toEqual({ type: 'rpc/error', id: 53, error: 'approval request is no longer pending' });
+  });
+
+  it('snapshots files before file-change approval and builds click-time diffs', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, requestFromServer } = await makeHarness(request);
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const filePath = join(root, 'a.txt');
+    writeFileSync(filePath, 'old\n');
+    stateStore.update((state) => ({ ...state, activeCwd: root, activeThreadId: 'thread-1', activeTurnId: 'turn-1' }));
+
+    const approvalBroadcast = nextMessage(ws);
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: 'approval-snapshot',
+      method: 'item/fileChange/requestApproval',
+      params: { path: filePath },
+    });
+    await approvalBroadcast;
+
+    writeFileSync(filePath, 'new\n');
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 57,
+        method: 'webui/fileChange/diff',
+        params: { threadId: 'thread-1', turnId: 'turn-1', path: filePath, changes: [{ path: filePath }] },
+      }),
+    );
+    const response = await nextRpcResponse(ws, 57);
+
+    expect(response).toEqual({
+      type: 'rpc/result',
+      id: 57,
+      result: { path: filePath, before: 'old\n', after: 'new\n', source: 'snapshot' },
+    });
+  });
+
+  it('does not snapshot symlink targets outside the active workspace', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, requestFromServer } = await makeHarness(request);
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    const outside = mkdtempSync(join(tmpdir(), 'codex-webui-outside-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(outside, { recursive: true, force: true }));
+    const outsidePath = join(outside, 'secret.txt');
+    const linkPath = join(root, 'secret-link.txt');
+    writeFileSync(outsidePath, 'outside secret\n');
+    symlinkSync(outsidePath, linkPath);
+    stateStore.update((state) => ({ ...state, activeCwd: root, activeThreadId: 'thread-1', activeTurnId: 'turn-1' }));
+
+    const approvalBroadcast = nextMessage(ws);
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: 'approval-symlink',
+      method: 'item/fileChange/requestApproval',
+      params: { path: linkPath },
+    });
+    await approvalBroadcast;
+
+    rmSync(linkPath);
+    writeFileSync(linkPath, 'inside file\n');
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 59,
+        method: 'webui/fileChange/diff',
+        params: { threadId: 'thread-1', turnId: 'turn-1', path: linkPath, changes: [{ path: linkPath }] },
+      }),
+    );
+    const response = await nextRpcResponse(ws, 59);
+
+    expect(response).toEqual({
+      type: 'rpc/result',
+      id: 59,
+      result: { path: linkPath, before: '', after: 'inside file\n', source: 'current' },
+    });
+  });
+
+  it('keeps the snapshot cache bounded within a single approval payload', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, requestFromServer } = await makeHarness(request);
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const paths = Array.from({ length: 55 }, (_, index) => join(root, `file-${index}.txt`));
+    for (const filePath of paths) writeFileSync(filePath, `old ${filePath}\n`);
+    stateStore.update((state) => ({ ...state, activeCwd: root, activeThreadId: 'thread-1', activeTurnId: 'turn-1' }));
+
+    const approvalBroadcast = nextMessage(ws);
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: 'approval-many-files',
+      method: 'item/fileChange/requestApproval',
+      params: { changes: paths.map((filePath) => ({ path: filePath })) },
+    });
+    await approvalBroadcast;
+
+    writeFileSync(paths[54], 'new last file\n');
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 60,
+        method: 'webui/fileChange/diff',
+        params: { threadId: 'thread-1', turnId: 'turn-1', path: paths[54], changes: [{ path: paths[54] }] },
+      }),
+    );
+    const response = await nextRpcResponse(ws, 60);
+
+    expect(response).toEqual({
+      type: 'rpc/result',
+      id: 60,
+      result: { path: paths[54], before: '', after: 'new last file\n', source: 'current' },
+    });
+  });
+
+  it('uses snapshots for in-workspace symlink edits', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, requestFromServer } = await makeHarness(request);
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const targetPath = join(root, 'target.txt');
+    const linkPath = join(root, 'target-link.txt');
+    writeFileSync(targetPath, 'old target\n');
+    symlinkSync(targetPath, linkPath);
+    stateStore.update((state) => ({ ...state, activeCwd: root, activeThreadId: 'thread-1', activeTurnId: 'turn-1' }));
+
+    const approvalBroadcast = nextMessage(ws);
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: 'approval-symlink-inside',
+      method: 'item/fileChange/requestApproval',
+      params: { path: linkPath },
+    });
+    await approvalBroadcast;
+
+    writeFileSync(targetPath, 'new target\n');
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 61,
+        method: 'webui/fileChange/diff',
+        params: { threadId: 'thread-1', turnId: 'turn-1', path: linkPath, changes: [{ path: linkPath }] },
+      }),
+    );
+    const response = await nextRpcResponse(ws, 61);
+
+    expect(response).toEqual({
+      type: 'rpc/result',
+      id: 61,
+      result: { path: targetPath, before: 'old target\n', after: 'new target\n', source: 'snapshot' },
+    });
+  });
+
+  it('reconstructs added-file diffs from grouped Codex file-change hunks when no snapshot exists', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request);
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const filePath = join(root, 'retry.txt');
+    stateStore.update((state) => ({ ...state, activeCwd: root, activeThreadId: 'thread-1', activeTurnId: 'turn-1' }));
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 58,
+        method: 'webui/fileChange/diff',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          path: filePath,
+          changes: [
+            { path: filePath, kind: { type: 'add' }, diff: 'File edit retry\n\nEdit 1: Initial file created.\n' },
+            { path: filePath, kind: { type: 'update' }, diff: '@@ -3 +3,2 @@\n Edit 1: Initial file created.\n+Edit 2: Added a second line.\n' },
+            { path: filePath, kind: { type: 'update' }, diff: '@@ -1,2 +1,2 @@\n-File edit retry\n+File edit retry - updated title\n \n' },
+          ],
+        },
+      }),
+    );
+    const response = await nextRpcResponse(ws, 58);
+
+    expect(response).toEqual({
+      type: 'rpc/result',
+      id: 58,
+      result: {
+        path: filePath,
+        before: '',
+        after: 'File edit retry - updated title\n\nEdit 1: Initial file created.\nEdit 2: Added a second line.\n',
+        source: 'reconstructed',
+      },
+    });
   });
 
   it('uses the stored pending request when browser approval params are spoofed', async () => {

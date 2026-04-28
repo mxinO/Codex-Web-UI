@@ -170,20 +170,135 @@ function allRecordChanges(value: unknown): unknown[] {
   return [value];
 }
 
-function fileChangeDiff(value: unknown): FileChangeDetail | null {
-  const change = firstRecordChange(value);
-  if (!change) return null;
+function diffText(change: unknown): string | null {
+  return firstStringAt(change, [['diff'], ['patch'], ['unifiedDiff'], ['unified_diff']]);
+}
 
-  const patch = allRecordChanges(value)
-    .map((entry) => firstStringAt(entry, [['diff'], ['patch'], ['unifiedDiff'], ['unified_diff']]))
-    .filter((entry): entry is string => entry !== null && entry.length > 0)
-    .join('\n\n');
-  if (patch) {
-    const filePath = firstStringAt(change, [['path'], ['file'], ['filePath'], ['file_path']]);
-    return { type: 'patch', patch, language: languageFromPath(filePath) };
+function changeKindType(change: unknown): string | null {
+  return firstStringAt(change, [['kind', 'type'], ['type']]);
+}
+
+function isPatch(text: string): boolean {
+  return /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/m.test(text);
+}
+
+function splitContentLines(text: string): string[] {
+  if (!text) return [];
+  const lines = text.split('\n');
+  if (lines.at(-1) === '') lines.pop();
+  return lines;
+}
+
+function joinContentLines(lines: string[], trailingNewline: boolean): string {
+  if (lines.length === 0) return '';
+  return `${lines.join('\n')}${trailingNewline ? '\n' : ''}`;
+}
+
+function applyUnifiedPatch(content: string, patch: string): string | null {
+  const source = splitContentLines(content);
+  const output: string[] = [];
+  let sourceIndex = 0;
+  let trailingNewline = content.endsWith('\n');
+  const lines = patch.split('\n');
+  let index = 0;
+  let applied = false;
+
+  while (index < lines.length) {
+    const header = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(lines[index]);
+    if (!header) {
+      index += 1;
+      continue;
+    }
+
+    applied = true;
+    const oldStart = Number(header[1]);
+    const targetIndex = oldStart > 0 ? oldStart - 1 : 0;
+    while (sourceIndex < targetIndex && sourceIndex < source.length) {
+      output.push(source[sourceIndex]);
+      sourceIndex += 1;
+    }
+
+    index += 1;
+    while (index < lines.length && !lines[index].startsWith('@@ ')) {
+      const line = lines[index];
+      if (line === '\\ No newline at end of file') {
+        trailingNewline = false;
+        index += 1;
+        continue;
+      }
+      if (!line) {
+        index += 1;
+        continue;
+      }
+
+      const marker = line[0];
+      const text = line.slice(1);
+      if (marker === ' ') {
+        output.push(text);
+        sourceIndex += 1;
+      } else if (marker === '-') {
+        sourceIndex += 1;
+      } else if (marker === '+') {
+        output.push(text);
+        trailingNewline = true;
+      }
+      index += 1;
+    }
   }
 
-  const before = firstStringAt(change, [
+  if (!applied) return null;
+  while (sourceIndex < source.length) {
+    output.push(source[sourceIndex]);
+    sourceIndex += 1;
+  }
+  return joinContentLines(output, trailingNewline);
+}
+
+function reconstructAddedFileDiff(changes: unknown[]): { before: string; after: string } | null {
+  const first = changes[0];
+  const firstDiff = diffText(first);
+  if (changeKindType(first) !== 'add' || firstDiff === null || isPatch(firstDiff)) return null;
+
+  let after = firstDiff;
+  for (const change of changes.slice(1)) {
+    const patch = diffText(change);
+    if (!patch || !isPatch(patch)) continue;
+    const next = applyUnifiedPatch(after, patch);
+    if (next === null) return null;
+    after = next;
+  }
+
+  return { before: '', after };
+}
+
+function explicitBeforeAfterDiff(changes: unknown[]): { before: string; after: string; filePath: string | null } | null {
+  const first = changes.find((change) =>
+    firstStringAt(change, [
+      ['before'],
+      ['oldText'],
+      ['old_text'],
+      ['previousText'],
+      ['previous_text'],
+      ['original'],
+      ['beforeContent'],
+      ['before_content'],
+    ]) !== null,
+  );
+  const last = [...changes].reverse().find((change) =>
+    firstStringAt(change, [
+      ['after'],
+      ['newText'],
+      ['new_text'],
+      ['updatedText'],
+      ['updated_text'],
+      ['modified'],
+      ['afterContent'],
+      ['after_content'],
+    ]) !== null,
+  );
+  if (!first || !last) return null;
+
+  const before = firstStringAt(first, [
     ['before'],
     ['oldText'],
     ['old_text'],
@@ -193,7 +308,7 @@ function fileChangeDiff(value: unknown): FileChangeDetail | null {
     ['beforeContent'],
     ['before_content'],
   ]);
-  const after = firstStringAt(change, [
+  const after = firstStringAt(last, [
     ['after'],
     ['newText'],
     ['new_text'],
@@ -203,11 +318,76 @@ function fileChangeDiff(value: unknown): FileChangeDetail | null {
     ['afterContent'],
     ['after_content'],
   ]);
-
   if (before === null || after === null) return null;
 
-  const filePath = firstStringAt(change, [['path'], ['file'], ['filePath'], ['file_path']]);
-  return { type: 'twoWay', before, after, language: languageFromPath(filePath) };
+  return {
+    before,
+    after,
+    filePath: firstStringAt(first, [['path'], ['file'], ['filePath'], ['file_path']]) ?? firstStringAt(last, [['path'], ['file'], ['filePath'], ['file_path']]),
+  };
+}
+
+function patchSnippetDiff(changes: unknown[]): { before: string; after: string } | null {
+  const beforeParts: string[] = [];
+  const afterParts: string[] = [];
+
+  for (const change of changes) {
+    const patch = diffText(change);
+    if (!patch || !isPatch(patch)) continue;
+
+    const beforeLines: string[] = [];
+    const afterLines: string[] = [];
+    for (const line of patch.split('\n')) {
+      if (!line || line.startsWith('@@ ') || line === '\\ No newline at end of file') continue;
+      const marker = line[0];
+      const text = line.slice(1);
+      if (marker === ' ' || marker === '-') beforeLines.push(text);
+      if (marker === ' ' || marker === '+') afterLines.push(text);
+    }
+    beforeParts.push(beforeLines.join('\n'));
+    afterParts.push(afterLines.join('\n'));
+  }
+
+  if (beforeParts.length === 0 && afterParts.length === 0) return null;
+  return { before: beforeParts.join('\n~~~ ... ~~~\n'), after: afterParts.join('\n~~~ ... ~~~\n') };
+}
+
+function fileChangeDiff(item: Extract<TimelineItem, { kind: 'fileChange' }>): FileChangeDetail | null {
+  if (item.resolvedDiff) {
+    return {
+      type: 'twoWay',
+      before: item.resolvedDiff.before,
+      after: item.resolvedDiff.after,
+      language: languageFromPath(item.resolvedDiff.path ?? item.filePath ?? null),
+    };
+  }
+
+  const value = item.item;
+  const change = firstRecordChange(value);
+  if (!change) return null;
+
+  const changes = allRecordChanges(value);
+  const explicit = explicitBeforeAfterDiff(changes);
+  if (explicit) {
+    return { type: 'twoWay', before: explicit.before, after: explicit.after, language: languageFromPath(explicit.filePath) };
+  }
+
+  const reconstructed = reconstructAddedFileDiff(changes) ?? patchSnippetDiff(changes);
+  if (reconstructed) {
+    const filePath = firstStringAt(change, [['path'], ['file'], ['filePath'], ['file_path']]);
+    return { type: 'twoWay', before: reconstructed.before, after: reconstructed.after, language: languageFromPath(filePath) };
+  }
+
+  const patch = changes
+    .map(diffText)
+    .filter((entry): entry is string => entry !== null && entry.length > 0)
+    .join('\n\n');
+  if (patch) {
+    const filePath = firstStringAt(change, [['path'], ['file'], ['filePath'], ['file_path']]);
+    return { type: 'patch', patch, language: languageFromPath(filePath) };
+  }
+
+  return null;
 }
 
 function getFocusableElements(element: HTMLElement): HTMLElement[] {
@@ -263,7 +443,7 @@ export default function DetailModal({ item, onClose }: { item: TimelineItem | nu
     }
   };
 
-  const diff = item.kind === 'fileChange' ? fileChangeDiff(item.item) : null;
+  const diff = item.kind === 'fileChange' && !item.diffLoading && !item.diffError ? fileChangeDiff(item) : null;
   const body =
     item.kind === 'assistant' ? (
       <Suspense fallback={<div className="detail-loading">Loading markdown...</div>}>
@@ -271,10 +451,14 @@ export default function DetailModal({ item, onClose }: { item: TimelineItem | nu
       </Suspense>
     ) : item.kind === 'bangCommand' ? (
       <pre className="detail-pre">{`$ ${item.command}\n${item.output}`}</pre>
+    ) : item.kind === 'fileChange' && item.diffLoading ? (
+      <div className="detail-loading">Loading diff...</div>
     ) : diff ? (
       <Suspense fallback={<div className="detail-loading">Loading diff...</div>}>
         {diff.type === 'patch' ? <DiffViewer patch={diff.patch} language={diff.language} /> : <DiffViewer before={diff.before} after={diff.after} language={diff.language} />}
       </Suspense>
+    ) : item.kind === 'fileChange' && item.diffError ? (
+      <pre className="detail-pre">{`Unable to load file diff: ${item.diffError}\n\n${stringifyDetail({ kind: item.kind, metadata: item.item })}`}</pre>
     ) : item.kind === 'fileChange' ? (
       <pre className="detail-pre">{stringifyDetail({ kind: item.kind, metadata: item.item })}</pre>
     ) : (

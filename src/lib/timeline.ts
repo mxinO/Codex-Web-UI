@@ -6,7 +6,17 @@ export type TimelineItem =
   | { id: string; kind: 'assistant'; timestamp: number; text: string; phase: string | null }
   | { id: string; kind: 'command'; timestamp: number; command: string; cwd: string; output: string; status: string; exitCode: number | null }
   | { id: string; kind: 'bangCommand'; timestamp: number; command: string; cwd: string; output: string; status: string; exitCode: number | null }
-  | { id: string; kind: 'fileChange'; timestamp: number; item: CodexItem; filePath?: string | null; changeCount?: number }
+  | {
+      id: string;
+      kind: 'fileChange';
+      timestamp: number;
+      item: CodexItem;
+      filePath?: string | null;
+      changeCount?: number;
+      resolvedDiff?: { before: string; after: string; path?: string | null };
+      diffLoading?: boolean;
+      diffError?: string;
+    }
   | { id: string; kind: 'tool'; timestamp: number; item: CodexItem }
   | { id: string; kind: 'notice'; timestamp: number; text: string }
   | { id: string; kind: 'warning'; timestamp: number; text: string }
