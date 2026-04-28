@@ -1,0 +1,64 @@
+:root {
+  --bg-primary: #1e1e1e;
+  --bg-secondary: #252526;
+  --bg-tertiary: #2d2d2d;
+  --bg-hover: #37373d;
+  --border: #3e3e42;
+  --text-primary: #cccccc;
+  --text-secondary: #858585;
+  --text-accent: #569cd6;
+  --green: #4ec9b0;
+  --red: #f44747;
+  --yellow: #dcdcaa;
+  --user-bubble: #2b5278;
+}
+
+[data-theme='light'] {
+  --bg-primary: #ffffff;
+  --bg-secondary: #f3f3f3;
+  --bg-tertiary: #e8e8e8;
+  --bg-hover: #e5e5e5;
+  --border: #d4d4d4;
+  --text-primary: #1f1f1f;
+  --text-secondary: #666666;
+  --text-accent: #0066b8;
+  --green: #16825d;
+  --red: #d13438;
+  --yellow: #996f00;
+  --user-bubble: #cce6ff;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  height: 100vh;
+  font-family: 'Segoe UI', Consolas, monospace;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+#root,
+.app-shell {
+  height: 100vh;
+}
+
+.topbar {
+  height: 40px;
+  display: flex;
+  align-items: center;
+  padding: 0 16px;
+  background: var(--bg-secondary);
+  border-bottom: 1px solid var(--border);
+  font-weight: 600;
+}
+
+.empty-state {
+  height: calc(100vh - 40px);
+  display: grid;
+  place-items: center;
+  color: var(--text-secondary);
+}
