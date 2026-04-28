@@ -1,16 +1,18 @@
 import { ChangeEvent, FormEvent, KeyboardEvent, useEffect, useRef, useState } from 'react';
 import { BANG_COMMAND_RPC_TIMEOUT_MS, parseBangCommand } from '../lib/bangCommands';
 import { classifySlashCommand } from '../lib/slashCommands';
+import type { CodexRunOptions } from '../types/ui';
 
 interface InputBoxProps {
   rpc: <T>(method: string, params?: unknown, timeoutMs?: number) => Promise<T>;
   threadId: string | null;
   isRunning: boolean;
   activeCwd?: string | null;
+  runOptions?: CodexRunOptions;
   draftOverride: string | null;
   disabled?: boolean;
   onDraftConsumed: () => void;
-  onEnqueue: (text: string) => Promise<void>;
+  onEnqueue: (text: string, options?: CodexRunOptions) => Promise<void>;
 }
 
 interface FileSuggestion {
@@ -66,6 +68,7 @@ export default function InputBox({
   threadId,
   isRunning,
   activeCwd,
+  runOptions,
   draftOverride,
   disabled = false,
   onDraftConsumed,
@@ -167,7 +170,7 @@ export default function InputBox({
       }
 
       if (isRunning) {
-        await onEnqueue(text);
+        await onEnqueue(text, runOptions);
         setDraft('');
         return;
       }
@@ -177,7 +180,7 @@ export default function InputBox({
         return;
       }
 
-      await rpc('webui/turn/start', { threadId, text });
+      await rpc('webui/turn/start', { threadId, text, options: runOptions });
       setDraft('');
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));

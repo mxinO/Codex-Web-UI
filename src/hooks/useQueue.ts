@@ -1,17 +1,19 @@
 import { useCallback, useMemo, useState } from 'react';
+import type { CodexRunOptions } from '../types/ui';
 
 export interface ClientQueuedMessage {
   id: string;
   text: string;
   createdAt: number;
+  options?: Partial<CodexRunOptions>;
 }
 
 export function useQueue(rpc: <T>(method: string, params?: unknown) => Promise<T>, initialQueue: ClientQueuedMessage[] = []) {
   const [queue, setQueue] = useState<ClientQueuedMessage[]>(initialQueue);
 
   const enqueue = useCallback(
-    async (text: string) => {
-      const next = await rpc<ClientQueuedMessage[]>('webui/queue/enqueue', { text });
+    async (text: string, options?: CodexRunOptions) => {
+      const next = await rpc<ClientQueuedMessage[]>('webui/queue/enqueue', { text, options });
       setQueue(next);
     },
     [rpc],

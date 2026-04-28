@@ -66,6 +66,45 @@ describe('HostStateStore', () => {
     }
   });
 
+  it('drops queued collaboration mode options when no model is persisted', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codex-webui-state-'));
+    try {
+      writeFileSync(
+        join(dir, 'login-node.runtime.json'),
+        JSON.stringify({
+          queue: [
+            {
+              id: 'mode-only',
+              text: 'next',
+              createdAt: 1,
+              options: { mode: 'plan', effort: 'high', sandbox: 'workspace-write' },
+            },
+            {
+              id: 'mode-with-model',
+              text: 'next with model',
+              createdAt: 2,
+              options: { model: 'gpt-5.5', mode: 'plan', effort: 'high' },
+            },
+          ],
+        }),
+      );
+
+      const state = new HostStateStore(dir, 'login-node').read();
+
+      expect(state.queue[0]).toMatchObject({
+        id: 'mode-only',
+        options: { effort: 'high', sandbox: 'workspace-write' },
+      });
+      expect(state.queue[0].options).not.toHaveProperty('mode');
+      expect(state.queue[1]).toMatchObject({
+        id: 'mode-with-model',
+        options: { model: 'gpt-5.5', mode: 'plan', effort: 'high' },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it('falls back to defaults for malformed or oversized state files', () => {
     const malformedDir = mkdtempSync(join(tmpdir(), 'codex-webui-state-'));
     const oversizedDir = mkdtempSync(join(tmpdir(), 'codex-webui-state-'));

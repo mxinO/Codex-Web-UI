@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import type { CodexRunOptions } from '../types/ui';
 
 export type ConnectionState = 'connecting' | 'connected' | 'disconnected' | 'auth-error';
 
@@ -10,7 +11,7 @@ interface ServerHello {
     activeTurnId: string | null;
     activeCwd: string | null;
     theme: 'dark' | 'light';
-      queue: Array<{ id: string; text: string; createdAt: number }>;
+    queue: Array<{ id: string; text: string; createdAt: number; options?: Partial<CodexRunOptions> }>;
   };
   requests?: unknown[];
 }

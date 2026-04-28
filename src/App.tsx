@@ -14,9 +14,21 @@ import { useQueue, type ClientQueuedMessage } from './hooks/useQueue';
 import { useThreadTimeline } from './hooks/useThreadTimeline';
 import { useTheme } from './hooks/useTheme';
 import { appendEphemeralBangItem, bangOutputEventToTimelineItem, getBangCommandOutputDetail } from './lib/bangCommands';
+import {
+  COLLABORATION_MODES,
+  REASONING_EFFORTS,
+  SANDBOX_MODES,
+  effectiveMode,
+  legacySandboxFromMode,
+  sanitizeStoredEffort,
+  sanitizeStoredMode,
+  sanitizeStoredModel,
+  sanitizeStoredSandbox,
+} from './lib/runOptions';
 import { parseSlashCommand } from './lib/slashCommands';
 import { approvalItemsFromRequests, liveStreamingItemFromNotifications, notificationMatchesActiveTurn, requestKey, type TimelineItem } from './lib/timeline';
 import type { CodexThread } from './types/codex';
+import type { CodexRunOptions } from './types/ui';
 
 interface OpenEditor {
   path: string;
@@ -63,6 +75,14 @@ function setLocalStorageValue(key: string, value: string | null): void {
   }
 }
 
+function initialMode(): string | null {
+  return sanitizeStoredMode(localStorageValue('codex-web-ui:mode'));
+}
+
+function initialSandbox(): string | null {
+  return sanitizeStoredSandbox(localStorageValue('codex-web-ui:sandbox')) ?? legacySandboxFromMode(localStorageValue('codex-web-ui:mode'));
+}
+
 function getNestedRecord(value: unknown, key: string): Record<string, unknown> | null {
   if (typeof value !== 'object' || value === null) return null;
   const child = (value as Record<string, unknown>)[key];
@@ -107,9 +127,10 @@ export default function App() {
   const [editor, setEditor] = useState<OpenEditor | null>(null);
   const [ephemeralItems, setEphemeralItems] = useState<TimelineItem[]>([]);
   const [answeredApprovals, setAnsweredApprovals] = useState<Set<string>>(() => new Set());
-  const [model, setModelState] = useState<string | null>(() => localStorageValue('codex-web-ui:model'));
-  const [mode, setModeState] = useState<string | null>(() => localStorageValue('codex-web-ui:mode'));
-  const [effort, setEffortState] = useState<string | null>(() => localStorageValue('codex-web-ui:effort'));
+  const [model, setModelState] = useState<string | null>(() => sanitizeStoredModel(localStorageValue('codex-web-ui:model')));
+  const [mode, setModeState] = useState<string | null>(initialMode);
+  const [effort, setEffortState] = useState<string | null>(() => sanitizeStoredEffort(localStorageValue('codex-web-ui:effort')));
+  const [sandbox, setSandboxState] = useState<string | null>(initialSandbox);
   const bangCounterRef = useRef(0);
   const lastNotification = socket.notifications.at(-1);
   const liveStreamingItem = useMemo(
@@ -118,9 +139,10 @@ export default function App() {
   );
   const approvalItems = useMemo(() => approvalItemsFromRequests(socket.requests, answeredApprovals), [answeredApprovals, socket.requests]);
   const chatItems = useMemo(
-    () => timeline.items.concat(ephemeralItems, liveStreamingItem ? [liveStreamingItem] : [], approvalItems),
-    [approvalItems, ephemeralItems, liveStreamingItem, timeline.items],
+    () => timeline.items.concat(timeline.isViewingLatest ? ephemeralItems.concat(liveStreamingItem ? [liveStreamingItem] : [], approvalItems) : []),
+    [approvalItems, ephemeralItems, liveStreamingItem, timeline.isViewingLatest, timeline.items],
   );
+  const runOptions = useMemo<CodexRunOptions>(() => ({ model, mode: effectiveMode(mode, model), effort, sandbox }), [effort, mode, model, sandbox]);
 
   useEffect(() => {
     if (state?.queue) replaceQueue(state.queue);
@@ -141,8 +163,8 @@ export default function App() {
     ) {
       return;
     }
-    void timeline.reload();
-  }, [activeThreadId, lastNotification, state?.activeTurnId, timeline.reload]);
+    if (timeline.isViewingLatest) void timeline.reload();
+  }, [activeThreadId, lastNotification, state?.activeTurnId, timeline.isViewingLatest, timeline.reload]);
 
   useEffect(() => {
     if (!activeThreadId || socket.connectionState !== 'connected' || socket.reconnectEpoch === 0) return;
@@ -181,6 +203,11 @@ export default function App() {
     setLocalStorageValue('codex-web-ui:effort', value);
   }, []);
 
+  const setSandbox = useCallback((value: string | null) => {
+    setSandboxState(value);
+    setLocalStorageValue('codex-web-ui:sandbox', value);
+  }, []);
+
   const loadSessions = useCallback(async () => {
     setSessionLoading(true);
     setSessionError(null);
@@ -205,7 +232,11 @@ export default function App() {
         return;
       }
       if (command === '/status') {
-        setSessionError(`Session ${activeThreadId ?? 'none'}; model ${model ?? 'default'}; effort ${effort ?? 'default'}; mode ${mode ?? 'default'}`);
+        setSessionError(
+          `Session ${activeThreadId ?? 'none'}; model ${model ?? 'default'}; effort ${effort ?? 'default'}; mode ${mode ?? 'default'}; sandbox ${
+            sandbox ?? 'default'
+          }`,
+        );
         return;
       }
       if (command === '/new') {
@@ -231,30 +262,54 @@ export default function App() {
           setSessionError('Usage: /effort <level>');
           return;
         }
+        if (!REASONING_EFFORTS.includes(value as (typeof REASONING_EFFORTS)[number])) {
+          setSessionError('Effort must be one of none, minimal, low, medium, high, xhigh');
+          return;
+        }
         setEffort(value);
         setSessionError(`Effort set to ${value}`);
         return;
       }
-      if (command === '/mode' || command === '/sandbox') {
+      if (command === '/mode') {
         if (!value) {
-          setSessionError(`Usage: ${command} <value>`);
+          setSessionError('Usage: /mode <default|plan>');
           return;
         }
-        const nextMode = command === '/sandbox' ? `sandbox:${value}` : value;
-        setMode(nextMode);
-        setSessionError(`Mode set to ${nextMode}`);
+        if (!COLLABORATION_MODES.includes(value as (typeof COLLABORATION_MODES)[number])) {
+          setSessionError('Mode must be default or plan');
+          return;
+        }
+        if (!model) {
+          setSessionError('Set /model before /mode so Codex can apply the mode');
+          return;
+        }
+        setMode(value);
+        setSessionError(`Mode set to ${value}`);
+        return;
+      }
+      if (command === '/sandbox') {
+        if (!value) {
+          setSessionError('Usage: /sandbox <read-only|workspace-write|danger-full-access>');
+          return;
+        }
+        if (!SANDBOX_MODES.includes(value as (typeof SANDBOX_MODES)[number])) {
+          setSessionError('Sandbox must be read-only, workspace-write, or danger-full-access');
+          return;
+        }
+        setSandbox(value);
+        setSessionError(`Sandbox set to ${value}`);
       }
     };
 
     window.addEventListener('webui-slash-command', handleSlashCommand);
     return () => window.removeEventListener('webui-slash-command', handleSlashCommand);
-  }, [activeThreadId, effort, loadSessions, mode, model, setEffort, setMode, setModel]);
+  }, [activeThreadId, effort, loadSessions, mode, model, sandbox, setEffort, setMode, setModel, setSandbox]);
 
   const startSession = async (cwd: string) => {
     setSessionLoading(true);
     setSessionError(null);
     try {
-      await socket.rpc('webui/session/start', { cwd });
+      await socket.rpc('webui/session/start', { cwd, options: runOptions });
       window.location.reload();
     } catch (error) {
       setSessionError(error instanceof Error ? error.message : String(error));
@@ -266,7 +321,7 @@ export default function App() {
     setSessionLoading(true);
     setSessionError(null);
     try {
-      await socket.rpc('webui/session/resume', { threadId });
+      await socket.rpc('webui/session/resume', { threadId, options: runOptions });
       window.location.reload();
     } catch (error) {
       setSessionError(error instanceof Error ? error.message : String(error));
@@ -353,6 +408,7 @@ export default function App() {
         model={model}
         mode={mode}
         effort={effort}
+        sandbox={sandbox}
         theme={theme}
         onToggleTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
       />
@@ -383,7 +439,9 @@ export default function App() {
                 <ChatTimeline
                   items={chatItems}
                   onLoadOlder={timeline.loadOlder}
+                  onJumpToLatest={timeline.jumpToLatest}
                   hasOlder={timeline.hasOlder}
+                  showJumpToLatest={!timeline.isViewingLatest}
                   loading={timeline.loading}
                   onOpenDetail={setDetailItem}
                   onApprovalDecision={respondToApproval}
@@ -404,6 +462,7 @@ export default function App() {
               threadId={activeThreadId}
               isRunning={Boolean(state?.activeTurnId)}
               activeCwd={state?.activeCwd ?? null}
+              runOptions={runOptions}
               draftOverride={composerDraft}
               disabled={socket.connectionState !== 'connected'}
               onDraftConsumed={() => setComposerDraft(null)}

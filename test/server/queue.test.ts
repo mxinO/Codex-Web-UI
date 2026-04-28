@@ -7,6 +7,14 @@ describe('queue helpers', () => {
     expect(() => enqueueMessage(queue, 'next', 2)).toThrow(/queue limit/);
   });
 
+  it('stores run options with queued messages', () => {
+    const queue = enqueueMessage([], 'next', 2, { model: 'gpt-5.5', effort: 'high', sandbox: 'workspace-write' });
+    expect(queue[0]).toMatchObject({
+      text: 'next',
+      options: { model: 'gpt-5.5', effort: 'high', sandbox: 'workspace-write' },
+    });
+  });
+
   it('removes queued message by id', () => {
     const queue = [{ id: 'a', text: 'hello', createdAt: 1 }];
     expect(removeQueuedMessage(queue, 'a')).toEqual([]);

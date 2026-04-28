@@ -1,7 +1,19 @@
+export type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+export type CodexSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
+export type CodexCollaborationMode = 'default' | 'plan';
+
+export interface CodexRunOptions {
+  model?: string;
+  effort?: CodexReasoningEffort;
+  mode?: CodexCollaborationMode;
+  sandbox?: CodexSandboxMode;
+}
+
 export interface QueuedMessage {
   id: string;
   text: string;
   createdAt: number;
+  options?: CodexRunOptions;
 }
 
 export interface HostRuntimeState {

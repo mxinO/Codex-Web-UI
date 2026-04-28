@@ -9,7 +9,7 @@ import type { HostStateStore } from './hostState.js';
 import type { JsonRpcServerRequest } from './jsonRpc.js';
 import { logWarn } from './logger.js';
 import { enqueueMessage, removeQueuedMessage, shiftQueuedMessage, updateQueuedMessage } from './queue.js';
-import type { HostRuntimeState, QueuedMessage } from './types.js';
+import type { CodexCollaborationMode, CodexReasoningEffort, CodexRunOptions, CodexSandboxMode, HostRuntimeState, QueuedMessage } from './types.js';
 
 interface BrowserSocketDeps {
   config: ServerConfig;
@@ -36,6 +36,7 @@ interface SessionResumeParams {
 interface TurnStartParams {
   threadId: string;
   text: string;
+  options?: CodexRunOptions;
 }
 
 export interface BrowserSocketCleanup {
@@ -91,6 +92,101 @@ function getRequiredString(params: unknown, key: string): string | null {
 function getString(params: unknown, key: string): string | null {
   if (!isRecord(params) || typeof params[key] !== 'string') return null;
   return params[key];
+}
+
+const REASONING_EFFORTS = new Set<CodexReasoningEffort>(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+const SANDBOX_MODES = new Set<CodexSandboxMode>(['read-only', 'workspace-write', 'danger-full-access']);
+const COLLABORATION_MODES = new Set<CodexCollaborationMode>(['default', 'plan']);
+
+function getOptionalString(params: unknown, key: string): string | null {
+  if (!isRecord(params) || !hasOwn(params, key)) return null;
+  const value = params[key];
+  if (value === null || value === undefined) return null;
+  if (typeof value !== 'string') throw new Error(`${key} must be a string`);
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+function getOptionalEnum<T extends string>(params: unknown, key: string, allowed: Set<T>): T | undefined {
+  const value = getOptionalString(params, key);
+  if (!value) return undefined;
+  if (!allowed.has(value as T)) throw new Error(`unsupported ${key}: ${value}`);
+  return value as T;
+}
+
+function runOptionsFromParams(params: unknown): CodexRunOptions | undefined {
+  const source = isRecord(params) && isRecord(params.options) ? params.options : params;
+  if (!isRecord(source)) return undefined;
+
+  const options: CodexRunOptions = {};
+  const model = getOptionalString(source, 'model');
+  if (model) options.model = model;
+
+  const effort = getOptionalEnum(source, 'effort', REASONING_EFFORTS);
+  if (effort) options.effort = effort;
+
+  const mode = getOptionalEnum(source, 'mode', COLLABORATION_MODES);
+  if (mode && options.model) options.mode = mode;
+
+  const sandbox = getOptionalEnum(source, 'sandbox', SANDBOX_MODES);
+  if (sandbox) options.sandbox = sandbox;
+
+  return Object.keys(options).length > 0 ? options : undefined;
+}
+
+function collaborationMode(options: CodexRunOptions): unknown | null {
+  if (!options.mode) return null;
+  if (!options.model) return null;
+  return {
+    mode: options.mode,
+    settings: {
+      model: options.model,
+      reasoning_effort: options.effort ?? null,
+      developer_instructions: null,
+    },
+  };
+}
+
+function applyThreadRunOptions<T extends Record<string, unknown>>(params: T, options?: CodexRunOptions): T {
+  if (!options) return params;
+  const next = params as Record<string, unknown>;
+  if (options.model) next.model = options.model;
+  if (options.sandbox) next.sandbox = options.sandbox;
+  if (options.effort) {
+    const existingConfig = isRecord(next.config) ? next.config : {};
+    next.config = { ...existingConfig, model_reasoning_effort: options.effort };
+  }
+  return params;
+}
+
+function sandboxPolicy(mode: CodexSandboxMode, cwd: string | null): unknown {
+  if (mode === 'danger-full-access') return { type: 'dangerFullAccess' };
+  if (mode === 'read-only') {
+    return {
+      type: 'readOnly',
+      access: { type: 'fullAccess' },
+      networkAccess: false,
+    };
+  }
+  return {
+    type: 'workspaceWrite',
+    writableRoots: cwd ? [cwd] : [],
+    readOnlyAccess: { type: 'fullAccess' },
+    networkAccess: false,
+    excludeTmpdirEnvVar: false,
+    excludeSlashTmp: false,
+  };
+}
+
+function applyTurnRunOptions<T extends Record<string, unknown>>(params: T, options: CodexRunOptions | undefined, cwd: string | null): T {
+  if (!options) return params;
+  const next = params as Record<string, unknown>;
+  if (options.model) next.model = options.model;
+  if (options.effort) next.effort = options.effort;
+  if (options.sandbox) next.sandboxPolicy = sandboxPolicy(options.sandbox, cwd);
+  const mode = collaborationMode(options);
+  if (mode) next.collaborationMode = mode;
+  return params;
 }
 
 function getStringPath(value: unknown, path: string[]): string | null {
@@ -255,11 +351,19 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
   };
 
-  const startTurn = async ({ threadId, text }: TurnStartParams) => {
-    return deps.codex.request<{ turn: { id: string } }>('turn/start', {
-      threadId,
-      input: [{ type: 'text', text, text_elements: [] }],
-    });
+  const startTurn = async ({ threadId, text, options }: TurnStartParams) => {
+    const state = deps.stateStore.read();
+    return deps.codex.request<{ turn: { id: string } }>(
+      'turn/start',
+      applyTurnRunOptions(
+        {
+          threadId,
+          input: [{ type: 'text', text, text_elements: [] }],
+        },
+        options,
+        state.activeCwd,
+      ),
+    );
   };
 
   const handleTurnCompleted = async (message: { params?: unknown }) => {
@@ -298,7 +402,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     queuedStartInFlight = { threadId, queuedMessage };
 
     try {
-      const result = await startTurn({ threadId, text: queuedMessage.text });
+      const result = await startTurn({ threadId, text: queuedMessage.text, options: queuedMessage.options });
       const next = deps.stateStore.update((current) => ({
         ...current,
         activeTurnId: current.activeThreadId === threadId ? extractTurnId(result) : current.activeTurnId,
@@ -399,11 +503,11 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
-          const params: SessionStartParams & { experimentalRawEvents: boolean; persistExtendedHistory: boolean } = {
+          const params = applyThreadRunOptions<SessionStartParams & { experimentalRawEvents: boolean; persistExtendedHistory: boolean; [key: string]: unknown }>({
             cwd,
             experimentalRawEvents: false,
             persistExtendedHistory: true,
-          };
+          }, runOptionsFromParams(request.params));
           const result = await deps.codex.request('thread/start', params);
           const activeCwd = extractThreadCwd(result) ?? cwd;
           const state = deps.stateStore.update((state) => ({
@@ -425,10 +529,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
-          const params: SessionResumeParams & { persistExtendedHistory: boolean } = {
+          const params = applyThreadRunOptions<SessionResumeParams & { persistExtendedHistory: boolean; [key: string]: unknown }>({
             threadId,
             persistExtendedHistory: true,
-          };
+          }, runOptionsFromParams(request.params));
           const result = await deps.codex.request('thread/resume', params);
           const activeCwd = extractThreadCwd(result) ?? deps.stateStore.read().activeCwd;
           const state = deps.stateStore.update((state) => ({
@@ -452,7 +556,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
           const state = deps.stateStore.update((current) => ({
             ...current,
-            queue: enqueueMessage(current.queue, text, deps.config.queueLimit),
+            queue: enqueueMessage(current.queue, text, deps.config.queueLimit, runOptionsFromParams(request.params)),
           }));
           send(ws, { type: 'rpc/result', id: request.id, result: state.queue });
           broadcastHello(state);
@@ -650,7 +754,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
-          const result = await startTurn({ threadId, text });
+          const result = await startTurn({ threadId, text, options: runOptionsFromParams(request.params) });
           const state = deps.stateStore.update((current) => ({
             ...current,
             activeTurnId: current.activeThreadId === threadId ? extractTurnId(result) : current.activeTurnId,

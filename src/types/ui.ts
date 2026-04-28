@@ -5,4 +5,12 @@ export interface RuntimeStatus {
   model: string | null;
   mode: string | null;
   effort: string | null;
+  sandbox: string | null;
+}
+
+export interface CodexRunOptions {
+  model: string | null;
+  mode: string | null;
+  effort: string | null;
+  sandbox: string | null;
 }

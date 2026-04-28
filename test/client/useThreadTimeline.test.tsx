@@ -105,6 +105,7 @@ describe('useThreadTimeline', () => {
     });
     expect(currentTimeline?.items.map(itemText)).toEqual(['older', 'newer']);
     expect(currentTimeline?.hasOlder).toBe(true);
+    expect((currentTimeline as HookResult & { isViewingLatest?: boolean })?.isViewingLatest).toBe(true);
   });
 
   it('loadOlder keeps a bounded older page window', async () => {
@@ -132,6 +133,7 @@ describe('useThreadTimeline', () => {
     expect(texts).not.toContain('older-200');
     expect(texts).not.toContain('latest-0');
     expect(currentTimeline?.hasOlder).toBe(true);
+    expect((currentTimeline as HookResult & { isViewingLatest?: boolean })?.isViewingLatest).toBe(false);
   });
 
   it('jumpToLatest refetches latest items after loading an older page', async () => {
@@ -171,6 +173,7 @@ describe('useThreadTimeline', () => {
 
     expect(currentTimeline?.items.map((item) => item.kind === 'assistant' ? item.text : '')).toEqual(['latest-restored']);
     expect(currentTimeline?.hasOlder).toBe(true);
+    expect((currentTimeline as HookResult & { isViewingLatest?: boolean })?.isViewingLatest).toBe(true);
   });
 
   it('stale request for old thread does not overwrite current thread items', async () => {

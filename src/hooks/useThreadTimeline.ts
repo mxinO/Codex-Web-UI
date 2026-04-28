@@ -29,6 +29,7 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
   const [items, setItems] = useState<TimelineItem[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [isViewingLatest, setIsViewingLatest] = useState(true);
   activeThreadRef.current = activeThreadId;
 
   const isCurrentRequest = useCallback((threadId: string, generation: number) => {
@@ -52,10 +53,12 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
       const latest = [...resultTurns(result)].reverse();
       setItems(trimTimelineWindow(normalizeTurns(latest), WINDOW_SIZE));
       setCursor(getNextCursor(result));
+      setIsViewingLatest(true);
     } catch {
       if (!isCurrentRequest(threadId, generation)) return;
       setItems([]);
       setCursor(null);
+      setIsViewingLatest(true);
     } finally {
       if (isCurrentRequest(threadId, generation)) setLoading(false);
     }
@@ -79,6 +82,7 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
       const older = [...resultTurns(result)].reverse();
       setItems(trimTimelineWindow(normalizeTurns(older), WINDOW_SIZE));
       setCursor(getNextCursor(result));
+      setIsViewingLatest(false);
     } catch {
       if (!isCurrentRequest(threadId, generation)) return;
       setCursor(null);
@@ -92,6 +96,7 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
     const generation = ++requestGenerationRef.current;
     setItems([]);
     setCursor(null);
+    setIsViewingLatest(true);
 
     if (!threadId) {
       setLoading(false);
@@ -110,11 +115,13 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
         const latest = [...resultTurns(result)].reverse();
         setItems(trimTimelineWindow(normalizeTurns(latest), WINDOW_SIZE));
         setCursor(getNextCursor(result));
+        setIsViewingLatest(true);
       })
       .catch(() => {
         if (!isCurrentRequest(threadId, generation)) return;
         setItems([]);
         setCursor(null);
+        setIsViewingLatest(true);
       })
       .finally(() => {
         if (isCurrentRequest(threadId, generation)) setLoading(false);
@@ -127,5 +134,5 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
 
   const jumpToLatest = loadLatest;
 
-  return { items, loadOlder, hasOlder: Boolean(cursor), loading, reload: loadLatest, jumpToLatest };
+  return { items, loadOlder, hasOlder: Boolean(cursor), loading, reload: loadLatest, jumpToLatest, isViewingLatest };
 }

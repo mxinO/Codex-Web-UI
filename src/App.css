@@ -569,9 +569,16 @@ body {
   background: var(--bg-hover);
 }
 
+.timeline-pager {
+  display: flex;
+  justify-content: center;
+  gap: 8px;
+  margin: 0 auto 16px;
+}
+
 .load-more {
   display: block;
-  margin: 0 auto 16px;
+  margin: 0;
 }
 
 .load-more:disabled {

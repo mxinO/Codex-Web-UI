@@ -8,6 +8,7 @@ interface HeaderProps {
   model?: string | null;
   mode?: string | null;
   effort?: string | null;
+  sandbox?: string | null;
   theme: 'dark' | 'light';
   onToggleTheme: () => void;
 }
@@ -33,6 +34,7 @@ export default function Header(props: HeaderProps) {
       {props.model && <span className="badge">{props.model}</span>}
       {props.mode && <span className="badge">{props.mode}</span>}
       {props.effort && <span className="badge">{props.effort}</span>}
+      {props.sandbox && <span className="badge">{props.sandbox}</span>}
       <button className="icon-button" type="button" onClick={props.onToggleTheme} title="Toggle theme" aria-label="Toggle theme">
         {props.theme === 'dark' ? 'Light' : 'Dark'}
       </button>

@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import type { HostRuntimeState, QueuedMessage } from './types.js';
+import type { CodexRunOptions, HostRuntimeState, QueuedMessage } from './types.js';
 
 interface HostStateStoreOptions {
   maxQueueItems?: number;
@@ -11,6 +11,9 @@ interface HostStateStoreOptions {
 const DEFAULT_MAX_QUEUE_ITEMS = 20;
 const DEFAULT_MAX_RECENT_CWDS = 20;
 const DEFAULT_MAX_STATE_FILE_BYTES = 256_000;
+const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+const SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
+const COLLABORATION_MODES = new Set(['default', 'plan']);
 
 function safeHost(hostname: string): string {
   return hostname.replace(/[^A-Za-z0-9_.-]/g, '_');
@@ -31,6 +34,29 @@ function defaultState(hostname: string): HostRuntimeState {
   };
 }
 
+function optionalEnum(value: unknown, allowed: Set<string>): string | undefined {
+  return typeof value === 'string' && allowed.has(value) ? value : undefined;
+}
+
+function sanitizeRunOptions(value: unknown): CodexRunOptions | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const candidate = value as Partial<CodexRunOptions>;
+  const next: CodexRunOptions = {};
+
+  if (typeof candidate.model === 'string' && candidate.model.trim()) next.model = candidate.model.trim();
+
+  const effort = optionalEnum(candidate.effort, REASONING_EFFORTS);
+  if (effort) next.effort = effort as CodexRunOptions['effort'];
+
+  const mode = optionalEnum(candidate.mode, COLLABORATION_MODES);
+  if (mode && next.model) next.mode = mode as CodexRunOptions['mode'];
+
+  const sandbox = optionalEnum(candidate.sandbox, SANDBOX_MODES);
+  if (sandbox) next.sandbox = sandbox as CodexRunOptions['sandbox'];
+
+  return Object.keys(next).length > 0 ? next : undefined;
+}
+
 function isQueuedMessage(value: unknown): value is QueuedMessage {
   if (!value || typeof value !== 'object') return false;
   const candidate = value as Partial<QueuedMessage>;
@@ -40,6 +66,14 @@ function isQueuedMessage(value: unknown): value is QueuedMessage {
     typeof candidate.createdAt === 'number' &&
     Number.isFinite(candidate.createdAt)
   );
+}
+
+function sanitizeQueuedMessage(value: unknown): QueuedMessage | null {
+  if (!isQueuedMessage(value)) return null;
+  const options = sanitizeRunOptions((value as Partial<QueuedMessage>).options);
+  const message: QueuedMessage = { id: value.id, text: value.text, createdAt: value.createdAt };
+  if (options) message.options = options;
+  return message;
 }
 
 function sanitizeStringArray(value: unknown, limit: number): string[] {
@@ -61,7 +95,12 @@ function sanitizeState(
     ...base,
     ...candidate,
     hostname,
-    queue: Array.isArray(candidate.queue) ? candidate.queue.filter(isQueuedMessage).slice(-maxQueueItems) : [],
+    queue: Array.isArray(candidate.queue)
+      ? candidate.queue
+          .map(sanitizeQueuedMessage)
+          .filter((message): message is QueuedMessage => Boolean(message))
+          .slice(-maxQueueItems)
+      : [],
     recentCwds: sanitizeStringArray(candidate.recentCwds, maxRecentCwds),
   };
 }

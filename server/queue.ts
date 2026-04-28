@@ -1,5 +1,5 @@
 import crypto from 'node:crypto';
-import type { QueuedMessage } from './types.js';
+import type { CodexRunOptions, QueuedMessage } from './types.js';
 
 function normalizeText(text: string): string {
   const next = text.trim();
@@ -7,9 +7,11 @@ function normalizeText(text: string): string {
   return next;
 }
 
-export function enqueueMessage(queue: QueuedMessage[], text: string, limit: number): QueuedMessage[] {
+export function enqueueMessage(queue: QueuedMessage[], text: string, limit: number, options?: CodexRunOptions): QueuedMessage[] {
   if (queue.length >= limit) throw new Error(`queue limit reached (${limit})`);
-  return queue.concat({ id: crypto.randomUUID(), text: normalizeText(text), createdAt: Date.now() });
+  const next: QueuedMessage = { id: crypto.randomUUID(), text: normalizeText(text), createdAt: Date.now() };
+  if (options && Object.keys(options).length > 0) next.options = options;
+  return queue.concat(next);
 }
 
 export function removeQueuedMessage(queue: QueuedMessage[], id: string): QueuedMessage[] {

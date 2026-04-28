@@ -172,6 +172,42 @@ describe('InputBox', () => {
     expect(document.querySelector('.input-error')?.textContent).toBe('/compact is not supported in the web UI');
   });
 
+  it('passes run options when starting a turn', async () => {
+    const rpc = vi.fn().mockResolvedValue({ turn: { id: 'turn-1' } });
+    const runOptions = { model: 'gpt-5.5', effort: 'high', mode: 'plan', sandbox: 'workspace-write' };
+    renderInputBox({ rpc, draftOverride: 'hello', runOptions });
+    const submit = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Send');
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await act(async () => {
+      submit?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(rpc).toHaveBeenCalledWith('webui/turn/start', { threadId: 'thread-1', text: 'hello', options: runOptions });
+  });
+
+  it('passes run options when queueing a message', async () => {
+    const onEnqueue = vi.fn().mockResolvedValue(undefined);
+    const runOptions = { model: 'gpt-5.5', effort: 'high', mode: 'plan', sandbox: 'workspace-write' };
+    renderInputBox({ isRunning: true, draftOverride: 'next', runOptions, onEnqueue });
+    const submit = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Queue');
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await act(async () => {
+      submit?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(onEnqueue).toHaveBeenCalledWith('next', runOptions);
+  });
+
   it('ignores stale file autocomplete responses after draft no longer matches', async () => {
     const readDirectory = controllableThenable<unknown>();
     const rpc = vi.fn((method: string) => {

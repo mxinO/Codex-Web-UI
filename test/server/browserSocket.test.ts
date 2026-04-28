@@ -158,6 +158,55 @@ describe('attachBrowserSocket session RPCs', () => {
     });
   });
 
+  it('forwards run options when starting sessions', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ thread: { id: 'thread-1', cwd: '/work/project' } });
+    const { ws } = await makeHarness(request);
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 20,
+        method: 'webui/session/start',
+        params: {
+          cwd: '/work/project',
+          options: { model: 'gpt-5.5', effort: 'high', mode: 'default', sandbox: 'workspace-write' },
+        },
+      }),
+    );
+    await nextMessage(ws);
+
+    expect(request).toHaveBeenCalledWith('thread/start', {
+      cwd: '/work/project',
+      experimentalRawEvents: false,
+      persistExtendedHistory: true,
+      model: 'gpt-5.5',
+      sandbox: 'workspace-write',
+      config: { model_reasoning_effort: 'high' },
+    });
+  });
+
+  it('forwards effort-only options as session config overrides', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ thread: { id: 'thread-1', cwd: '/work/project' } });
+    const { ws } = await makeHarness(request);
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 22,
+        method: 'webui/session/start',
+        params: { cwd: '/work/project', options: { effort: 'minimal' } },
+      }),
+    );
+    await nextMessage(ws);
+
+    expect(request).toHaveBeenCalledWith('thread/start', {
+      cwd: '/work/project',
+      experimentalRawEvents: false,
+      persistExtendedHistory: true,
+      config: { model_reasoning_effort: 'minimal' },
+    });
+  });
+
   it('resumes sessions without forwarding full thread history', async () => {
     const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({
       thread: {
@@ -184,6 +233,32 @@ describe('attachBrowserSocket session RPCs', () => {
       activeThreadId: 'thread-2',
       activeCwd: '/work/resumed',
       recentCwds: ['/work/resumed'],
+    });
+  });
+
+  it('forwards run options when resuming sessions', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ thread: { id: 'thread-2', cwd: '/work/resumed', turns: [] } });
+    const { ws } = await makeHarness(request);
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 21,
+        method: 'webui/session/resume',
+        params: {
+          threadId: 'thread-2',
+          options: { model: 'gpt-5.5', effort: 'xhigh', mode: 'plan', sandbox: 'danger-full-access' },
+        },
+      }),
+    );
+    await nextMessage(ws);
+
+    expect(request).toHaveBeenCalledWith('thread/resume', {
+      threadId: 'thread-2',
+      persistExtendedHistory: true,
+      model: 'gpt-5.5',
+      sandbox: 'danger-full-access',
+      config: { model_reasoning_effort: 'xhigh' },
     });
   });
 
@@ -670,6 +745,65 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-2', activeTurnId: 'turn-current' });
   });
 
+  it('forwards run options when starting direct turns', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ turn: { id: 'turn-1' } });
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeCwd: '/work/project' });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 14,
+        method: 'webui/turn/start',
+        params: {
+          threadId: 'thread-1',
+          text: 'hello',
+          options: { model: 'gpt-5.5', effort: 'high', sandbox: 'danger-full-access' },
+        },
+      }),
+    );
+    await nextMessage(ws);
+
+    expect(request).toHaveBeenCalledWith('turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'hello', text_elements: [] }],
+      model: 'gpt-5.5',
+      effort: 'high',
+      sandboxPolicy: { type: 'dangerFullAccess' },
+    });
+  });
+
+  it('forwards collaboration mode when starting direct turns', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ turn: { id: 'turn-1' } });
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeCwd: '/work/project' });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 15,
+        method: 'webui/turn/start',
+        params: {
+          threadId: 'thread-1',
+          text: 'hello',
+          options: { model: 'gpt-5.5', effort: 'high', mode: 'plan' },
+        },
+      }),
+    );
+    await nextMessage(ws);
+
+    expect(request).toHaveBeenCalledWith('turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'hello', text_elements: [] }],
+      model: 'gpt-5.5',
+      effort: 'high',
+      collaborationMode: {
+        mode: 'plan',
+        settings: { model: 'gpt-5.5', reasoning_effort: 'high', developer_instructions: null },
+      },
+    });
+  });
+
   it('auto-starts exactly one queued message when duplicate completion notifications arrive', async () => {
     let resolveStart: (value: unknown) => void = () => undefined;
     const startPromise = new Promise<unknown>((resolve) => {
@@ -696,6 +830,71 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
 
     resolveStart({ turn: { id: 'turn-next' } });
     await flushPromises();
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-next', queue: [] });
+  });
+
+  it('auto-starts queued messages with captured run options', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ turn: { id: 'turn-next' } });
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-old',
+      activeCwd: '/work/project',
+      queue: [
+        {
+          id: 'queued-1',
+          text: 'next',
+          createdAt: 1,
+          options: { model: 'gpt-5.5', effort: 'medium', sandbox: 'workspace-write' },
+        },
+      ],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    await flushPromises();
+
+    expect(request).toHaveBeenCalledWith('turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'next', text_elements: [] }],
+      model: 'gpt-5.5',
+      effort: 'medium',
+      sandboxPolicy: {
+        type: 'workspaceWrite',
+        writableRoots: ['/work/project'],
+        readOnlyAccess: { type: 'fullAccess' },
+        networkAccess: false,
+        excludeTmpdirEnvVar: false,
+        excludeSlashTmp: false,
+      },
+    });
+  });
+
+  it('drops queued collaboration mode without model during auto-start', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ turn: { id: 'turn-next' } });
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-old',
+      queue: [
+        {
+          id: 'queued-1',
+          text: 'next',
+          createdAt: 1,
+          options: { mode: 'plan', effort: 'high' },
+        },
+      ],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    await flushPromises();
+
+    expect(request).toHaveBeenCalledWith('turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'next', text_elements: [] }],
+      effort: 'high',
+    });
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-next', queue: [] });
   });
 
