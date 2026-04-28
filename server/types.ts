@@ -16,3 +16,10 @@ export interface HostRuntimeState {
   recentCwds: string[];
   theme: 'dark' | 'light';
 }
+
+export interface CodexInitializeResponse {
+  userAgent: string;
+  codexHome: string;
+  platformFamily: string;
+  platformOs: string;
+}
