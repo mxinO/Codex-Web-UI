@@ -2,6 +2,7 @@ import type http from 'node:http';
 import { WebSocket, WebSocketServer } from 'ws';
 import { isTokenValid, parseTokenFromCookie } from './auth.js';
 import type { CodexAppServer } from './appServer.js';
+import { buildBangCommandParams, isInteractiveCommandBlocked } from './bangCommand.js';
 import type { ServerConfig } from './config.js';
 import type { HostStateStore } from './hostState.js';
 import { logWarn } from './logger.js';
@@ -319,6 +320,33 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }));
           send(ws, { type: 'rpc/result', id: request.id, result: state.queue });
           broadcastHello(state);
+          return;
+        }
+
+        if (request.method === 'webui/bang/run') {
+          const command = getRequiredString(request.params, 'command');
+          if (!command) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'command is required' });
+            return;
+          }
+
+          const state = deps.stateStore.read();
+          if (state.activeTurnId) {
+            throw new Error('! commands are disabled while Codex is working');
+          }
+          if (!state.activeCwd) {
+            throw new Error('no active cwd');
+          }
+          if (isInteractiveCommandBlocked(command)) {
+            throw new Error('interactive commands are not supported');
+          }
+
+          const result = await deps.codex.request(
+            'command/exec',
+            buildBangCommandParams(command, state.activeCwd, deps.config.commandTimeoutMs, deps.config.commandOutputBytes),
+            deps.config.commandTimeoutMs + 2_000,
+          );
+          send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
 

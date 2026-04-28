@@ -1,8 +1,9 @@
 import { FormEvent, KeyboardEvent, useEffect, useState } from 'react';
+import { BANG_COMMAND_RPC_TIMEOUT_MS, parseBangCommand } from '../lib/bangCommands';
 import { classifySlashCommand } from '../lib/slashCommands';
 
 interface InputBoxProps {
-  rpc: <T>(method: string, params?: unknown) => Promise<T>;
+  rpc: <T>(method: string, params?: unknown, timeoutMs?: number) => Promise<T>;
   threadId: string | null;
   isRunning: boolean;
   activeCwd?: string | null;
@@ -54,12 +55,16 @@ export default function InputBox({
         return;
       }
 
-      if (text.startsWith('!')) {
+      const bangCommand = parseBangCommand(text);
+      if (bangCommand) {
         if (isRunning) {
           setError('! commands are disabled while Codex is working');
           return;
         }
-        dispatchInputEvent('webui-bang-command', { input: text, activeCwd });
+        const submittedCwd = activeCwd ?? '';
+        const submittedThreadId = threadId;
+        const result = await rpc('webui/bang/run', { command: bangCommand.command }, BANG_COMMAND_RPC_TIMEOUT_MS);
+        dispatchInputEvent('webui-bang-output', { command: bangCommand.command, cwd: submittedCwd, threadId: submittedThreadId, result });
         setDraft('');
         return;
       }

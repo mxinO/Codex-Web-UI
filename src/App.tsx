@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import AuthOverlay from './components/AuthOverlay';
 import ChatTimeline from './components/ChatTimeline';
 import CwdPicker from './components/CwdPicker';
@@ -11,6 +11,7 @@ import { useCodexSocket } from './hooks/useCodexSocket';
 import { useQueue, type ClientQueuedMessage } from './hooks/useQueue';
 import { useThreadTimeline } from './hooks/useThreadTimeline';
 import { useTheme } from './hooks/useTheme';
+import { appendEphemeralBangItem, bangOutputEventToTimelineItem, getBangCommandOutputDetail } from './lib/bangCommands';
 import type { TimelineItem } from './lib/timeline';
 import type { CodexThread } from './types/codex';
 
@@ -28,10 +29,33 @@ export default function App() {
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [detailItem, setDetailItem] = useState<TimelineItem | null>(null);
   const [composerDraft, setComposerDraft] = useState<string | null>(null);
+  const [ephemeralItems, setEphemeralItems] = useState<TimelineItem[]>([]);
+  const bangCounterRef = useRef(0);
 
   useEffect(() => {
     if (state?.queue) replaceQueue(state.queue);
   }, [replaceQueue, state?.queue]);
+
+  useEffect(() => {
+    setEphemeralItems([]);
+  }, [activeThreadId]);
+
+  useEffect(() => {
+    const handleBangOutput = (event: Event) => {
+      const detail = getBangCommandOutputDetail(event);
+      if (!detail) return;
+
+      const now = Date.now();
+      const counter = (bangCounterRef.current += 1);
+      const item = bangOutputEventToTimelineItem(detail, activeThreadId, now, counter);
+      if (!item) return;
+
+      setEphemeralItems((items) => appendEphemeralBangItem(items, item));
+    };
+
+    window.addEventListener('webui-bang-output', handleBangOutput);
+    return () => window.removeEventListener('webui-bang-output', handleBangOutput);
+  }, [activeThreadId]);
 
   const loadSessions = async () => {
     setSessionLoading(true);
@@ -122,7 +146,7 @@ export default function App() {
         <div className="main-content">
           {activeThreadId ? (
             <ChatTimeline
-              items={timeline.items}
+              items={timeline.items.concat(ephemeralItems)}
               onLoadOlder={timeline.loadOlder}
               hasOlder={timeline.hasOlder}
               loading={timeline.loading}

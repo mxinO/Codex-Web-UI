@@ -172,6 +172,69 @@ describe('attachBrowserSocket session RPCs', () => {
   });
 });
 
+describe('attachBrowserSocket bang command RPCs', () => {
+  it('rejects bang commands while a turn is running', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeTurnId: 'turn-1', activeCwd: '/work/project' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 20, method: 'webui/bang/run', params: { command: 'echo ok' } }));
+    const response = await nextMessage(ws);
+
+    expect(request).not.toHaveBeenCalled();
+    expect(response).toEqual({ type: 'rpc/error', id: 20, error: '! commands are disabled while Codex is working' });
+  });
+
+  it('rejects bang commands with no active cwd', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeTurnId: null, activeCwd: null });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 21, method: 'webui/bang/run', params: { command: 'echo ok' } }));
+    const response = await nextMessage(ws);
+
+    expect(request).not.toHaveBeenCalled();
+    expect(response).toEqual({ type: 'rpc/error', id: 21, error: 'no active cwd' });
+  });
+
+  it('executes valid bang commands through command exec with cwd and configured limits', async () => {
+    const result = { exitCode: 0, stdout: 'ok\n', stderr: '' };
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue(result);
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeTurnId: null, activeCwd: '/work/project' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 22, method: 'webui/bang/run', params: { command: 'echo ok' } }));
+    const response = await nextMessage(ws);
+
+    expect(request).toHaveBeenCalledWith(
+      'command/exec',
+      {
+        command: ['bash', '-lc', 'echo ok'],
+        cwd: '/work/project',
+        timeoutMs: 30_000,
+        outputBytesCap: 256_000,
+        tty: false,
+        streamStdoutStderr: false,
+        streamStdin: false,
+      },
+      32_000,
+    );
+    expect(response).toEqual({ type: 'rpc/result', id: 22, result });
+  });
+
+  it('rejects interactive bang commands before calling codex', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeTurnId: null, activeCwd: '/work/project' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 23, method: 'webui/bang/run', params: { command: 'vim file.txt' } }));
+    const response = await nextMessage(ws);
+
+    expect(request).not.toHaveBeenCalled();
+    expect(response).toEqual({ type: 'rpc/error', id: 23, error: 'interactive commands are not supported' });
+  });
+});
+
 describe('attachBrowserSocket queue and turn RPCs', () => {
   it('enqueues, updates, and removes queued messages', async () => {
     const request = vi.fn<CodexAppServer['request']>();

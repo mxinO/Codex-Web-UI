@@ -41,6 +41,51 @@ afterEach(() => {
 });
 
 describe('InputBox', () => {
+  it('runs bang commands through rpc, dispatches output, and clears draft after success', async () => {
+    const result = { exitCode: 0, stdout: 'ok\n', stderr: '' };
+    const rpc = vi.fn().mockResolvedValue(result);
+    const dispatch = vi.spyOn(window, 'dispatchEvent');
+    renderInputBox({ rpc, draftOverride: '!pwd', activeCwd: '/work/project' });
+
+    const textarea = document.querySelector<HTMLTextAreaElement>('textarea');
+    const submit = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Send');
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await act(async () => {
+      submit?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(rpc).toHaveBeenCalledWith('webui/bang/run', { command: 'pwd' }, 35_000);
+    const outputEvent = dispatch.mock.calls.map(([event]) => event).find((event) => event.type === 'webui-bang-output') as CustomEvent | undefined;
+    expect(outputEvent?.detail).toEqual({ command: 'pwd', cwd: '/work/project', threadId: 'thread-1', result });
+    expect(textarea?.value).toBe('');
+  });
+
+  it('preserves bang command drafts when rpc fails', async () => {
+    const rpc = vi.fn().mockRejectedValue(new Error('command failed'));
+    renderInputBox({ rpc, draftOverride: '!pwd' });
+
+    const textarea = document.querySelector<HTMLTextAreaElement>('textarea');
+    const submit = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Send');
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await act(async () => {
+      submit?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(rpc).toHaveBeenCalledWith('webui/bang/run', { command: 'pwd' }, 35_000);
+    expect(textarea?.value).toBe('!pwd');
+    expect(document.querySelector('.input-error')?.textContent).toBe('command failed');
+  });
+
   it('blocks bang commands while a turn is running and preserves draft', async () => {
     const dispatch = vi.spyOn(window, 'dispatchEvent');
     renderInputBox({ isRunning: true, draftOverride: '!pwd' });
@@ -56,7 +101,7 @@ describe('InputBox', () => {
       await Promise.resolve();
     });
 
-    expect(dispatch).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'webui-bang-command' }));
+    expect(dispatch).not.toHaveBeenCalledWith(expect.objectContaining({ type: 'webui-bang-output' }));
     expect(textarea?.value).toBe('!pwd');
     expect(document.querySelector('.input-error')?.textContent).toBe('! commands are disabled while Codex is working');
   });
