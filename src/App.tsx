@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import AuthOverlay from './components/AuthOverlay';
 import ChatTimeline from './components/ChatTimeline';
 import CwdPicker from './components/CwdPicker';
@@ -14,7 +14,7 @@ import { useQueue, type ClientQueuedMessage } from './hooks/useQueue';
 import { useThreadTimeline } from './hooks/useThreadTimeline';
 import { useTheme } from './hooks/useTheme';
 import { appendEphemeralBangItem, bangOutputEventToTimelineItem, getBangCommandOutputDetail } from './lib/bangCommands';
-import type { TimelineItem } from './lib/timeline';
+import { approvalItemsFromRequests, liveStreamingItemFromNotifications, notificationMatchesActiveTurn, requestKey, type TimelineItem } from './lib/timeline';
 import type { CodexThread } from './types/codex';
 
 interface OpenEditor {
@@ -87,7 +87,18 @@ export default function App() {
   const [composerDraft, setComposerDraft] = useState<string | null>(null);
   const [editor, setEditor] = useState<OpenEditor | null>(null);
   const [ephemeralItems, setEphemeralItems] = useState<TimelineItem[]>([]);
+  const [answeredApprovals, setAnsweredApprovals] = useState<Set<string>>(() => new Set());
   const bangCounterRef = useRef(0);
+  const lastNotification = socket.notifications.at(-1);
+  const liveStreamingItem = useMemo(
+    () => liveStreamingItemFromNotifications(socket.notifications, { activeThreadId, activeTurnId: state?.activeTurnId ?? null }, Boolean(state?.activeTurnId)),
+    [activeThreadId, socket.notifications, state?.activeTurnId],
+  );
+  const approvalItems = useMemo(() => approvalItemsFromRequests(socket.requests, answeredApprovals), [answeredApprovals, socket.requests]);
+  const chatItems = useMemo(
+    () => timeline.items.concat(ephemeralItems, liveStreamingItem ? [liveStreamingItem] : [], approvalItems),
+    [approvalItems, ephemeralItems, liveStreamingItem, timeline.items],
+  );
 
   useEffect(() => {
     if (state?.queue) replaceQueue(state.queue);
@@ -95,7 +106,21 @@ export default function App() {
 
   useEffect(() => {
     setEphemeralItems([]);
+    setAnsweredApprovals(new Set());
   }, [activeThreadId]);
+
+  useEffect(() => {
+    if (
+      !activeThreadId ||
+      typeof lastNotification !== 'object' ||
+      lastNotification === null ||
+      (lastNotification as Record<string, unknown>).method !== 'turn/completed' ||
+      !notificationMatchesActiveTurn(lastNotification, { activeThreadId, activeTurnId: state?.activeTurnId ?? null })
+    ) {
+      return;
+    }
+    void timeline.reload();
+  }, [activeThreadId, lastNotification, state?.activeTurnId, timeline.reload]);
 
   useEffect(() => {
     const handleBangOutput = (event: Event) => {
@@ -204,6 +229,23 @@ export default function App() {
     setEditor(null);
   };
 
+  const respondToApproval = useCallback(
+    async (item: Extract<TimelineItem, { kind: 'approval' }>, decision: unknown) => {
+      await socket.rpc('webui/approval/respond', {
+        requestId: item.requestId,
+        method: item.method,
+        decision,
+        requestParams: item.params,
+      });
+      setAnsweredApprovals((current) => {
+        const next = new Set(current);
+        next.add(requestKey(item.requestId));
+        return next;
+      });
+    },
+    [socket],
+  );
+
   return (
     <div className="app-shell">
       <Header
@@ -239,11 +281,12 @@ export default function App() {
             <div className="main-content">
               {activeThreadId ? (
                 <ChatTimeline
-                  items={timeline.items.concat(ephemeralItems)}
+                  items={chatItems}
                   onLoadOlder={timeline.loadOlder}
                   hasOlder={timeline.hasOlder}
                   loading={timeline.loading}
                   onOpenDetail={setDetailItem}
+                  onApprovalDecision={respondToApproval}
                 />
               ) : (
                 <div className="empty-state">No active session loaded.</div>

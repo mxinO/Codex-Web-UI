@@ -462,6 +462,90 @@ body {
   border: 1px solid var(--border);
 }
 
+.streaming-card,
+.approval-card {
+  width: min(760px, 80%);
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  padding: 10px 12px;
+  overflow: hidden;
+}
+
+.streaming-card {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.streaming-card__header,
+.approval-card__header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin-bottom: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.streaming-card__dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+}
+
+.streaming-card__empty,
+.approval-card__empty {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.approval-card__header code {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-family: Consolas, monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.approval-card__meta {
+  margin-bottom: 8px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.approval-card__params {
+  max-height: min(240px, 32vh);
+  margin: 0;
+  padding: 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font: 12px/1.4 Consolas, monospace;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.approval-card__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.approval-card__button {
+  min-height: 30px;
+  text-transform: capitalize;
+}
+
 .tool-card,
 .load-more {
   display: block;

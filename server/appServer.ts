@@ -1,7 +1,13 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process';
 import type { Readable } from 'node:stream';
 import WebSocket from 'ws';
-import { JsonRpcPeer, type JsonRpcNotification, type JsonRpcNotificationHandler } from './jsonRpc.js';
+import {
+  JsonRpcPeer,
+  type JsonRpcNotification,
+  type JsonRpcNotificationHandler,
+  type JsonRpcServerRequest,
+  type JsonRpcServerRequestHandler,
+} from './jsonRpc.js';
 import type { CodexInitializeResponse } from './types.js';
 
 export interface CodexAppServerOptions {
@@ -28,6 +34,7 @@ export class CodexAppServer {
   private startPromise: Promise<CodexInitializeResponse | void> | null = null;
   private lifecycleId = 0;
   private readonly notificationHandlers = new Set<JsonRpcNotificationHandler>();
+  private readonly requestHandlers = new Set<JsonRpcServerRequestHandler>();
 
   constructor(private readonly options: CodexAppServerOptions) {}
 
@@ -54,10 +61,25 @@ export class CodexAppServer {
     return this.peer.request<T>(method, params, timeoutMs);
   }
 
+  respond(id: number | string, result: unknown): void {
+    if (!this.peer) {
+      throw this.deadError ?? new Error('Codex app-server is not connected');
+    }
+
+    this.peer.respond(id, result);
+  }
+
   onNotification(handler: JsonRpcNotificationHandler): () => void {
     this.notificationHandlers.add(handler);
     return () => {
       this.notificationHandlers.delete(handler);
+    };
+  }
+
+  onServerRequest(handler: JsonRpcServerRequestHandler): () => void {
+    this.requestHandlers.add(handler);
+    return () => {
+      this.requestHandlers.delete(handler);
     };
   }
 
@@ -204,6 +226,7 @@ export class CodexAppServer {
     this.socket = socket;
     this.peer = new JsonRpcPeer(socket);
     this.peer.onNotification((message) => this.forwardNotification(message));
+    this.peer.onServerRequest((message) => this.forwardServerRequest(message));
 
     return this.peer.request<CodexInitializeResponse>('initialize', {
       clientInfo: { name: 'codex-web-ui', version: '0.1.0' },
@@ -292,6 +315,10 @@ export class CodexAppServer {
 
   private forwardNotification(message: JsonRpcNotification): void {
     for (const handler of this.notificationHandlers) handler(message);
+  }
+
+  private forwardServerRequest(message: JsonRpcServerRequest): void {
+    for (const handler of this.requestHandlers) handler(message);
   }
 
   private captureReadyz(output: string): void {

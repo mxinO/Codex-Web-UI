@@ -19,6 +19,8 @@ type ServerMessage =
   | { type: 'rpc/result'; id: number; result: unknown }
   | { type: 'rpc/error'; id: number; error: string }
   | { type: 'codex/notification'; message: unknown }
+  | { type: 'codex/request'; message: unknown }
+  | { type: 'codex/requestResolved'; requestId: number | string }
   | { type: 'auth/error' };
 
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
@@ -52,10 +54,21 @@ function parseServerMessage(data: string): ServerMessage | null {
   }
 }
 
+function requestKey(id: number | string): string {
+  return `${typeof id}:${String(id)}`;
+}
+
+function requestIdOf(request: unknown): string | null {
+  if (typeof request !== 'object' || request === null) return null;
+  const id = (request as Record<string, unknown>).id;
+  return typeof id === 'string' || typeof id === 'number' ? requestKey(id) : null;
+}
+
 export function useCodexSocket() {
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
   const [hello, setHello] = useState<ServerHello | null>(null);
   const [notifications, setNotifications] = useState<unknown[]>([]);
+  const [requests, setRequests] = useState<unknown[]>([]);
   const wsRef = useRef<WebSocket | null>(null);
   const nextIdRef = useRef(1);
   const pendingRef = useRef(new Map<number, PendingRpc>());
@@ -143,6 +156,10 @@ export function useCodexSocket() {
           ws.close();
         } else if (message.type === 'codex/notification') {
           setNotifications((items) => [...items.slice(-199), message.message]);
+        } else if (message.type === 'codex/request') {
+          setRequests((items) => [...items.slice(-49), message.message]);
+        } else if (message.type === 'codex/requestResolved') {
+          setRequests((items) => items.filter((item) => requestIdOf(item) !== requestKey(message.requestId)));
         } else if (message.type === 'rpc/result' || message.type === 'rpc/error') {
           const pending = pendingRef.current.get(message.id);
           if (!pending) return;
@@ -201,5 +218,5 @@ export function useCodexSocket() {
     });
   }, []);
 
-  return { connectionState, hello, notifications, rpc };
+  return { connectionState, hello, notifications, requests, rpc };
 }

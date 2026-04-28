@@ -5,6 +5,7 @@ import type { CodexAppServer } from './appServer.js';
 import { buildBangCommandParams, isInteractiveCommandBlocked } from './bangCommand.js';
 import type { ServerConfig } from './config.js';
 import type { HostStateStore } from './hostState.js';
+import type { JsonRpcServerRequest } from './jsonRpc.js';
 import { logWarn } from './logger.js';
 import { enqueueMessage, removeQueuedMessage, shiftQueuedMessage, updateQueuedMessage } from './queue.js';
 import type { HostRuntimeState, QueuedMessage } from './types.js';
@@ -72,6 +73,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
 
+function hasOwn(value: Record<string, unknown>, key: string): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
+function requestKey(id: number | string): string {
+  return `${typeof id}:${String(id)}`;
+}
+
 function getRequiredString(params: unknown, key: string): string | null {
   if (!isRecord(params) || typeof params[key] !== 'string') return null;
   const value = params[key].trim();
@@ -127,14 +136,66 @@ function sanitizeThreadHistory(value: unknown): unknown {
   return next;
 }
 
+function approvalResponseForDecision(method: string, decision: unknown, params: unknown): unknown {
+  if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
+    return { decision };
+  }
+
+  if (method === 'mcpServer/elicitation/request') {
+    if (decision !== 'decline' && decision !== 'cancel') {
+      throw new Error('unsupported MCP elicitation decision');
+    }
+    return { action: decision, content: null, _meta: null };
+  }
+
+  if (method === 'item/tool/requestUserInput') {
+    return { answers: decision };
+  }
+
+  if (method === 'item/tool/call') {
+    return decision;
+  }
+
+  if (method === 'item/permissions/requestApproval') {
+    if (decision !== 'accept' && decision !== 'decline') {
+      throw new Error('unsupported permissions approval decision');
+    }
+    return { permissions: decision === 'accept' && isRecord(params) ? params.permissions : {}, scope: 'session' };
+  }
+
+  throw new Error(`unsupported approval request method: ${method}`);
+}
+
+function approvalRespondParams(params: unknown): { requestId: number | string; decision: unknown; method: string | null } | string {
+  if (!isRecord(params)) return 'approval response params are required';
+  const { requestId, method } = params;
+  if (typeof requestId !== 'string' && typeof requestId !== 'number') return 'requestId is required';
+  if (!hasOwn(params, 'decision')) return 'decision is required';
+  return { requestId, decision: params.decision, method: typeof method === 'string' ? method : null };
+}
+
+function extractResolvedRequestId(message: { method: string; params?: unknown }): number | string | null {
+  if (!/request.*resolved|serverRequest.*resolved/i.test(message.method)) return null;
+  if (!isRecord(message.params)) return null;
+  const requestId = message.params.requestId ?? message.params.request_id ?? message.params.id;
+  return typeof requestId === 'string' || typeof requestId === 'number' ? requestId : null;
+}
+
 export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps): BrowserSocketCleanup {
   const wss = new WebSocketServer({ server, path: '/ws' });
   let closed = false;
   let queuedStartInFlight: { threadId: string; queuedMessage: QueuedMessage } | null = null;
+  const pendingServerRequests = new Map<string, JsonRpcServerRequest>();
 
   const broadcastHello = (state: HostRuntimeState = deps.stateStore.read()) => {
     for (const client of wss.clients) {
       send(client, { type: 'server/hello', hostname: deps.config.hostname, state });
+    }
+  };
+
+  const broadcastRequestResolved = (requestId: number | string) => {
+    for (const client of wss.clients) {
+      send(client, { type: 'codex/requestResolved', requestId });
     }
   };
 
@@ -195,14 +256,25 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
   };
 
-  deps.codex.onNotification((message) => {
+  const unsubscribeNotification = deps.codex.onNotification((message) => {
     for (const client of wss.clients) send(client, { type: 'codex/notification', message });
+    const resolvedRequestId = extractResolvedRequestId(message);
+    if (resolvedRequestId !== null && pendingServerRequests.delete(requestKey(resolvedRequestId))) {
+      broadcastRequestResolved(resolvedRequestId);
+    }
     if (message.method === 'turn/completed') void handleTurnCompleted();
+  });
+
+  const unsubscribeServerRequest = deps.codex.onServerRequest((message) => {
+    pendingServerRequests.set(requestKey(message.id), message);
+    for (const client of wss.clients) send(client, { type: 'codex/request', message });
   });
 
   const close = () => {
     if (closed) return;
     closed = true;
+    unsubscribeNotification();
+    unsubscribeServerRequest();
     for (const client of wss.clients) closeClient(client);
     wss.close();
   };
@@ -352,6 +424,26 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             deps.config.commandTimeoutMs + 2_000,
           );
           send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/approval/respond') {
+          const params = approvalRespondParams(request.params);
+          if (typeof params === 'string') {
+            send(ws, { type: 'rpc/error', id: request.id, error: params });
+            return;
+          }
+
+          const pendingRequest = pendingServerRequests.get(requestKey(params.requestId));
+          if (!pendingRequest) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'approval request is no longer pending' });
+            return;
+          }
+          const response = approvalResponseForDecision(pendingRequest.method, params.decision, pendingRequest.params);
+          deps.codex.respond(pendingRequest.id, response);
+          pendingServerRequests.delete(requestKey(params.requestId));
+          send(ws, { type: 'rpc/result', id: request.id, result: { ok: true } });
+          broadcastRequestResolved(pendingRequest.id);
           return;
         }
 

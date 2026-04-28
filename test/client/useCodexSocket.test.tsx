@@ -107,4 +107,103 @@ describe('useCodexSocket', () => {
     await rejection;
     expect(ws.sent.at(-1)).toBe(JSON.stringify({ type: 'rpc', id: 1, method: 'slow.method', params: { value: 1 } }));
   });
+
+  it('stores app-server requests from the browser socket', async () => {
+    await renderHook();
+    const ws = MockWebSocket.instances[0];
+    act(() => {
+      ws.open();
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'codex/request',
+            message: { jsonrpc: '2.0', id: 'approval-1', method: 'item/fileChange/requestApproval', params: { path: 'file.ts' } },
+          }),
+        }),
+      );
+    });
+
+    expect(currentSocket?.requests).toEqual([{ jsonrpc: '2.0', id: 'approval-1', method: 'item/fileChange/requestApproval', params: { path: 'file.ts' } }]);
+  });
+
+  it('caps app-server request history at 50 items', async () => {
+    await renderHook();
+    const ws = MockWebSocket.instances[0];
+    act(() => {
+      ws.open();
+      for (let index = 0; index < 55; index += 1) {
+        ws.onmessage?.(
+          new MessageEvent('message', {
+            data: JSON.stringify({
+              type: 'codex/request',
+              message: { jsonrpc: '2.0', id: index, method: 'item/commandExecution/requestApproval', params: { index } },
+            }),
+          }),
+        );
+      }
+    });
+
+    expect(currentSocket?.requests).toHaveLength(50);
+    expect(currentSocket?.requests[0]).toMatchObject({ id: 5 });
+  });
+
+  it('removes app-server requests when the server broadcasts resolution', async () => {
+    await renderHook();
+    const ws = MockWebSocket.instances[0];
+    act(() => {
+      ws.open();
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'codex/request',
+            message: { jsonrpc: '2.0', id: 'approval-1', method: 'item/fileChange/requestApproval', params: { path: 'file.ts' } },
+          }),
+        }),
+      );
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'codex/requestResolved',
+            requestId: 'approval-1',
+          }),
+        }),
+      );
+    });
+
+    expect(currentSocket?.requests).toEqual([]);
+  });
+
+  it('does not collapse numeric and string request ids when resolving requests', async () => {
+    await renderHook();
+    const ws = MockWebSocket.instances[0];
+    act(() => {
+      ws.open();
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'codex/request',
+            message: { jsonrpc: '2.0', id: 1, method: 'item/fileChange/requestApproval', params: { path: 'numeric.ts' } },
+          }),
+        }),
+      );
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'codex/request',
+            message: { jsonrpc: '2.0', id: '1', method: 'item/fileChange/requestApproval', params: { path: 'string.ts' } },
+          }),
+        }),
+      );
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'codex/requestResolved',
+            requestId: 1,
+          }),
+        }),
+      );
+    });
+
+    expect(currentSocket?.requests).toEqual([{ jsonrpc: '2.0', id: '1', method: 'item/fileChange/requestApproval', params: { path: 'string.ts' } }]);
+  });
 });

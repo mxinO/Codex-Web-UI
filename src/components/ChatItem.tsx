@@ -1,9 +1,17 @@
 import { lazy, Suspense } from 'react';
 import type { TimelineItem } from '../lib/timeline';
+import ApprovalCard from './ApprovalCard';
+import StreamingCard from './StreamingCard';
 
 const MarkdownView = lazy(() => import('./MarkdownView'));
 
-export default function ChatItem({ item, onOpenDetail }: { item: TimelineItem; onOpenDetail: (item: TimelineItem) => void }) {
+interface ChatItemProps {
+  item: TimelineItem;
+  onOpenDetail: (item: TimelineItem) => void;
+  onApprovalDecision: (item: Extract<TimelineItem, { kind: 'approval' }>, decision: unknown) => Promise<void>;
+}
+
+export default function ChatItem({ item, onOpenDetail, onApprovalDecision }: ChatItemProps) {
   if (item.kind === 'user') {
     return (
       <div className="chat-row chat-row--user">
@@ -20,6 +28,22 @@ export default function ChatItem({ item, onOpenDetail }: { item: TimelineItem; o
             <MarkdownView content={item.text} />
           </Suspense>
         </div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'streaming') {
+    return (
+      <div className="chat-row chat-row--assistant">
+        <StreamingCard text={item.text} active={item.active} />
+      </div>
+    );
+  }
+
+  if (item.kind === 'approval') {
+    return (
+      <div className="chat-row chat-row--system">
+        <ApprovalCard requestId={item.requestId} method={item.method} params={item.params} onDecision={(decision) => onApprovalDecision(item, decision)} />
       </div>
     );
   }

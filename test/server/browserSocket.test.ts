@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import WebSocket from 'ws';
+import WebSocket, { type RawData } from 'ws';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { attachBrowserSocket } from '../../server/browserSocket.js';
 import { HostStateStore } from '../../server/hostState.js';
@@ -15,10 +15,12 @@ interface RpcMessage {
   id?: number;
   result?: unknown;
   error?: string;
+  requestId?: number | string;
 }
 
 const cleanups: Array<() => void> = [];
 type NotificationHandler = Parameters<CodexAppServer['onNotification']>[0];
+type ServerRequestHandler = Parameters<CodexAppServer['onServerRequest']>[0];
 
 function makeConfig(): ServerConfig {
   return {
@@ -41,10 +43,17 @@ async function makeHarness(request: TestRequest) {
   const stateDir = mkdtempSync(join(tmpdir(), 'codex-webui-browser-socket-'));
   const stateStore = new HostStateStore(stateDir, 'test-host');
   let notificationHandler: NotificationHandler | null = null;
+  let serverRequestHandler: ServerRequestHandler | null = null;
+  const respond = vi.fn<CodexAppServer['respond']>();
   const codex = {
     request,
+    respond,
     onNotification: vi.fn((handler: NotificationHandler) => {
       notificationHandler = handler;
+      return () => undefined;
+    }),
+    onServerRequest: vi.fn((handler: ServerRequestHandler) => {
+      serverRequestHandler = handler;
       return () => undefined;
     }),
   } as unknown as CodexAppServer;
@@ -67,13 +76,30 @@ async function makeHarness(request: TestRequest) {
   const notify = (method: string, params?: unknown) => {
     notificationHandler?.({ jsonrpc: '2.0', method, params });
   };
+  const requestFromServer = (message: Parameters<ServerRequestHandler>[0]) => {
+    serverRequestHandler?.(message);
+  };
 
-  return { ws, stateStore, notify };
+  return { ws, stateStore, notify, requestFromServer, respond };
 }
 
 function nextMessage(ws: WebSocket): Promise<RpcMessage> {
   return new Promise((resolve) => {
     ws.once('message', (data) => resolve(JSON.parse(String(data)) as RpcMessage));
+  });
+}
+
+function nextMessages(ws: WebSocket, count: number): Promise<RpcMessage[]> {
+  return new Promise((resolve) => {
+    const messages: RpcMessage[] = [];
+    const onMessage = (data: RawData) => {
+      messages.push(JSON.parse(String(data)) as RpcMessage);
+      if (messages.length === count) {
+        ws.off('message', onMessage);
+        resolve(messages);
+      }
+    };
+    ws.on('message', onMessage);
   });
 }
 
@@ -169,6 +195,278 @@ describe('attachBrowserSocket session RPCs', () => {
 
     expect(request).not.toHaveBeenCalled();
     expect(response).toEqual({ type: 'rpc/error', id: 4, error: 'threadId is required' });
+  });
+});
+
+describe('attachBrowserSocket app-server requests', () => {
+  it('broadcasts app-server requests to browser clients', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, requestFromServer } = await makeHarness(request);
+
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: 'approval-1',
+      method: 'item/commandExecution/requestApproval',
+      params: { command: 'npm test' },
+    });
+    const message = await nextMessage(ws);
+
+    expect(message).toEqual({
+      type: 'codex/request',
+      message: {
+        jsonrpc: '2.0',
+        id: 'approval-1',
+        method: 'item/commandExecution/requestApproval',
+        params: { command: 'npm test' },
+      },
+    });
+  });
+
+  it('maps command approval decisions into app-server responses', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, requestFromServer, respond } = await makeHarness(request);
+
+    const approvalBroadcast = nextMessage(ws);
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: 'approval-1',
+      method: 'item/commandExecution/requestApproval',
+      params: { command: 'npm test' },
+    });
+    await approvalBroadcast;
+
+    const responses = nextMessages(ws, 2);
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 50,
+        method: 'webui/approval/respond',
+        params: {
+          requestId: 'approval-1',
+          method: 'item/commandExecution/requestApproval',
+          decision: 'accept',
+          requestParams: { command: 'npm test' },
+        },
+      }),
+    );
+    const [response, resolved] = await responses;
+
+    expect(respond).toHaveBeenCalledWith('approval-1', { decision: 'accept' });
+    expect(response).toEqual({ type: 'rpc/result', id: 50, result: { ok: true } });
+    expect(resolved).toEqual({ type: 'codex/requestResolved', requestId: 'approval-1' });
+  });
+
+  it('returns an RPC error for unsupported approval request methods', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, requestFromServer, respond } = await makeHarness(request);
+
+    const approvalBroadcast = nextMessage(ws);
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: 7,
+      method: 'unknown/request',
+      params: {},
+    });
+    await approvalBroadcast;
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 51,
+        method: 'webui/approval/respond',
+        params: {
+          requestId: 7,
+          method: 'unknown/request',
+          decision: 'accept',
+          requestParams: {},
+        },
+      }),
+    );
+    const response = await nextMessage(ws);
+
+    expect(respond).not.toHaveBeenCalled();
+    expect(response).toEqual({ type: 'rpc/error', id: 51, error: 'unsupported approval request method: unknown/request' });
+  });
+
+  it('rejects duplicate approval responses after the pending request resolves', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, requestFromServer, respond } = await makeHarness(request);
+
+    const approvalBroadcast = nextMessage(ws);
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: 'approval-duplicate',
+      method: 'item/fileChange/requestApproval',
+      params: { file: 'src/App.tsx' },
+    });
+    await approvalBroadcast;
+
+    const firstResponses = nextMessages(ws, 2);
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 52,
+        method: 'webui/approval/respond',
+        params: { requestId: 'approval-duplicate', decision: 'accept' },
+      }),
+    );
+    expect(await firstResponses).toEqual([
+      { type: 'rpc/result', id: 52, result: { ok: true } },
+      { type: 'codex/requestResolved', requestId: 'approval-duplicate' },
+    ]);
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 53,
+        method: 'webui/approval/respond',
+        params: { requestId: 'approval-duplicate', decision: 'decline' },
+      }),
+    );
+    const duplicateResponse = await nextMessage(ws);
+
+    expect(respond).toHaveBeenCalledTimes(1);
+    expect(duplicateResponse).toEqual({ type: 'rpc/error', id: 53, error: 'approval request is no longer pending' });
+  });
+
+  it('uses the stored pending request when browser approval params are spoofed', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, requestFromServer, respond } = await makeHarness(request);
+
+    const approvalBroadcast = nextMessage(ws);
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: 'approval-spoof',
+      method: 'item/permissions/requestApproval',
+      params: { permissions: ['safe-permission'] },
+    });
+    await approvalBroadcast;
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 54,
+        method: 'webui/approval/respond',
+        params: {
+          requestId: 'approval-spoof',
+          method: 'item/commandExecution/requestApproval',
+          decision: 'accept',
+          requestParams: { permissions: ['spoofed-permission'] },
+        },
+      }),
+    );
+    const response = await nextMessage(ws);
+
+    expect(respond).toHaveBeenCalledWith('approval-spoof', { permissions: ['safe-permission'], scope: 'session' });
+    expect(response).toEqual({ type: 'rpc/result', id: 54, result: { ok: true } });
+  });
+
+  it('does not grant requested permissions when permission approval is declined', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, requestFromServer, respond } = await makeHarness(request);
+
+    const approvalBroadcast = nextMessage(ws);
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: 'permission-decline',
+      method: 'item/permissions/requestApproval',
+      params: { permissions: ['network', 'filesystem'] },
+    });
+    await approvalBroadcast;
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 55,
+        method: 'webui/approval/respond',
+        params: { requestId: 'permission-decline', decision: 'decline' },
+      }),
+    );
+    const response = await nextMessage(ws);
+
+    expect(respond).toHaveBeenCalledWith('permission-decline', { permissions: {}, scope: 'session' });
+    expect(response).toEqual({ type: 'rpc/result', id: 55, result: { ok: true } });
+  });
+
+  it('rejects unsafe MCP elicitation accept responses', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, requestFromServer, respond } = await makeHarness(request);
+
+    const approvalBroadcast = nextMessage(ws);
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: 'mcp-elicitation',
+      method: 'mcpServer/elicitation/request',
+      params: { message: 'Need a value' },
+    });
+    await approvalBroadcast;
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 56,
+        method: 'webui/approval/respond',
+        params: { requestId: 'mcp-elicitation', decision: 'accept' },
+      }),
+    );
+    const response = await nextMessage(ws);
+
+    expect(respond).not.toHaveBeenCalled();
+    expect(response).toEqual({ type: 'rpc/error', id: 56, error: 'unsupported MCP elicitation decision' });
+  });
+
+  it('keeps numeric and string pending request ids distinct', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, requestFromServer, respond } = await makeHarness(request);
+
+    const numericBroadcast = nextMessage(ws);
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'item/fileChange/requestApproval',
+      params: { file: 'numeric-id.ts' },
+    });
+    await numericBroadcast;
+
+    const stringBroadcast = nextMessage(ws);
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: '1',
+      method: 'item/permissions/requestApproval',
+      params: { permissions: { filesystem: 'read' } },
+    });
+    await stringBroadcast;
+
+    const firstResponses = nextMessages(ws, 2);
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 57,
+        method: 'webui/approval/respond',
+        params: { requestId: 1, decision: 'accept' },
+      }),
+    );
+    expect(await firstResponses).toEqual([
+      { type: 'rpc/result', id: 57, result: { ok: true } },
+      { type: 'codex/requestResolved', requestId: 1 },
+    ]);
+
+    const secondResponses = nextMessages(ws, 2);
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 58,
+        method: 'webui/approval/respond',
+        params: { requestId: '1', decision: 'accept' },
+      }),
+    );
+    expect(await secondResponses).toEqual([
+      { type: 'rpc/result', id: 58, result: { ok: true } },
+      { type: 'codex/requestResolved', requestId: '1' },
+    ]);
+
+    expect(respond).toHaveBeenNthCalledWith(1, 1, { decision: 'accept' });
+    expect(respond).toHaveBeenNthCalledWith(2, '1', { permissions: { filesystem: 'read' }, scope: 'session' });
   });
 });
 
