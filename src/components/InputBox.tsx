@@ -1,6 +1,6 @@
-import { ChangeEvent, FormEvent, KeyboardEvent, useEffect, useRef, useState } from 'react';
+import { ChangeEvent, FormEvent, KeyboardEvent, useEffect, useMemo, useRef, useState } from 'react';
 import { BANG_COMMAND_RPC_TIMEOUT_MS, parseBangCommand } from '../lib/bangCommands';
-import { classifySlashCommand } from '../lib/slashCommands';
+import { classifySlashCommand, SLASH_ARGUMENT_SUGGESTIONS, SLASH_COMMANDS } from '../lib/slashCommands';
 import type { CodexRunOptions } from '../types/ui';
 
 interface InputBoxProps {
@@ -13,11 +13,18 @@ interface InputBoxProps {
   disabled?: boolean;
   onDraftConsumed: () => void;
   onEnqueue: (text: string, options?: CodexRunOptions) => Promise<void>;
+  onDirectSubmit?: (text: string) => void | (() => void);
 }
 
 interface FileSuggestion {
   name: string;
   path: string;
+}
+
+interface SlashSuggestion {
+  label: string;
+  detail: string;
+  insertText: string;
 }
 
 function dispatchInputEvent(name: string, detail: unknown): void {
@@ -73,12 +80,42 @@ export default function InputBox({
   disabled = false,
   onDraftConsumed,
   onEnqueue,
+  onDirectSubmit,
 }: InputBoxProps) {
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [fileSuggestions, setFileSuggestions] = useState<FileSuggestion[]>([]);
   const autocompleteSeqRef = useRef(0);
+
+  const slashSuggestions = useMemo<SlashSuggestion[]>(() => {
+    if (!draft.startsWith('/')) return [];
+    const firstSpace = draft.search(/\s/);
+    const commandText = firstSpace === -1 ? draft.toLowerCase() : draft.slice(0, firstSpace).toLowerCase();
+
+    if (firstSpace === -1) {
+      return SLASH_COMMANDS.filter((command) => command.command.startsWith(commandText))
+        .map((command) => ({
+          label: command.valueHint ? `${command.command} ${command.valueHint}` : command.command,
+          detail: command.description,
+          insertText: command.valueHint ? `${command.command} ` : command.command,
+        }))
+        .slice(0, 12);
+    }
+
+    const options = SLASH_ARGUMENT_SUGGESTIONS[commandText];
+    if (!options) return [];
+
+    const argument = draft.slice(firstSpace + 1).trim().toLowerCase();
+    return options
+      .filter((option) => option.value.startsWith(argument) || option.description.toLowerCase().includes(argument))
+      .map((option) => ({
+        label: option.value,
+        detail: option.description,
+        insertText: `${commandText} ${option.value}`,
+      }))
+      .slice(0, 12);
+  }, [draft]);
 
   useEffect(() => {
     if (draftOverride === null) return;
@@ -132,6 +169,12 @@ export default function InputBox({
     setFileSuggestions([]);
   };
 
+  const insertSlashSuggestion = (suggestion: SlashSuggestion) => {
+    autocompleteSeqRef.current += 1;
+    setDraft(suggestion.insertText.endsWith(' ') ? suggestion.insertText : `${suggestion.insertText} `);
+    setFileSuggestions([]);
+  };
+
   const handleDraftChange = (event: ChangeEvent<HTMLTextAreaElement>) => {
     autocompleteSeqRef.current += 1;
     setDraft(event.target.value);
@@ -180,7 +223,16 @@ export default function InputBox({
         return;
       }
 
-      await rpc('webui/turn/start', { threadId, text, options: runOptions });
+      const previousDraft = draft;
+      const rollbackOptimistic = onDirectSubmit?.(text);
+      setDraft('');
+      try {
+        await rpc('webui/turn/start', { threadId, text, options: runOptions });
+      } catch (caught) {
+        if (typeof rollbackOptimistic === 'function') rollbackOptimistic();
+        setDraft(previousDraft);
+        throw caught;
+      }
       setDraft('');
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -195,6 +247,11 @@ export default function InputBox({
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.key === 'Tab' && slashSuggestions.length > 0) {
+      event.preventDefault();
+      insertSlashSuggestion(slashSuggestions[0]);
+      return;
+    }
     if (event.key !== 'Enter' || event.shiftKey) return;
     event.preventDefault();
     void submitText();
@@ -215,6 +272,23 @@ export default function InputBox({
 
   return (
     <form className="input-panel" onSubmit={handleSubmit}>
+      {slashSuggestions.length > 0 && (
+        <div className="slash-autocomplete">
+          {slashSuggestions.map((suggestion) => (
+            <button
+              key={`${suggestion.insertText}-${suggestion.label}`}
+              type="button"
+              className="slash-autocomplete-row"
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={() => insertSlashSuggestion(suggestion)}
+              title={suggestion.detail}
+            >
+              <span>{suggestion.label}</span>
+              <small>{suggestion.detail}</small>
+            </button>
+          ))}
+        </div>
+      )}
       {fileSuggestions.length > 0 && (
         <div className="file-autocomplete">
           {fileSuggestions.map((suggestion) => (

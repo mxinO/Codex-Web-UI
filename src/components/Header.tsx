@@ -1,3 +1,5 @@
+import { List, Moon, Plus, Sun } from 'lucide-react';
+import type { ReactNode } from 'react';
 import type { ConnectionState } from '../hooks/useCodexSocket';
 
 interface HeaderProps {
@@ -11,6 +13,11 @@ interface HeaderProps {
   sandbox?: string | null;
   theme: 'dark' | 'light';
   onToggleTheme: () => void;
+  sessionBusy?: boolean;
+  sessionError?: string | null;
+  onOpenSessions?: () => void;
+  onNewSession?: () => void;
+  sessionPicker?: ReactNode;
 }
 
 function trimPath(path: string) {
@@ -18,14 +25,30 @@ function trimPath(path: string) {
 }
 
 export default function Header(props: HeaderProps) {
-  const shortThread = props.activeThreadId ? `${props.activeThreadId.slice(0, 8)}...` : 'No session';
+  const shortThread = props.activeThreadId ? `Session: ${props.activeThreadId.slice(0, 8)}...` : 'No session';
 
   return (
     <header className="topbar">
       <span className="brand" title={props.hostname ? `Codex Web UI @${props.hostname}` : 'Codex Web UI'}>
         Codex Web UI{props.hostname ? ` @${props.hostname}` : ''}
       </span>
-      <span className="badge">{shortThread}</span>
+      <div className="topbar-session">
+        <button
+          className="header-pill header-pill--session"
+          type="button"
+          onClick={props.onOpenSessions}
+          disabled={!props.onOpenSessions || props.sessionBusy}
+          title={props.activeThreadId ? `Switch session ${props.activeThreadId}` : 'Open sessions'}
+          aria-label="Switch session"
+        >
+          <List size={14} aria-hidden="true" />
+          <span>{props.sessionBusy ? 'Loading sessions...' : shortThread}</span>
+        </button>
+        {props.sessionPicker}
+      </div>
+      <button className="icon-button icon-button--square" type="button" onClick={props.onNewSession} disabled={!props.onNewSession} title="New session" aria-label="New session">
+        <Plus size={16} aria-hidden="true" />
+      </button>
       {props.cwd && (
         <span className="cwd" title={props.cwd}>
           {trimPath(props.cwd)}
@@ -35,8 +58,13 @@ export default function Header(props: HeaderProps) {
       {props.mode && <span className="badge">{props.mode}</span>}
       {props.effort && <span className="badge">{props.effort}</span>}
       {props.sandbox && <span className="badge">{props.sandbox}</span>}
-      <button className="icon-button" type="button" onClick={props.onToggleTheme} title="Toggle theme" aria-label="Toggle theme">
-        {props.theme === 'dark' ? 'Light' : 'Dark'}
+      {props.sessionError && (
+        <span className="topbar-error" title={props.sessionError}>
+          {props.sessionError}
+        </span>
+      )}
+      <button className="icon-button icon-button--square" type="button" onClick={props.onToggleTheme} title="Toggle theme" aria-label="Toggle theme">
+        {props.theme === 'dark' ? <Sun size={16} aria-hidden="true" /> : <Moon size={16} aria-hidden="true" />}
       </button>
       <span className={`status status--${props.connectionState}`}>{props.connectionState}</span>
     </header>

@@ -45,9 +45,9 @@ function fileButton(path: string): HTMLButtonElement {
   return button;
 }
 
-function buttonByText(text: string): HTMLButtonElement {
-  const button = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((item) => item.textContent === text);
-  if (!button) throw new Error(`missing button ${text}`);
+function buttonByLabel(label: string): HTMLButtonElement {
+  const button = document.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+  if (!button) throw new Error(`missing button ${label}`);
   return button;
 }
 
@@ -62,18 +62,13 @@ afterEach(() => {
 });
 
 describe('FileExplorer', () => {
-  it('ignores stale directory responses after navigating again', async () => {
-    const initialRootLoad = deferred<unknown>();
-    const staleRootRefresh = deferred<unknown>();
+  it('expands directories inline instead of navigating away from the root tree', async () => {
+    const rootLoad = deferred<unknown>();
     const dirALoad = deferred<unknown>();
-    let rootReadCount = 0;
     const rpc = vi.fn((method: string, params?: unknown) => {
       const path = (params as { path?: string } | undefined)?.path;
       if (method !== 'webui/fs/readDirectory') return Promise.reject(new Error(`unexpected method ${method}`));
-      if (path === '/repo-a') {
-        rootReadCount += 1;
-        return rootReadCount === 1 ? initialRootLoad.promise : staleRootRefresh.promise;
-      }
+      if (path === '/repo-a') return rootLoad.promise;
       if (path === '/repo-a/a') return dirALoad.promise;
       return Promise.reject(new Error(`unexpected path ${path}`));
     });
@@ -81,19 +76,23 @@ describe('FileExplorer', () => {
     renderFileExplorer(asRpc(rpc), '/repo-a');
 
     await act(async () => {
-      initialRootLoad.resolve({ entries: [{ name: 'a', path: '/repo-a/a', isDirectory: true }] });
+      rootLoad.resolve({
+        entries: [
+          { name: 'a', path: '/repo-a/a', isDirectory: true },
+          { name: 'root.txt', path: '/repo-a/root.txt', isFile: true },
+        ],
+      });
       await Promise.resolve();
     });
 
     await act(async () => {
-      buttonByText('Refresh').click();
-      fileButton('/repo-a/a').click();
-      staleRootRefresh.resolve({ entries: [{ name: 'stale.txt', path: '/repo-a/stale.txt', isFile: true }] });
+      buttonByLabel('Expand a').click();
+      dirALoad.resolve({ entries: [{ name: 'nested.txt', path: '/repo-a/a/nested.txt', isFile: true }] });
       await Promise.resolve();
     });
 
-    expect(document.querySelector('.file-current')?.textContent).toBe('/repo-a/a');
-    expect(document.querySelector('[title="/repo-a/stale.txt"]')).toBeNull();
+    expect(fileButton('/repo-a/root.txt')).not.toBeNull();
+    expect(fileButton('/repo-a/a/nested.txt')).not.toBeNull();
   });
 
   it('does not refresh the old directory after create resolves following navigation', async () => {
@@ -118,7 +117,7 @@ describe('FileExplorer', () => {
 
     renderFileExplorer(asRpc(rpc), '/repo-a');
     act(() => {
-      buttonByText('New File').click();
+      buttonByLabel('New file in root').click();
     });
     rerenderFileExplorer(asRpc(rpc), '/repo-b');
 
@@ -135,8 +134,54 @@ describe('FileExplorer', () => {
       await Promise.resolve();
     });
 
-    expect(document.querySelector('.file-current')?.textContent).toBe('/repo-b');
     expect(fileButton('/repo-b/b.txt')).not.toBeNull();
     expect(document.querySelector('[title="/repo-a/a.txt"]')).toBeNull();
+  });
+
+  it('exposes a resize handle for the explorer panel', async () => {
+    const rpc = vi.fn().mockResolvedValue({ entries: [] });
+    renderFileExplorer(asRpc(rpc), '/repo-a');
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const explorer = document.querySelector<HTMLElement>('.file-explorer');
+    const handle = document.querySelector<HTMLElement>('[role="separator"][aria-label="Resize file explorer"]');
+    const initialWidth = Number.parseInt(explorer?.style.getPropertyValue('--file-explorer-width') ?? '0', 10);
+
+    expect(handle).toBeInstanceOf(HTMLElement);
+
+    act(() => {
+      handle?.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 300 }));
+      window.dispatchEvent(new MouseEvent('mousemove', { bubbles: true, clientX: 420 }));
+      window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+    });
+
+    const expectedWidth = Math.min(720, Math.max(240, initialWidth + 120));
+    expect(explorer?.style.getPropertyValue('--file-explorer-width')).toBe(`${expectedWidth}px`);
+    expect(handle?.getAttribute('aria-valuenow')).toBe(String(expectedWidth));
+  });
+
+  it('supports keyboard resizing through the separator', async () => {
+    const rpc = vi.fn().mockResolvedValue({ entries: [] });
+    renderFileExplorer(asRpc(rpc), '/repo-a');
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const explorer = document.querySelector<HTMLElement>('.file-explorer');
+    const handle = document.querySelector<HTMLElement>('[role="separator"][aria-label="Resize file explorer"]');
+    const initialWidth = Number.parseInt(explorer?.style.getPropertyValue('--file-explorer-width') ?? '0', 10);
+
+    expect(handle?.getAttribute('tabindex')).toBe('0');
+    expect(handle?.getAttribute('aria-valuemin')).toBe('240');
+    expect(handle?.getAttribute('aria-valuemax')).toBe('720');
+
+    act(() => {
+      handle?.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true, key: 'ArrowRight' }));
+    });
+
+    expect(explorer?.style.getPropertyValue('--file-explorer-width')).toBe(`${initialWidth + 16}px`);
+    expect(handle?.getAttribute('aria-valuenow')).toBe(String(initialWidth + 16));
   });
 });

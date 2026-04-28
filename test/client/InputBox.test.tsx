@@ -190,6 +190,32 @@ describe('InputBox', () => {
     expect(rpc).toHaveBeenCalledWith('webui/turn/start', { threadId: 'thread-1', text: 'hello', options: runOptions });
   });
 
+  it('notifies the app about a direct send before the turn RPC resolves', async () => {
+    const turnStart = deferred<unknown>();
+    const rpc = vi.fn((method: string) => {
+      if (method === 'webui/turn/start') return turnStart.promise;
+      return Promise.reject(new Error(`unexpected method ${method}`));
+    });
+    const onDirectSubmit = vi.fn();
+    renderInputBox({ rpc: asRpc(rpc), draftOverride: 'hello now', onDirectSubmit });
+    const submit = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Send');
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    act(() => {
+      submit?.click();
+    });
+
+    expect(onDirectSubmit).toHaveBeenCalledWith('hello now');
+    expect(rpc).toHaveBeenCalledWith('webui/turn/start', { threadId: 'thread-1', text: 'hello now', options: undefined });
+
+    await act(async () => {
+      turnStart.resolve({ turn: { id: 'turn-1' } });
+      await Promise.resolve();
+    });
+  });
+
   it('passes run options when queueing a message', async () => {
     const onEnqueue = vi.fn().mockResolvedValue(undefined);
     const runOptions = { model: 'gpt-5.5', effort: 'high', mode: 'plan', sandbox: 'workspace-write' };
@@ -231,5 +257,17 @@ describe('InputBox', () => {
     });
 
     expect(document.querySelector('.file-autocomplete')).toBeNull();
+  });
+
+  it('shows slash command suggestions for the current prefix', async () => {
+    renderInputBox({ draftOverride: '/m' });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const suggestions = Array.from(document.querySelectorAll<HTMLButtonElement>('.slash-autocomplete-row')).map((button) => button.textContent);
+    expect(suggestions.some((text) => text?.includes('/model'))).toBe(true);
+    expect(suggestions.some((text) => text?.includes('/status'))).toBe(false);
   });
 });

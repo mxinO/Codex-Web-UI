@@ -37,6 +37,8 @@ interface OpenEditor {
   modifiedAtMs: number | null;
 }
 
+type UserTimelineItem = Extract<TimelineItem, { kind: 'user' }>;
+
 function decodeUtf8Base64(value: string): string {
   const binary = window.atob(value);
   const bytes = new Uint8Array(binary.length);
@@ -126,22 +128,24 @@ export default function App() {
   const [composerDraft, setComposerDraft] = useState<string | null>(null);
   const [editor, setEditor] = useState<OpenEditor | null>(null);
   const [ephemeralItems, setEphemeralItems] = useState<TimelineItem[]>([]);
+  const [pendingUserItems, setPendingUserItems] = useState<UserTimelineItem[]>([]);
   const [answeredApprovals, setAnsweredApprovals] = useState<Set<string>>(() => new Set());
   const [model, setModelState] = useState<string | null>(() => sanitizeStoredModel(localStorageValue('codex-web-ui:model')));
   const [mode, setModeState] = useState<string | null>(initialMode);
   const [effort, setEffortState] = useState<string | null>(() => sanitizeStoredEffort(localStorageValue('codex-web-ui:effort')));
   const [sandbox, setSandboxState] = useState<string | null>(initialSandbox);
   const bangCounterRef = useRef(0);
+  const pendingUserCounterRef = useRef(0);
   const lastNotification = socket.notifications.at(-1);
   const liveStreamingItem = useMemo(
     () => liveStreamingItemFromNotifications(socket.notifications, { activeThreadId, activeTurnId: state?.activeTurnId ?? null }, Boolean(state?.activeTurnId)),
     [activeThreadId, socket.notifications, state?.activeTurnId],
   );
   const approvalItems = useMemo(() => approvalItemsFromRequests(socket.requests, answeredApprovals), [answeredApprovals, socket.requests]);
-  const chatItems = useMemo(
-    () => timeline.items.concat(timeline.isViewingLatest ? ephemeralItems.concat(liveStreamingItem ? [liveStreamingItem] : [], approvalItems) : []),
-    [approvalItems, ephemeralItems, liveStreamingItem, timeline.isViewingLatest, timeline.items],
-  );
+  const chatItems = useMemo<TimelineItem[]>(() => {
+    if (!timeline.isViewingLatest) return timeline.items;
+    return [...timeline.items, ...pendingUserItems, ...ephemeralItems, ...(liveStreamingItem ? [liveStreamingItem] : []), ...approvalItems];
+  }, [approvalItems, ephemeralItems, liveStreamingItem, pendingUserItems, timeline.isViewingLatest, timeline.items]);
   const runOptions = useMemo<CodexRunOptions>(() => ({ model, mode: effectiveMode(mode, model), effort, sandbox }), [effort, mode, model, sandbox]);
 
   useEffect(() => {
@@ -150,8 +154,20 @@ export default function App() {
 
   useEffect(() => {
     setEphemeralItems([]);
+    setPendingUserItems([]);
     setAnsweredApprovals(new Set());
   }, [activeThreadId]);
+
+  useEffect(() => {
+    setPendingUserItems((items) =>
+      items.filter(
+        (pending) =>
+          !timeline.items.some(
+            (item) => item.kind === 'user' && item.text.trim() === pending.text.trim() && item.timestamp >= pending.timestamp - 60_000,
+          ),
+      ),
+    );
+  }, [timeline.items]);
 
   useEffect(() => {
     if (
@@ -221,6 +237,17 @@ export default function App() {
       setSessionLoading(false);
     }
   }, [socket.rpc]);
+
+  const openNewSessionPicker = useCallback(() => {
+    setSessionPickerOpen(false);
+    setCwdPickerOpen(true);
+  }, []);
+
+  const addPendingUserMessage = useCallback((text: string) => {
+    const id = `pending:user:${Date.now()}:${(pendingUserCounterRef.current += 1)}`;
+    setPendingUserItems((items) => [...items, { id, kind: 'user', timestamp: Date.now(), text }]);
+    return () => setPendingUserItems((items) => items.filter((item) => item.id !== id));
+  }, []);
 
   useEffect(() => {
     const handleSlashCommand = (event: Event) => {
@@ -411,29 +438,26 @@ export default function App() {
         sandbox={sandbox}
         theme={theme}
         onToggleTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+        sessionBusy={sessionLoading}
+        sessionError={sessionError}
+        onOpenSessions={socket.connectionState === 'connected' ? () => void loadSessions() : undefined}
+        onNewSession={socket.connectionState === 'connected' ? openNewSessionPicker : undefined}
+        sessionPicker={
+          <SessionPicker
+            threads={threads}
+            visible={sessionPickerOpen}
+            busy={sessionLoading}
+            onClose={() => setSessionPickerOpen(false)}
+            onSelect={(threadId) => void resumeSession(threadId)}
+            onNew={openNewSessionPicker}
+          />
+        }
       />
       <main className="main-panel">
         {socket.connectionState === 'disconnected' && <div className="disconnect-banner">Connection lost - reconnecting...</div>}
         <div className="workspace-layout">
           {state?.activeCwd && <FileExplorer root={state.activeCwd} rpc={socket.rpc} onOpenFile={(path, readOnly) => void openFile(path, readOnly)} />}
           <section className="workspace-main" aria-label="Chat workspace">
-            <div className="session-actions">
-              <button className="text-button primary" type="button" onClick={loadSessions} disabled={socket.connectionState !== 'connected' || sessionLoading}>
-                {sessionLoading ? 'Loading...' : 'Sessions'}
-              </button>
-              {sessionError && <span className="action-error">{sessionError}</span>}
-              <SessionPicker
-                threads={threads}
-                visible={sessionPickerOpen}
-                busy={sessionLoading}
-                onClose={() => setSessionPickerOpen(false)}
-                onSelect={(threadId) => void resumeSession(threadId)}
-                onNew={() => {
-                  setSessionPickerOpen(false);
-                  setCwdPickerOpen(true);
-                }}
-              />
-            </div>
             <div className="main-content">
               {activeThreadId ? (
                 <ChatTimeline
@@ -467,6 +491,7 @@ export default function App() {
               disabled={socket.connectionState !== 'connected'}
               onDraftConsumed={() => setComposerDraft(null)}
               onEnqueue={enqueue}
+              onDirectSubmit={addPendingUserMessage}
             />
           </section>
         </div>
