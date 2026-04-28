@@ -374,6 +374,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       type: 'server/hello',
       hostname: deps.config.hostname,
       state,
+      appServerHealth: deps.codex.health(),
       requests: Array.from(pendingServerRequests.values()),
     });
   };
@@ -384,9 +385,31 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
   };
 
+  const ensureCodexStarted = (): Promise<void> | null => {
+    const health = deps.codex.health();
+    if (health.connected && !health.dead) return null;
+    return deps.codex.start().then(() => {
+      const appServerUrl = deps.codex.getUrl();
+      const appServerPid = deps.codex.getPid();
+      const current = deps.stateStore.read();
+      if (current.appServerUrl === appServerUrl && current.appServerPid === appServerPid) {
+        broadcastHello(current);
+        return;
+      }
+      const next = deps.stateStore.update((state) => ({ ...state, appServerUrl, appServerPid }));
+      broadcastHello(next);
+    });
+  };
+
+  const requestCodex = <T = unknown>(method: string, params?: unknown, timeoutMs?: number): Promise<T> => {
+    const call = () => (timeoutMs === undefined ? deps.codex.request<T>(method, params) : deps.codex.request<T>(method, params, timeoutMs));
+    const starting = ensureCodexStarted();
+    return starting ? starting.then(call) : call();
+  };
+
   const startTurn = async ({ threadId, text, options }: TurnStartParams) => {
     const state = deps.stateStore.read();
-    return deps.codex.request<{ turn: { id: string } }>(
+    return requestCodex<{ turn: { id: string } }>(
       'turn/start',
       applyTurnRunOptions(
         {
@@ -470,11 +493,16 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     for (const client of wss.clients) send(client, { type: 'codex/request', message });
   });
 
+  const unsubscribeHealthChange = deps.codex.onHealthChange(() => {
+    broadcastHello();
+  });
+
   const close = () => {
     if (closed) return;
     closed = true;
     unsubscribeNotification();
     unsubscribeServerRequest();
+    unsubscribeHealthChange();
     for (const client of wss.clients) closeClient(client);
     wss.close();
   };
@@ -519,7 +547,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
       try {
         if (request.method === 'webui/session/list') {
-          const result = await deps.codex.request('thread/list', {
+          const result = await requestCodex('thread/list', {
             limit: 50,
             cursor: null,
             sortDirection: 'desc',
@@ -541,7 +569,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             experimentalRawEvents: false,
             persistExtendedHistory: true,
           }, runOptionsFromParams(request.params));
-          const result = await deps.codex.request('thread/start', params);
+          const result = await requestCodex('thread/start', params);
           const activeCwd = extractThreadCwd(result) ?? cwd;
           const state = deps.stateStore.update((state) => ({
             ...state,
@@ -566,7 +594,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             threadId,
             persistExtendedHistory: true,
           }, runOptionsFromParams(request.params));
-          const result = await deps.codex.request('thread/resume', params);
+          const result = await requestCodex('thread/resume', params);
           const activeCwd = extractThreadCwd(result) ?? deps.stateStore.read().activeCwd;
           const state = deps.stateStore.update((state) => ({
             ...state,
@@ -614,7 +642,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             throw new Error('interactive commands are not supported');
           }
 
-          const result = await deps.codex.request(
+          const result = await requestCodex(
             'command/exec',
             buildBangCommandParams(command, state.activeCwd, deps.config.commandTimeoutMs, deps.config.commandOutputBytes),
             deps.config.commandTimeoutMs + 2_000,
@@ -658,7 +686,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
 
           const resolvedPath = await resolveReadableRpcPath(deps, filePath);
-          const result = await deps.codex.request('fs/readDirectory', { path: resolvedPath });
+          const result = await requestCodex('fs/readDirectory', { path: resolvedPath });
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
@@ -671,7 +699,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
 
           const resolvedPath = await resolveReadableRpcPath(deps, filePath);
-          const result = await deps.codex.request('fs/readFile', { path: resolvedPath });
+          const result = await requestCodex('fs/readFile', { path: resolvedPath });
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
@@ -689,7 +717,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
 
           const resolvedPath = await resolveWritableRpcPath(deps, filePath);
-          const result = await deps.codex.request('fs/writeFile', { path: resolvedPath, dataBase64 });
+          const result = await requestCodex('fs/writeFile', { path: resolvedPath, dataBase64 });
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
@@ -702,7 +730,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
 
           const resolvedPath = await resolveWritableRpcPath(deps, filePath);
-          const result = await deps.codex.request('fs/createDirectory', { path: resolvedPath });
+          const result = await requestCodex('fs/createDirectory', { path: resolvedPath });
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
@@ -715,7 +743,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
 
           const resolvedPath = await resolveWritableRpcPath(deps, filePath);
-          const result = await deps.codex.request('fs/writeFile', { path: resolvedPath, dataBase64: '' });
+          const result = await requestCodex('fs/writeFile', { path: resolvedPath, dataBase64: '' });
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
@@ -728,7 +756,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
 
           const resolvedPath = await resolveReadableRpcPath(deps, filePath);
-          const result = await deps.codex.request('fs/getMetadata', { path: resolvedPath });
+          const result = await requestCodex('fs/getMetadata', { path: resolvedPath });
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
@@ -740,7 +768,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
-          const result = await deps.codex.request('thread/turns/list', params);
+          const result = await requestCodex('thread/turns/list', params);
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
@@ -810,7 +838,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             throw new Error('no active turn to interrupt');
           }
 
-          const result = await deps.codex.request('turn/interrupt', {
+          const result = await requestCodex('turn/interrupt', {
             threadId: state.activeThreadId,
             turnId: state.activeTurnId,
           });

@@ -32,29 +32,43 @@ export class CodexAppServer {
   private readyzUrl: string | null = null;
   private deadError: Error | null = null;
   private startPromise: Promise<CodexInitializeResponse | void> | null = null;
+  private initialized = false;
   private lifecycleId = 0;
+  private readonly healthHandlers = new Set<() => void>();
   private readonly notificationHandlers = new Set<JsonRpcNotificationHandler>();
   private readonly requestHandlers = new Set<JsonRpcServerRequestHandler>();
 
   constructor(private readonly options: CodexAppServerOptions) {}
 
   start(): Promise<CodexInitializeResponse | void> {
+    if (this.isConnected()) return Promise.resolve();
     if (this.startPromise) return this.startPromise;
 
     this.deadError = null;
+    this.initialized = false;
 
     if (this.options.mock) {
       this.url = 'mock://codex-app-server';
-      this.startPromise = Promise.resolve();
-      return this.startPromise;
+      this.initialized = true;
+      this.emitHealthChange();
+      return Promise.resolve();
     }
 
-    this.startPromise = this.startReal();
-    return this.startPromise;
+    const startup = this.startReal();
+    this.startPromise = startup;
+    void startup.then(
+      () => {
+        if (this.startPromise === startup) this.startPromise = null;
+      },
+      () => {
+        if (this.startPromise === startup) this.startPromise = null;
+      },
+    );
+    return startup;
   }
 
   async request<T = unknown>(method: string, params?: unknown, timeoutMs?: number): Promise<T> {
-    if (!this.peer) {
+    if (!this.peer || !this.isConnected()) {
       throw this.deadError ?? new Error('Codex app-server is not connected');
     }
 
@@ -62,7 +76,7 @@ export class CodexAppServer {
   }
 
   respond(id: number | string, result: unknown): void {
-    if (!this.peer) {
+    if (!this.peer || !this.isConnected()) {
       throw this.deadError ?? new Error('Codex app-server is not connected');
     }
 
@@ -83,9 +97,16 @@ export class CodexAppServer {
     };
   }
 
+  onHealthChange(handler: () => void): () => void {
+    this.healthHandlers.add(handler);
+    return () => {
+      this.healthHandlers.delete(handler);
+    };
+  }
+
   health(): CodexAppServerHealth {
     return {
-      connected: this.socket?.readyState === WebSocket.OPEN && this.peer !== null,
+      connected: this.isConnected(),
       dead: this.deadError !== null,
       error: this.deadError?.message ?? null,
       readyzUrl: this.readyzUrl,
@@ -109,6 +130,7 @@ export class CodexAppServer {
 
     this.child = null;
     this.startPromise = null;
+    this.initialized = false;
     this.url = null;
     this.readyzUrl = null;
     this.deadError = null;
@@ -162,6 +184,8 @@ export class CodexAppServer {
         if (current) {
           this.deadError = error;
           this.startPromise = null;
+          this.initialized = false;
+          this.emitHealthChange();
         }
         reject(error);
       };
@@ -170,6 +194,10 @@ export class CodexAppServer {
         if (settled) return;
         settled = true;
         cleanupStartup();
+        if (this.isCurrentLifecycle(lifecycleId, child)) {
+          this.initialized = true;
+          this.emitHealthChange();
+        }
         resolve(response);
       };
 
@@ -206,6 +234,8 @@ export class CodexAppServer {
         this.socket = null;
         this.child = null;
         this.startPromise = null;
+        this.initialized = false;
+        this.emitHealthChange();
       });
     });
   }
@@ -260,17 +290,7 @@ export class CodexAppServer {
           reject(new Error('Codex app-server startup was cancelled'));
           return;
         }
-        socket.on('close', () => {
-          if (this.socket !== socket) return;
-
-          this.deadError = new Error('Codex app-server WebSocket closed');
-          this.peer = null;
-          this.socket = null;
-        });
-        socket.on('error', (error) => {
-          if (this.socket !== socket) return;
-          this.deadError = error;
-        });
+        this.handleSocketOpen(socket);
         resolve(socket);
       };
 
@@ -294,6 +314,39 @@ export class CodexAppServer {
     return this.lifecycleId === lifecycleId && this.child === child;
   }
 
+  private isConnected(): boolean {
+    if (this.options.mock) return this.initialized;
+    return this.initialized && this.socket?.readyState === WebSocket.OPEN && this.peer !== null;
+  }
+
+  private handleSocketOpen(socket: WebSocket): void {
+    socket.on('close', () => {
+      this.failCurrentSocket(socket, new Error('Codex app-server WebSocket closed'));
+    });
+    socket.on('error', (error) => {
+      this.failCurrentSocket(socket, error);
+    });
+  }
+
+  private failCurrentSocket(socket: WebSocket, error: Error): void {
+    if (this.socket !== socket) return;
+
+    const child = this.child;
+    this.deadError = error;
+    this.peer = null;
+    this.socket = null;
+    this.startPromise = null;
+    this.initialized = false;
+    this.url = null;
+    this.readyzUrl = null;
+
+    if (socket.readyState !== WebSocket.CLOSED && socket.readyState !== WebSocket.CLOSING) {
+      socket.close();
+    }
+    if (child) this.stopChild(child);
+    this.emitHealthChange();
+  }
+
   private stopChild(child: ChildProcessByStdio<null, Readable, Readable>): void {
     if (this.child === child) {
       this.child = null;
@@ -309,8 +362,13 @@ export class CodexAppServer {
     this.socket = null;
     this.openingSocket = null;
     this.peer = null;
+    this.initialized = false;
     socket?.close();
     openingSocket?.close();
+  }
+
+  private emitHealthChange(): void {
+    for (const handler of this.healthHandlers) handler();
   }
 
   private forwardNotification(message: JsonRpcNotification): void {

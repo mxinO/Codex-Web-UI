@@ -3,9 +3,18 @@ import type { CodexRunOptions } from '../types/ui';
 
 export type ConnectionState = 'connecting' | 'connected' | 'disconnected' | 'auth-error';
 
+export interface AppServerHealth {
+  connected: boolean;
+  dead: boolean;
+  error: string | null;
+  readyzUrl: string | null;
+  url: string | null;
+}
+
 interface ServerHello {
   type: 'server/hello';
   hostname: string;
+  appServerHealth?: AppServerHealth;
   state: {
     activeThreadId: string | null;
     activeTurnId: string | null;

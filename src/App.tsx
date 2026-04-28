@@ -436,6 +436,7 @@ export default function App() {
         mode={mode}
         effort={effort}
         sandbox={sandbox}
+        appServerHealth={socket.hello?.appServerHealth ?? null}
         theme={theme}
         onToggleTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
         sessionBusy={sessionLoading}

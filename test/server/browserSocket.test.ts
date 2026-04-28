@@ -45,16 +45,27 @@ async function makeHarness(request: TestRequest) {
   const stateStore = new HostStateStore(stateDir, 'test-host');
   let notificationHandler: NotificationHandler | null = null;
   let serverRequestHandler: ServerRequestHandler | null = null;
+  let healthHandler: (() => void) | null = null;
   const respond = vi.fn<CodexAppServer['respond']>();
+  const start = vi.fn<CodexAppServer['start']>().mockResolvedValue(undefined);
+  const health = vi.fn<CodexAppServer['health']>().mockReturnValue({ connected: true, dead: false, error: null, readyzUrl: 'http://127.0.0.1:1/readyz', url: 'ws://127.0.0.1:1' });
   const codex = {
+    start,
     request,
     respond,
+    health,
+    getPid: vi.fn<CodexAppServer['getPid']>().mockReturnValue(null),
+    getUrl: vi.fn<CodexAppServer['getUrl']>().mockReturnValue(null),
     onNotification: vi.fn((handler: NotificationHandler) => {
       notificationHandler = handler;
       return () => undefined;
     }),
     onServerRequest: vi.fn((handler: ServerRequestHandler) => {
       serverRequestHandler = handler;
+      return () => undefined;
+    }),
+    onHealthChange: vi.fn((handler: () => void) => {
+      healthHandler = handler;
       return () => undefined;
     }),
   } as unknown as CodexAppServer;
@@ -80,8 +91,11 @@ async function makeHarness(request: TestRequest) {
   const requestFromServer = (message: Parameters<ServerRequestHandler>[0]) => {
     serverRequestHandler?.(message);
   };
+  const emitHealthChange = () => {
+    healthHandler?.();
+  };
 
-  return { ws, stateStore, notify, requestFromServer, respond, port };
+  return { ws, stateStore, notify, requestFromServer, emitHealthChange, respond, start, health, port };
 }
 
 function nextMessage(ws: WebSocket): Promise<RpcMessage> {
@@ -98,6 +112,19 @@ function nextMessages(ws: WebSocket, count: number): Promise<RpcMessage[]> {
       if (messages.length === count) {
         ws.off('message', onMessage);
         resolve(messages);
+      }
+    };
+    ws.on('message', onMessage);
+  });
+}
+
+function nextRpcResponse(ws: WebSocket, id: number): Promise<RpcMessage> {
+  return new Promise((resolve) => {
+    const onMessage = (data: RawData) => {
+      const message = JSON.parse(String(data)) as RpcMessage;
+      if ((message.type === 'rpc/result' || message.type === 'rpc/error') && message.id === id) {
+        ws.off('message', onMessage);
+        resolve(message);
       }
     };
     ws.on('message', onMessage);
@@ -743,6 +770,67 @@ describe('attachBrowserSocket fs RPC wrappers', () => {
 
     expect(request).not.toHaveBeenCalled();
     expect(response).toEqual({ type: 'rpc/error', id: 34, error: 'unsupported RPC method: fs/readFile' });
+  });
+});
+
+describe('attachBrowserSocket app-server lifecycle', () => {
+  it('ensures the app-server is started before timeline RPCs after reconnect or refresh', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ data: [] });
+    const { ws, start, health } = await makeHarness(request);
+    health.mockReturnValue({ connected: false, dead: true, error: 'Codex app-server exited', readyzUrl: null, url: null });
+    start.mockImplementationOnce(async () => {
+      health.mockReturnValue({ connected: true, dead: false, error: null, readyzUrl: 'http://127.0.0.1:1/readyz', url: 'ws://127.0.0.1:1' });
+    });
+
+    const messages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 40, method: 'thread/turns/list', params: { threadId: 'thread-1' } }));
+    const [hello, response] = await messages;
+
+    expect(hello).toMatchObject({ type: 'server/hello', appServerHealth: { connected: true, dead: false, error: null } });
+    expect(response).toEqual({ type: 'rpc/result', id: 40, result: { data: [] } });
+    expect(start).toHaveBeenCalledTimes(1);
+    expect(start.mock.invocationCallOrder[0]).toBeLessThan(request.mock.invocationCallOrder[0]);
+  });
+
+  it('awaits an in-flight app-server startup before sending timeline RPCs', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ data: [] });
+    const { ws, start, health } = await makeHarness(request);
+    let resolveStart!: () => void;
+    health.mockReturnValue({ connected: false, dead: false, error: null, readyzUrl: 'http://127.0.0.1:1/readyz', url: 'ws://127.0.0.1:1' });
+    start.mockReturnValueOnce(
+      new Promise<void>((resolve) => {
+        resolveStart = () => {
+          health.mockReturnValue({ connected: true, dead: false, error: null, readyzUrl: 'http://127.0.0.1:1/readyz', url: 'ws://127.0.0.1:1' });
+          resolve();
+        };
+      }),
+    );
+
+    const response = nextRpcResponse(ws, 41);
+    ws.send(JSON.stringify({ type: 'rpc', id: 41, method: 'thread/turns/list', params: { threadId: 'thread-1' } }));
+    await waitForRequest(start);
+
+    expect(request).not.toHaveBeenCalled();
+
+    resolveStart();
+
+    expect(await response).toEqual({ type: 'rpc/result', id: 41, result: { data: [] } });
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+
+  it('broadcasts app-server health changes while browser clients are idle', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, health, emitHealthChange } = await makeHarness(request);
+    health.mockReturnValue({ connected: false, dead: true, error: 'Codex app-server WebSocket closed', readyzUrl: null, url: null });
+
+    const message = nextMessage(ws);
+    emitHealthChange();
+
+    expect(await message).toMatchObject({
+      type: 'server/hello',
+      appServerHealth: { connected: false, dead: true, error: 'Codex app-server WebSocket closed' },
+    });
+    expect(request).not.toHaveBeenCalled();
   });
 });
 

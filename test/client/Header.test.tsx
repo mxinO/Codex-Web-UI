@@ -61,4 +61,12 @@ describe('Header', () => {
     expect(onOpenSessions).toHaveBeenCalledTimes(1);
     expect(onNewSession).toHaveBeenCalledTimes(1);
   });
+
+  it('shows app-server health in the top bar', () => {
+    renderHeader({ appServerHealth: { connected: false, dead: true, error: 'Codex app-server exited', readyzUrl: null, url: null } });
+
+    const appStatus = document.querySelector('.status--app-server');
+    expect(appStatus?.textContent).toBe('App stopped');
+    expect(appStatus?.getAttribute('title')).toBe('Codex app-server exited');
+  });
 });

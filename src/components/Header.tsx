@@ -1,6 +1,6 @@
 import { List, Moon, Plus, Sun } from 'lucide-react';
 import type { ReactNode } from 'react';
-import type { ConnectionState } from '../hooks/useCodexSocket';
+import type { AppServerHealth, ConnectionState } from '../hooks/useCodexSocket';
 
 interface HeaderProps {
   hostname: string | null;
@@ -18,6 +18,7 @@ interface HeaderProps {
   onOpenSessions?: () => void;
   onNewSession?: () => void;
   sessionPicker?: ReactNode;
+  appServerHealth?: AppServerHealth | null;
 }
 
 function trimPath(path: string) {
@@ -26,6 +27,8 @@ function trimPath(path: string) {
 
 export default function Header(props: HeaderProps) {
   const shortThread = props.activeThreadId ? `Session: ${props.activeThreadId.slice(0, 8)}...` : 'No session';
+  const appServerLabel = props.appServerHealth ? (props.appServerHealth.connected ? 'App ready' : props.appServerHealth.dead ? 'App stopped' : 'App starting') : null;
+  const appServerTitle = props.appServerHealth?.error ?? props.appServerHealth?.url ?? appServerLabel ?? undefined;
 
   return (
     <header className="topbar">
@@ -61,6 +64,11 @@ export default function Header(props: HeaderProps) {
       {props.sessionError && (
         <span className="topbar-error" title={props.sessionError}>
           {props.sessionError}
+        </span>
+      )}
+      {appServerLabel && (
+        <span className={`status status--app-server ${props.appServerHealth?.connected ? 'status--connected' : props.appServerHealth?.dead ? 'status--disconnected' : 'status--connecting'}`} title={appServerTitle}>
+          {appServerLabel}
         </span>
       )}
       <button className="icon-button icon-button--square" type="button" onClick={props.onToggleTheme} title="Toggle theme" aria-label="Toggle theme">
