@@ -2,11 +2,13 @@ import { useState } from 'react';
 import AuthOverlay from './components/AuthOverlay';
 import ChatTimeline from './components/ChatTimeline';
 import CwdPicker from './components/CwdPicker';
+import DetailModal from './components/DetailModal';
 import Header from './components/Header';
 import SessionPicker from './components/SessionPicker';
 import { useCodexSocket } from './hooks/useCodexSocket';
 import { useThreadTimeline } from './hooks/useThreadTimeline';
 import { useTheme } from './hooks/useTheme';
+import type { TimelineItem } from './lib/timeline';
 import type { CodexThread } from './types/codex';
 
 export default function App() {
@@ -20,6 +22,7 @@ export default function App() {
   const [cwdPickerOpen, setCwdPickerOpen] = useState(false);
   const [sessionLoading, setSessionLoading] = useState(false);
   const [sessionError, setSessionError] = useState<string | null>(null);
+  const [detailItem, setDetailItem] = useState<TimelineItem | null>(null);
 
   const loadSessions = async () => {
     setSessionLoading(true);
@@ -89,7 +92,13 @@ export default function App() {
           />
         </div>
         {activeThreadId ? (
-          <ChatTimeline items={timeline.items} onLoadOlder={timeline.loadOlder} hasOlder={timeline.hasOlder} loading={timeline.loading} />
+          <ChatTimeline
+            items={timeline.items}
+            onLoadOlder={timeline.loadOlder}
+            hasOlder={timeline.hasOlder}
+            loading={timeline.loading}
+            onOpenDetail={setDetailItem}
+          />
         ) : (
           <div className="empty-state">No active session loaded.</div>
         )}
@@ -103,6 +112,7 @@ export default function App() {
         />
       )}
       <AuthOverlay visible={socket.connectionState === 'auth-error'} />
+      <DetailModal item={detailItem} onClose={() => setDetailItem(null)} />
     </div>
   );
 }

@@ -6,9 +6,10 @@ interface ChatTimelineProps {
   onLoadOlder: () => void;
   hasOlder: boolean;
   loading?: boolean;
+  onOpenDetail: (item: TimelineItem) => void;
 }
 
-export default function ChatTimeline({ items, onLoadOlder, hasOlder, loading = false }: ChatTimelineProps) {
+export default function ChatTimeline({ items, onLoadOlder, hasOlder, loading = false, onOpenDetail }: ChatTimelineProps) {
   return (
     <div className="chat-scroll">
       <div className="chat-column">
@@ -18,7 +19,7 @@ export default function ChatTimeline({ items, onLoadOlder, hasOlder, loading = f
           </button>
         )}
         {items.map((item) => (
-          <ChatItem key={item.id} item={item} />
+          <ChatItem key={item.id} item={item} onOpenDetail={onOpenDetail} />
         ))}
         {items.length === 0 && <div className="chat-empty">{loading ? 'Loading messages...' : 'No messages loaded.'}</div>}
       </div>

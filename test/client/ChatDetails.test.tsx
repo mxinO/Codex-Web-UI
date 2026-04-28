@@ -1,0 +1,229 @@
+// @vitest-environment jsdom
+
+import { act } from 'react';
+import { createRoot, type Root } from 'react-dom/client';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import ChatItem from '../../src/components/ChatItem';
+import DetailModal from '../../src/components/DetailModal';
+import type { TimelineItem } from '../../src/lib/timeline';
+
+(globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+
+let root: Root | null = null;
+let container: HTMLDivElement | null = null;
+
+function render(node: React.ReactNode) {
+  container = document.createElement('div');
+  document.body.append(container);
+  root = createRoot(container);
+
+  act(() => {
+    root?.render(node);
+  });
+}
+
+async function flushLazy() {
+  for (let index = 0; index < 5; index += 1) {
+    await act(async () => {
+      await new Promise((resolve) => {
+        window.setTimeout(resolve, 0);
+      });
+    });
+  }
+}
+
+afterEach(() => {
+  act(() => {
+    root?.unmount();
+  });
+  container?.remove();
+  root = null;
+  container = null;
+});
+
+describe('ChatItem details', () => {
+  it('renders assistant markdown', async () => {
+    const item: TimelineItem = { id: 'a1', kind: 'assistant', timestamp: 1, text: '**Ready**\n\n- item', phase: null };
+
+    render(<ChatItem item={item} onOpenDetail={vi.fn()} />);
+    expect(document.querySelector('.detail-loading')?.textContent).toBe('Loading markdown...');
+
+    await act(async () => {
+      await import('../../src/components/MarkdownView');
+    });
+    await flushLazy();
+
+    expect(document.querySelector('.markdown-body strong')?.textContent).toBe('Ready');
+    expect(document.querySelector('.markdown-body li')?.textContent).toBe('item');
+  });
+
+  it('opens command cards through the detail callback', () => {
+    const onOpenDetail = vi.fn();
+    const item: TimelineItem = {
+      id: 'c1',
+      kind: 'command',
+      timestamp: 1,
+      command: 'npm test',
+      cwd: '/repo',
+      output: 'ok',
+      status: 'completed',
+      exitCode: 0,
+    };
+
+    render(<ChatItem item={item} onOpenDetail={onOpenDetail} />);
+
+    act(() => {
+      document.querySelector<HTMLButtonElement>('.tool-card')?.click();
+    });
+
+    expect(onOpenDetail).toHaveBeenCalledWith(item);
+  });
+
+  it('opens file and tool cards through the detail callback', () => {
+    const onOpenDetail = vi.fn();
+    const fileItem: TimelineItem = {
+      id: 'f1',
+      kind: 'fileChange',
+      timestamp: 1,
+      item: { type: 'fileChange', id: 'raw-file', changes: [], status: 'ok' },
+    };
+    const toolItem: TimelineItem = {
+      id: 't1',
+      kind: 'tool',
+      timestamp: 1,
+      item: { type: 'mcpToolCall', id: 'raw-tool', server: 'srv', tool: 'lookup', status: 'ok', arguments: {}, result: {}, error: null },
+    };
+
+    render(
+      <>
+        <ChatItem item={fileItem} onOpenDetail={onOpenDetail} />
+        <ChatItem item={toolItem} onOpenDetail={onOpenDetail} />
+      </>,
+    );
+
+    const buttons = Array.from(document.querySelectorAll<HTMLButtonElement>('.tool-card'));
+    act(() => {
+      buttons[0]?.click();
+      buttons[1]?.click();
+    });
+
+    expect(onOpenDetail).toHaveBeenNthCalledWith(1, fileItem);
+    expect(onOpenDetail).toHaveBeenNthCalledWith(2, toolItem);
+  });
+});
+
+describe('DetailModal', () => {
+  it('renders file change metadata without fake diff output', () => {
+    const item: TimelineItem = {
+      id: 'f1',
+      kind: 'fileChange',
+      timestamp: 1,
+      item: { type: 'fileChange', id: 'raw-file', changes: [{ path: 'src/App.tsx' }], status: 'ok' },
+    };
+
+    render(<DetailModal item={item} onClose={vi.fn()} />);
+
+    const pre = document.querySelector('.detail-pre');
+    expect(pre?.textContent).toContain('"kind": "fileChange"');
+    expect(pre?.textContent).toContain('"path": "src/App.tsx"');
+    expect(document.querySelector('.detail-loading')?.textContent).not.toBe('Loading diff...');
+  });
+
+  it('caps large JSON details and renders dialog semantics', () => {
+    const onClose = vi.fn();
+    const item: TimelineItem = {
+      id: 't1',
+      kind: 'tool',
+      timestamp: 1,
+      item: { type: 'custom', id: 'raw-tool', payload: 'x'.repeat(210_000) },
+    };
+
+    render(<DetailModal item={item} onClose={onClose} />);
+
+    const dialog = document.querySelector('[role="dialog"]');
+    const pre = document.querySelector('.detail-pre');
+
+    expect(dialog?.getAttribute('aria-modal')).toBe('true');
+    expect(dialog?.getAttribute('aria-labelledby')).toBe('detail-modal-title');
+    expect(pre?.textContent?.length).toBeLessThan(202_000);
+    expect(pre?.textContent).toContain('Truncated after 200000 characters.');
+  });
+
+  it('handles circular detail data without losing sibling fields', () => {
+    const circular: Record<string, unknown> = { label: 'kept' };
+    circular.self = circular;
+    const item: TimelineItem = {
+      id: 't1',
+      kind: 'tool',
+      timestamp: 1,
+      item: { type: 'custom', id: 'raw-tool', payload: circular },
+    };
+
+    render(<DetailModal item={item} onClose={vi.fn()} />);
+
+    const text = document.querySelector('.detail-pre')?.textContent ?? '';
+    expect(text).toContain('"label": "kept"');
+    expect(text).toContain('[Circular]');
+  });
+
+  it('does not read object values beyond the key cap', () => {
+    let getterReads = 0;
+    const payload: Record<string, string> = {};
+    for (let index = 0; index < 150; index += 1) {
+      Object.defineProperty(payload, `key${String(index).padStart(3, '0')}`, {
+        enumerable: true,
+        get: () => {
+          getterReads += 1;
+          return `value-${index}`;
+        },
+      });
+    }
+    const item: TimelineItem = {
+      id: 't1',
+      kind: 'tool',
+      timestamp: 1,
+      item: { type: 'custom', id: 'raw-tool', payload },
+    };
+
+    render(<DetailModal item={item} onClose={vi.fn()} />);
+
+    expect(getterReads).toBe(100);
+    expect(document.querySelector('.detail-pre')?.textContent).toContain('"[More keys]": true');
+  });
+
+  it('closes on Escape, traps Tab focus, and restores previous focus on unmount', () => {
+    const onClose = vi.fn();
+    const opener = document.createElement('button');
+    opener.type = 'button';
+    document.body.append(opener);
+    opener.focus();
+    const item: TimelineItem = {
+      id: 't1',
+      kind: 'tool',
+      timestamp: 1,
+      item: { type: 'custom', id: 'raw-tool' },
+    };
+
+    render(<DetailModal item={item} onClose={onClose} />);
+
+    const close = document.querySelector<HTMLButtonElement>('[aria-label="Close detail"]');
+    expect(document.activeElement).toBe(close);
+
+    act(() => {
+      close?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Tab', bubbles: true }));
+    });
+    expect(document.activeElement).toBe(close);
+
+    act(() => {
+      close?.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    });
+    expect(onClose).toHaveBeenCalledTimes(1);
+
+    act(() => {
+      root?.render(<DetailModal item={null} onClose={onClose} />);
+    });
+    expect(document.activeElement).toBe(opener);
+
+    opener.remove();
+  });
+});

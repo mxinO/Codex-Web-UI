@@ -1,6 +1,9 @@
+import { lazy, Suspense } from 'react';
 import type { TimelineItem } from '../lib/timeline';
 
-export default function ChatItem({ item }: { item: TimelineItem }) {
+const MarkdownView = lazy(() => import('./MarkdownView'));
+
+export default function ChatItem({ item, onOpenDetail }: { item: TimelineItem; onOpenDetail: (item: TimelineItem) => void }) {
   if (item.kind === 'user') {
     return (
       <div className="chat-row chat-row--user">
@@ -12,7 +15,11 @@ export default function ChatItem({ item }: { item: TimelineItem }) {
   if (item.kind === 'assistant') {
     return (
       <div className="chat-row chat-row--assistant">
-        <div className="chat-bubble chat-bubble--assistant">{item.text}</div>
+        <div className="chat-bubble chat-bubble--assistant">
+          <Suspense fallback={<div className="detail-loading">Loading markdown...</div>}>
+            <MarkdownView content={item.text} />
+          </Suspense>
+        </div>
       </div>
     );
   }
@@ -20,7 +27,7 @@ export default function ChatItem({ item }: { item: TimelineItem }) {
   if (item.kind === 'command') {
     return (
       <div className="chat-row chat-row--assistant">
-        <button className="tool-card" type="button">
+        <button className="tool-card" type="button" onClick={() => onOpenDetail(item)}>
           $ {item.command}
         </button>
       </div>
@@ -35,9 +42,21 @@ export default function ChatItem({ item }: { item: TimelineItem }) {
     );
   }
 
+  if (item.kind === 'fileChange') {
+    return (
+      <div className="chat-row chat-row--system">
+        <button className="tool-card" type="button" onClick={() => onOpenDetail(item)}>
+          File change: {item.item.status}
+        </button>
+      </div>
+    );
+  }
+
   return (
     <div className="chat-row chat-row--system">
-      <div className="chat-notice">{item.kind}</div>
+      <button className="tool-card" type="button" onClick={() => onOpenDetail(item)}>
+        Tool: {item.item.type}
+      </button>
     </div>
   );
 }
