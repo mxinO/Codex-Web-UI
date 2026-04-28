@@ -1,12 +1,59 @@
+import { useState } from 'react';
 import AuthOverlay from './components/AuthOverlay';
+import CwdPicker from './components/CwdPicker';
 import Header from './components/Header';
+import SessionPicker from './components/SessionPicker';
 import { useCodexSocket } from './hooks/useCodexSocket';
 import { useTheme } from './hooks/useTheme';
+import type { CodexThread } from './types/codex';
 
 export default function App() {
   const socket = useCodexSocket();
   const { theme, setTheme } = useTheme();
   const state = socket.hello?.state;
+  const [threads, setThreads] = useState<CodexThread[]>([]);
+  const [sessionPickerOpen, setSessionPickerOpen] = useState(false);
+  const [cwdPickerOpen, setCwdPickerOpen] = useState(false);
+  const [sessionLoading, setSessionLoading] = useState(false);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+
+  const loadSessions = async () => {
+    setSessionLoading(true);
+    setSessionError(null);
+    try {
+      const result = await socket.rpc<{ data: CodexThread[] }>('webui/session/list');
+      setThreads(result.data);
+      setSessionPickerOpen(true);
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setSessionLoading(false);
+    }
+  };
+
+  const startSession = async (cwd: string) => {
+    setSessionLoading(true);
+    setSessionError(null);
+    try {
+      await socket.rpc('webui/session/start', { cwd });
+      window.location.reload();
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : String(error));
+      setSessionLoading(false);
+    }
+  };
+
+  const resumeSession = async (threadId: string) => {
+    setSessionLoading(true);
+    setSessionError(null);
+    try {
+      await socket.rpc('webui/session/resume', { threadId });
+      window.location.reload();
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : String(error));
+      setSessionLoading(false);
+    }
+  };
 
   return (
     <div className="app-shell">
@@ -20,8 +67,33 @@ export default function App() {
       />
       <main className="main-panel">
         {socket.connectionState === 'disconnected' && <div className="disconnect-banner">Connection lost - reconnecting...</div>}
+        <div className="session-actions">
+          <button className="text-button primary" type="button" onClick={loadSessions} disabled={socket.connectionState !== 'connected' || sessionLoading}>
+            {sessionLoading ? 'Loading...' : 'Sessions'}
+          </button>
+          {sessionError && <span className="action-error">{sessionError}</span>}
+          <SessionPicker
+            threads={threads}
+            visible={sessionPickerOpen}
+            busy={sessionLoading}
+            onClose={() => setSessionPickerOpen(false)}
+            onSelect={(threadId) => void resumeSession(threadId)}
+            onNew={() => {
+              setSessionPickerOpen(false);
+              setCwdPickerOpen(true);
+            }}
+          />
+        </div>
         <div className="empty-state">No active session loaded.</div>
       </main>
+      {cwdPickerOpen && (
+        <CwdPicker
+          initialCwd={state?.activeCwd ?? ''}
+          busy={sessionLoading}
+          onCancel={() => setCwdPickerOpen(false)}
+          onConfirm={(cwd) => void startSession(cwd)}
+        />
+      )}
       <AuthOverlay visible={socket.connectionState === 'auth-error'} />
     </div>
   );

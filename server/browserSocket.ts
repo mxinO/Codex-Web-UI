@@ -20,6 +20,14 @@ interface BrowserRequest {
   params?: unknown;
 }
 
+interface SessionStartParams {
+  cwd: string;
+}
+
+interface SessionResumeParams {
+  threadId: string;
+}
+
 export interface BrowserSocketCleanup {
   close(): void;
 }
@@ -50,6 +58,56 @@ function closeClient(ws: WebSocket): void {
   }
   ws.close(1001, 'server shutting down');
   ws.terminate();
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function getRequiredString(params: unknown, key: string): string | null {
+  if (!isRecord(params) || typeof params[key] !== 'string') return null;
+  const value = params[key].trim();
+  return value.length > 0 ? value : null;
+}
+
+function getStringPath(value: unknown, path: string[]): string | null {
+  let current = value;
+  for (const key of path) {
+    if (!isRecord(current)) return null;
+    current = current[key];
+  }
+  return typeof current === 'string' && current.trim() ? current.trim() : null;
+}
+
+function extractThreadId(result: unknown): string | null {
+  return (
+    getStringPath(result, ['thread', 'id']) ??
+    getStringPath(result, ['data', 'id']) ??
+    getStringPath(result, ['id']) ??
+    getStringPath(result, ['threadId'])
+  );
+}
+
+function extractThreadCwd(result: unknown): string | null {
+  return getStringPath(result, ['thread', 'cwd']) ?? getStringPath(result, ['data', 'cwd']) ?? getStringPath(result, ['cwd']);
+}
+
+function rememberCwd(cwds: string[], cwd: string): string[] {
+  return [cwd, ...cwds.filter((item) => item !== cwd)].slice(0, 20);
+}
+
+function sanitizeThreadHistory(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map((item) => sanitizeThreadHistory(item));
+  if (!isRecord(value)) return value;
+
+  const next: Record<string, unknown> = { ...value };
+  if (Array.isArray(next.turns)) next.turns = [];
+
+  for (const [key, child] of Object.entries(next)) {
+    if (key !== 'turns') next[key] = sanitizeThreadHistory(child);
+  }
+
+  return next;
 }
 
 export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps): BrowserSocketCleanup {
@@ -110,6 +168,64 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       }
 
       try {
+        if (request.method === 'webui/session/list') {
+          const result = await deps.codex.request('thread/list', {
+            limit: 50,
+            cursor: null,
+            sortDirection: 'desc',
+            sortKey: 'updated_at',
+          });
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/session/start') {
+          const cwd = getRequiredString(request.params, 'cwd');
+          if (!cwd) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'cwd is required' });
+            return;
+          }
+
+          const params: SessionStartParams & { experimentalRawEvents: boolean; persistExtendedHistory: boolean } = {
+            cwd,
+            experimentalRawEvents: false,
+            persistExtendedHistory: true,
+          };
+          const result = await deps.codex.request('thread/start', params);
+          const activeCwd = extractThreadCwd(result) ?? cwd;
+          deps.stateStore.update((state) => ({
+            ...state,
+            activeThreadId: extractThreadId(result),
+            activeCwd,
+            recentCwds: rememberCwd(state.recentCwds, activeCwd),
+          }));
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/session/resume') {
+          const threadId = getRequiredString(request.params, 'threadId');
+          if (!threadId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
+            return;
+          }
+
+          const params: SessionResumeParams & { persistExtendedHistory: boolean } = {
+            threadId,
+            persistExtendedHistory: true,
+          };
+          const result = await deps.codex.request('thread/resume', params);
+          const activeCwd = extractThreadCwd(result) ?? deps.stateStore.read().activeCwd;
+          deps.stateStore.update((state) => ({
+            ...state,
+            activeThreadId: threadId,
+            activeCwd,
+            recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
+          }));
+          send(ws, { type: 'rpc/result', id: request.id, result: sanitizeThreadHistory(result) });
+          return;
+        }
+
         const result = await deps.codex.request(request.method, request.params);
         send(ws, { type: 'rpc/result', id: request.id, result });
       } catch (err) {
