@@ -1,4 +1,4 @@
-import type { UIEvent } from 'react';
+import { useEffect, useLayoutEffect, useRef, type UIEvent } from 'react';
 import type { TimelineItem } from '../lib/timeline';
 import ChatItem from './ChatItem';
 
@@ -15,6 +15,12 @@ interface ChatTimelineProps {
   onQueuedRemove?: (id: string) => void;
 }
 
+const BOTTOM_STICKY_THRESHOLD_PX = 80;
+
+function scrollToBottom(scroller: HTMLDivElement) {
+  scroller.scrollTop = scroller.scrollHeight;
+}
+
 export default function ChatTimeline({
   items,
   onLoadOlder,
@@ -27,14 +33,46 @@ export default function ChatTimeline({
   onQueuedEdit,
   onQueuedRemove,
 }: ChatTimelineProps) {
+  const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const columnRef = useRef<HTMLDivElement | null>(null);
+  const stickToBottomRef = useRef(true);
+
+  useLayoutEffect(() => {
+    const scroller = scrollerRef.current;
+    if (!scroller || showJumpToLatest || !stickToBottomRef.current) return;
+    scrollToBottom(scroller);
+  }, [items, showJumpToLatest]);
+
+  useEffect(() => {
+    const scroller = scrollerRef.current;
+    const column = columnRef.current;
+    if (!scroller || !column || typeof ResizeObserver === 'undefined') return;
+
+    const observer = new ResizeObserver(() => {
+      if (showJumpToLatest || !stickToBottomRef.current) return;
+      scrollToBottom(scroller);
+    });
+    observer.observe(column);
+    return () => observer.disconnect();
+  }, [showJumpToLatest]);
+
   const handleScroll = (event: UIEvent<HTMLDivElement>) => {
+    const scroller = event.currentTarget;
+    const distanceFromBottom = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop;
+    stickToBottomRef.current = distanceFromBottom <= BOTTOM_STICKY_THRESHOLD_PX;
+
     if (!hasOlder || loading) return;
-    if (event.currentTarget.scrollTop <= 80) onLoadOlder();
+    if (scroller.scrollTop <= 80) onLoadOlder();
+  };
+
+  const handleJumpToLatest = () => {
+    stickToBottomRef.current = true;
+    onJumpToLatest();
   };
 
   return (
-    <div className="chat-scroll" onScroll={handleScroll}>
-      <div className="chat-column">
+    <div ref={scrollerRef} className="chat-scroll" onScroll={handleScroll}>
+      <div ref={columnRef} className="chat-column">
         {(hasOlder || showJumpToLatest) && (
           <div className="timeline-pager">
             {hasOlder && (
@@ -43,7 +81,7 @@ export default function ChatTimeline({
               </button>
             )}
             {showJumpToLatest && (
-              <button className="load-more" type="button" onClick={onJumpToLatest} disabled={loading}>
+              <button className="load-more" type="button" onClick={handleJumpToLatest} disabled={loading}>
                 Jump to latest
               </button>
             )}

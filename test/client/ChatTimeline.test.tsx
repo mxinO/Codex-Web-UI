@@ -10,6 +10,14 @@ import type { TimelineItem } from '../../src/lib/timeline';
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 const emptyItems: TimelineItem[] = [];
+const baseProps = {
+  onLoadOlder: vi.fn(),
+  hasOlder: false,
+  onOpenDetail: vi.fn(),
+  onApprovalDecision: vi.fn(),
+  showJumpToLatest: false,
+  onJumpToLatest: vi.fn(),
+};
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 
@@ -22,10 +30,30 @@ function render(node: React.ReactNode) {
   });
 }
 
+function rerender(node: React.ReactNode) {
+  act(() => {
+    root?.render(node);
+  });
+}
+
+function setScrollMetrics(scroller: HTMLDivElement, metrics: { scrollTop: number; scrollHeight: number; clientHeight: number }) {
+  let scrollTop = metrics.scrollTop;
+  Object.defineProperty(scroller, 'scrollTop', {
+    configurable: true,
+    get: () => scrollTop,
+    set: (value) => {
+      scrollTop = value;
+    },
+  });
+  Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: metrics.scrollHeight });
+  Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: metrics.clientHeight });
+}
+
 afterEach(() => {
   act(() => {
     root?.unmount();
   });
+  vi.unstubAllGlobals();
   container?.remove();
   root = null;
   container = null;
@@ -79,5 +107,72 @@ describe('ChatTimeline', () => {
     });
 
     expect(onLoadOlder).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the latest message visible when new chat items appear', () => {
+    const firstItem: TimelineItem = { id: 'a1', kind: 'assistant', timestamp: 1, text: 'hello', phase: null };
+    const secondItem: TimelineItem = { id: 'a2', kind: 'assistant', timestamp: 2, text: 'world', phase: null };
+
+    render(<ChatTimeline {...baseProps} items={[firstItem]} />);
+
+    const scroller = document.querySelector<HTMLDivElement>('.chat-scroll');
+    setScrollMetrics(scroller!, { scrollTop: 300, scrollHeight: 500, clientHeight: 200 });
+
+    rerender(<ChatTimeline {...baseProps} items={[firstItem, secondItem]} />);
+
+    expect(scroller?.scrollTop).toBe(500);
+  });
+
+  it('does not pull the viewport down when the user has scrolled away from latest', () => {
+    const firstItem: TimelineItem = { id: 'a1', kind: 'assistant', timestamp: 1, text: 'hello', phase: null };
+    const secondItem: TimelineItem = { id: 'a2', kind: 'assistant', timestamp: 2, text: 'world', phase: null };
+
+    render(<ChatTimeline {...baseProps} items={[firstItem]} />);
+
+    const scroller = document.querySelector<HTMLDivElement>('.chat-scroll');
+    setScrollMetrics(scroller!, { scrollTop: 100, scrollHeight: 500, clientHeight: 200 });
+    act(() => {
+      scroller?.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    rerender(<ChatTimeline {...baseProps} items={[firstItem, secondItem]} />);
+
+    expect(scroller?.scrollTop).toBe(100);
+  });
+
+  it('keeps the latest message visible when rendered content grows after paint', () => {
+    let notifyResize: ResizeObserverCallback | null = null;
+    const observe = vi.fn();
+    const disconnect = vi.fn();
+
+    class MockResizeObserver {
+      observe = observe;
+      disconnect = disconnect;
+
+      constructor(callback: ResizeObserverCallback) {
+        notifyResize = callback;
+      }
+    }
+
+    vi.stubGlobal('ResizeObserver', MockResizeObserver);
+
+    const item: TimelineItem = { id: 'a1', kind: 'assistant', timestamp: 1, text: '**hello**', phase: null };
+
+    render(<ChatTimeline {...baseProps} items={[item]} />);
+
+    const scroller = document.querySelector<HTMLDivElement>('.chat-scroll');
+    const column = document.querySelector<HTMLDivElement>('.chat-column');
+    setScrollMetrics(scroller!, { scrollTop: 300, scrollHeight: 500, clientHeight: 200 });
+    act(() => {
+      scroller?.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 800 });
+    act(() => {
+      notifyResize?.([] as ResizeObserverEntry[], {} as ResizeObserver);
+    });
+
+    expect(observe).toHaveBeenCalledWith(column);
+    expect(scroller?.scrollTop).toBe(800);
   });
 });
