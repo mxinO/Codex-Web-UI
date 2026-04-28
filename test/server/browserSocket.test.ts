@@ -628,29 +628,23 @@ describe('attachBrowserSocket bang command RPCs', () => {
     expect(response).toEqual({ type: 'rpc/error', id: 21, error: 'no active cwd' });
   });
 
-  it('executes valid bang commands through command exec with cwd and configured limits', async () => {
-    const result = { exitCode: 0, stdout: 'ok\n', stderr: '' };
-    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue(result);
+  it('executes valid bang commands locally in the active cwd without calling Codex', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
     const { ws, stateStore } = await makeHarness(request);
-    stateStore.write({ ...stateStore.read(), activeTurnId: null, activeCwd: '/work/project' });
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-bang-'));
+    writeFileSync(join(workspace, 'marker.txt'), 'ok');
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    stateStore.write({ ...stateStore.read(), activeTurnId: null, activeCwd: workspace });
 
-    ws.send(JSON.stringify({ type: 'rpc', id: 22, method: 'webui/bang/run', params: { command: 'echo ok' } }));
+    ws.send(JSON.stringify({ type: 'rpc', id: 22, method: 'webui/bang/run', params: { command: 'printf \"%s\" \"$PWD\" && printf \" \" && cat marker.txt' } }));
     const response = await nextMessage(ws);
 
-    expect(request).toHaveBeenCalledWith(
-      'command/exec',
-      {
-        command: ['bash', '-lc', 'echo ok'],
-        cwd: '/work/project',
-        timeoutMs: 30_000,
-        outputBytesCap: 256_000,
-        tty: false,
-        streamStdoutStderr: false,
-        streamStdin: false,
-      },
-      32_000,
-    );
-    expect(response).toEqual({ type: 'rpc/result', id: 22, result });
+    expect(request).not.toHaveBeenCalled();
+    expect(response).toMatchObject({
+      type: 'rpc/result',
+      id: 22,
+      result: { exitCode: 0, stdout: `${workspace} ok`, stderr: '', cwd: workspace, killed: false },
+    });
   });
 
   it('rejects interactive bang commands before calling codex', async () => {

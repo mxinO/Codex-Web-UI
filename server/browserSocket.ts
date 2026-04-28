@@ -4,7 +4,7 @@ import nodePath from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
 import { isTokenValid, parseTokenFromCookie } from './auth.js';
 import type { CodexAppServer } from './appServer.js';
-import { buildBangCommandParams, isInteractiveCommandBlocked } from './bangCommand.js';
+import { isInteractiveCommandBlocked, runBangCommand } from './bangCommand.js';
 import type { ServerConfig } from './config.js';
 import { resolveExistingPathInsideRoot, resolveWritablePathInsideRoot } from './fileTransfer.js';
 import type { HostStateStore } from './hostState.js';
@@ -361,6 +361,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const wss = new WebSocketServer({ server, path: '/ws' });
   let closed = false;
   let queuedStartInFlight: { threadId: string; queuedMessage: QueuedMessage } | null = null;
+  let bangCommandInFlight = false;
   const pendingServerRequests = new Map<string, JsonRpcServerRequest>();
   const resumedThreadIds = new Set<string>();
   const resumeThreadPromises = new Map<string, Promise<void>>();
@@ -672,13 +673,17 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           if (isInteractiveCommandBlocked(command)) {
             throw new Error('interactive commands are not supported');
           }
+          if (bangCommandInFlight) {
+            throw new Error('A command is already running');
+          }
 
-          const result = await requestCodex(
-            'command/exec',
-            buildBangCommandParams(command, state.activeCwd, deps.config.commandTimeoutMs, deps.config.commandOutputBytes),
-            deps.config.commandTimeoutMs + 2_000,
-          );
-          send(ws, { type: 'rpc/result', id: request.id, result });
+          bangCommandInFlight = true;
+          try {
+            const result = await runBangCommand(command, state.activeCwd, deps.config.commandTimeoutMs, deps.config.commandOutputBytes);
+            send(ws, { type: 'rpc/result', id: request.id, result });
+          } finally {
+            bangCommandInFlight = false;
+          }
           return;
         }
 

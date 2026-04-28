@@ -7,7 +7,6 @@ import FileEditorModal from './components/FileEditorModal';
 import FileExplorer from './components/FileExplorer';
 import Header from './components/Header';
 import InputBox from './components/InputBox';
-import QueueCard from './components/QueueCard';
 import SessionPicker from './components/SessionPicker';
 import { useCodexSocket } from './hooks/useCodexSocket';
 import { useQueue, type ClientQueuedMessage } from './hooks/useQueue';
@@ -142,10 +141,20 @@ export default function App() {
     [activeThreadId, socket.notifications, state?.activeTurnId],
   );
   const approvalItems = useMemo(() => approvalItemsFromRequests(socket.requests, answeredApprovals), [answeredApprovals, socket.requests]);
+  const queuedTimelineItems = useMemo<TimelineItem[]>(
+    () =>
+      queuedMessages.map((message) => ({
+        id: `queued:${message.id}`,
+        kind: 'queued',
+        timestamp: message.createdAt,
+        message,
+      })),
+    [queuedMessages],
+  );
   const chatItems = useMemo<TimelineItem[]>(() => {
     if (!timeline.isViewingLatest) return timeline.items;
-    return [...timeline.items, ...pendingUserItems, ...ephemeralItems, ...(liveStreamingItem ? [liveStreamingItem] : []), ...approvalItems];
-  }, [approvalItems, ephemeralItems, liveStreamingItem, pendingUserItems, timeline.isViewingLatest, timeline.items]);
+    return [...timeline.items, ...pendingUserItems, ...queuedTimelineItems, ...ephemeralItems, ...(liveStreamingItem ? [liveStreamingItem] : []), ...approvalItems];
+  }, [approvalItems, ephemeralItems, liveStreamingItem, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items]);
   const runOptions = useMemo<CodexRunOptions>(() => ({ model, mode: effectiveMode(mode, model), effort, sandbox }), [effort, mode, model, sandbox]);
 
   useEffect(() => {
@@ -249,20 +258,42 @@ export default function App() {
     return () => setPendingUserItems((items) => items.filter((item) => item.id !== id));
   }, []);
 
+  const startSession = useCallback(async (cwd: string) => {
+    setSessionLoading(true);
+    setSessionError(null);
+    try {
+      await socket.rpc('webui/session/start', { cwd, options: runOptions });
+      window.location.reload();
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : String(error));
+      setSessionLoading(false);
+    }
+  }, [runOptions, socket.rpc]);
+
+  const resumeSession = useCallback(async (threadId: string) => {
+    setSessionLoading(true);
+    setSessionError(null);
+    try {
+      await socket.rpc('webui/session/resume', { threadId, options: runOptions });
+      window.location.reload();
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : String(error));
+      setSessionLoading(false);
+    }
+  }, [runOptions, socket.rpc]);
+
   useEffect(() => {
     const handleSlashCommand = (event: Event) => {
       if (!(event instanceof CustomEvent) || typeof event.detail?.input !== 'string') return;
       const { command, value } = parseSlashCommand(event.detail.input);
 
       if (command === '/help') {
-        setSessionError('Commands: /new, /resume, /model <name>, /effort <level>, /mode <value>, /sandbox <value>, /status');
+        setSessionError('Commands: /new, /resume [id], /model <name>, /effort <level>, /mode <value>, /sandbox <value>, /compact, /diff, /status');
         return;
       }
       if (command === '/status') {
         setSessionError(
-          `Session ${activeThreadId ?? 'none'}; model ${model ?? 'default'}; effort ${effort ?? 'default'}; mode ${mode ?? 'default'}; sandbox ${
-            sandbox ?? 'default'
-          }`,
+          `Host ${socket.hello?.hostname ?? 'unknown'}; session ${activeThreadId ?? 'none'}; cwd ${state?.activeCwd ?? 'none'}; model ${model ?? 'default'}; effort ${effort ?? 'default'}; mode ${mode ?? 'default'}; sandbox ${sandbox ?? 'default'}; connection ${socket.connectionState}`,
         );
         return;
       }
@@ -272,7 +303,19 @@ export default function App() {
         return;
       }
       if (command === '/resume') {
+        if (value) {
+          void resumeSession(value);
+          return;
+        }
         void loadSessions();
+        return;
+      }
+      if (command === '/compact') {
+        setSessionError('/compact is not supported by this Codex app-server integration yet');
+        return;
+      }
+      if (command === '/diff') {
+        setSessionError('/diff is not supported by this Codex app-server integration yet');
         return;
       }
       if (command === '/model') {
@@ -330,31 +373,7 @@ export default function App() {
 
     window.addEventListener('webui-slash-command', handleSlashCommand);
     return () => window.removeEventListener('webui-slash-command', handleSlashCommand);
-  }, [activeThreadId, effort, loadSessions, mode, model, sandbox, setEffort, setMode, setModel, setSandbox]);
-
-  const startSession = async (cwd: string) => {
-    setSessionLoading(true);
-    setSessionError(null);
-    try {
-      await socket.rpc('webui/session/start', { cwd, options: runOptions });
-      window.location.reload();
-    } catch (error) {
-      setSessionError(error instanceof Error ? error.message : String(error));
-      setSessionLoading(false);
-    }
-  };
-
-  const resumeSession = async (threadId: string) => {
-    setSessionLoading(true);
-    setSessionError(null);
-    try {
-      await socket.rpc('webui/session/resume', { threadId, options: runOptions });
-      window.location.reload();
-    } catch (error) {
-      setSessionError(error instanceof Error ? error.message : String(error));
-      setSessionLoading(false);
-    }
-  };
+  }, [activeThreadId, effort, loadSessions, mode, model, resumeSession, sandbox, setEffort, setMode, setModel, setSandbox, socket.connectionState, socket.hello?.hostname, state?.activeCwd]);
 
   const editQueued = async (message: ClientQueuedMessage) => {
     setSessionError(null);
@@ -470,16 +489,11 @@ export default function App() {
                   loading={timeline.loading}
                   onOpenDetail={setDetailItem}
                   onApprovalDecision={respondToApproval}
+                  onQueuedEdit={(message) => void editQueued(message as ClientQueuedMessage)}
+                  onQueuedRemove={(id) => void removeQueued(id)}
                 />
               ) : (
                 <div className="empty-state">No active session loaded.</div>
-              )}
-              {queuedMessages.length > 0 && (
-                <div className="queue-list">
-                  {queuedMessages.map((message) => (
-                    <QueueCard key={message.id} message={message} onEdit={(item) => void editQueued(item)} onRemove={(id) => void removeQueued(id)} />
-                  ))}
-                </div>
               )}
             </div>
             <InputBox

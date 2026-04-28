@@ -23,17 +23,20 @@ function readableJson(value: unknown): string {
 }
 
 function decisionsFor(method: string, params: unknown): string[] {
+  if (isRecord(params) && Array.isArray(params.availableDecisions)) {
+    const decisions = params.availableDecisions.filter((item): item is string => typeof item === 'string');
+    if (decisions.length > 0) return decisions;
+  }
+
   if (method === 'item/commandExecution/requestApproval') {
-    if (isRecord(params) && Array.isArray(params.availableDecisions)) {
-      const decisions = params.availableDecisions.filter((item): item is string => typeof item === 'string');
-      if (decisions.length > 0) return decisions;
-    }
     return ['accept', 'decline'];
   }
 
   if (method === 'item/fileChange/requestApproval') return ['accept', 'decline'];
   if (method === 'mcpServer/elicitation/request') return ['decline', 'cancel'];
   if (method === 'item/permissions/requestApproval') return ['accept', 'decline'];
+  if (method === 'item/tool/requestUserInput') return ['submit', 'cancel'];
+  if (method === 'item/tool/call') return ['accept', 'decline'];
   return [];
 }
 

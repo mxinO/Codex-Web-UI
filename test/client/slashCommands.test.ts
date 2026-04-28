@@ -10,11 +10,20 @@ describe('slash commands', () => {
     expect(classifySlashCommand('/model gpt-5.4', true).allowed).toBe(false);
   });
 
-  it('rejects unsupported commands instead of dispatching placeholders', () => {
+  it('allows compact and diff as supported compatibility-gated commands', () => {
     expect(classifySlashCommand('/compact', false)).toEqual({
       command: '/compact',
+      allowed: true,
+      reason: null,
+    });
+    expect(classifySlashCommand('/diff', false)).toEqual({ command: '/diff', allowed: true, reason: null });
+  });
+
+  it('rejects unsupported commands instead of dispatching placeholders', () => {
+    expect(classifySlashCommand('/unknown', false)).toEqual({
+      command: '/unknown',
       allowed: false,
-      reason: '/compact is not supported in the web UI',
+      reason: '/unknown is not supported in the web UI',
     });
   });
 

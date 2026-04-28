@@ -1,12 +1,17 @@
 import type { CodexItem, CodexTurn } from '../types/codex';
+import type { CodexRunOptions } from '../types/ui';
 
 export type TimelineItem =
   | { id: string; kind: 'user'; timestamp: number; text: string }
   | { id: string; kind: 'assistant'; timestamp: number; text: string; phase: string | null }
   | { id: string; kind: 'command'; timestamp: number; command: string; cwd: string; output: string; status: string; exitCode: number | null }
-  | { id: string; kind: 'fileChange'; timestamp: number; item: CodexItem }
+  | { id: string; kind: 'bangCommand'; timestamp: number; command: string; cwd: string; output: string; status: string; exitCode: number | null }
+  | { id: string; kind: 'fileChange'; timestamp: number; item: CodexItem; filePath?: string | null; changeCount?: number }
   | { id: string; kind: 'tool'; timestamp: number; item: CodexItem }
   | { id: string; kind: 'notice'; timestamp: number; text: string }
+  | { id: string; kind: 'warning'; timestamp: number; text: string }
+  | { id: string; kind: 'error'; timestamp: number; text: string }
+  | { id: string; kind: 'queued'; timestamp: number; message: { id: string; text: string; createdAt: number; options?: Partial<CodexRunOptions> } }
   | { id: string; kind: 'streaming'; timestamp: number; text: string; active: boolean }
   | { id: string; kind: 'approval'; timestamp: number; requestId: number | string; method: string; params: unknown };
 
@@ -99,16 +104,106 @@ function safeItemId(turn: CodexTurn, item: CodexItem, index: number): string {
   return `${turn.id}:${item.id ?? index}`;
 }
 
+function itemChanges(item: CodexItem): unknown[] {
+  const changes = (item as Record<string, unknown>).changes;
+  if (Array.isArray(changes)) return changes.length > 0 ? changes : [item];
+  return [item];
+}
+
+function changePath(change: unknown): string | null {
+  return (
+    stringField(change, 'path') ||
+    stringField(change, 'file') ||
+    stringField(change, 'filePath') ||
+    stringField(change, 'file_path') ||
+    null
+  );
+}
+
+function safePathKey(path: string | null, fallback: string): string {
+  return path ?? `unknown:${fallback}`;
+}
+
+interface FileChangeGroup {
+  key: string;
+  firstIndex: number;
+  order: number;
+  filePath: string | null;
+  changes: unknown[];
+  itemIds: string[];
+  lastStatus: string;
+  firstItem: CodexItem;
+}
+
+function groupedFileChangeItems(turn: CodexTurn, timestamp: number): Map<number, TimelineItem[]> {
+  const groups = new Map<string, FileChangeGroup>();
+  let order = 0;
+
+  turn.items.forEach((item, index) => {
+    if (item.type !== 'fileChange') return;
+
+    for (const change of itemChanges(item)) {
+      const path = changePath(change);
+      const key = safePathKey(path, safeItemId(turn, item, index));
+      const existing = groups.get(key);
+      if (existing) {
+        existing.changes.push(change);
+        existing.itemIds.push(item.id ?? `${index}`);
+        existing.lastStatus = stringField(item, 'status', existing.lastStatus);
+        continue;
+      }
+
+      groups.set(key, {
+        key,
+        firstIndex: index,
+        order: order++,
+        filePath: path,
+        changes: [change],
+        itemIds: [item.id ?? `${index}`],
+        lastStatus: stringField(item, 'status', 'updated'),
+        firstItem: item,
+      });
+    }
+  });
+
+  const byFirstIndex = new Map<number, TimelineItem[]>();
+  for (const group of Array.from(groups.values()).sort((a, b) => a.firstIndex - b.firstIndex || a.order - b.order)) {
+    const item: CodexItem = {
+      ...group.firstItem,
+      id: group.itemIds.join('+'),
+      type: 'fileChange',
+      changes: group.changes,
+      status: group.lastStatus,
+      groupedItemIds: group.itemIds,
+    };
+    const timelineItem: TimelineItem = {
+      id: `${turn.id}:file:${group.key}`,
+      kind: 'fileChange',
+      timestamp,
+      item,
+      filePath: group.filePath,
+      changeCount: group.changes.length,
+    };
+    const entries = byFirstIndex.get(group.firstIndex) ?? [];
+    entries.push(timelineItem);
+    byFirstIndex.set(group.firstIndex, entries);
+  }
+
+  return byFirstIndex;
+}
+
 export function turnToTimelineItems(turn: CodexTurn): TimelineItem[] {
   const timestamp = (turn.startedAt ?? 0) * 1000;
   const items = Array.isArray(turn.items) ? turn.items : [];
+  const fileChangesByIndex = groupedFileChangeItems({ ...turn, items }, timestamp);
 
-  return items.map((item, index) => {
+  return items.flatMap((item, index): TimelineItem[] => {
     const id = safeItemId(turn, item, index);
-    if (item.type === 'userMessage') return { id, kind: 'user', timestamp, text: userText(item) };
-    if (item.type === 'agentMessage') return { id, kind: 'assistant', timestamp, text: stringField(item, 'text'), phase: nullableStringField(item, 'phase') };
+    if (item.type === 'fileChange') return fileChangesByIndex.get(index) ?? [];
+    if (item.type === 'userMessage') return [{ id, kind: 'user', timestamp, text: userText(item) }];
+    if (item.type === 'agentMessage') return [{ id, kind: 'assistant', timestamp, text: stringField(item, 'text'), phase: nullableStringField(item, 'phase') }];
     if (item.type === 'commandExecution') {
-      return {
+      return [{
         id,
         kind: 'command',
         timestamp,
@@ -117,16 +212,17 @@ export function turnToTimelineItems(turn: CodexTurn): TimelineItem[] {
         output: stringField(item, 'aggregatedOutput'),
         status: stringField(item, 'status', 'unknown'),
         exitCode: numberOrNullField(item, 'exitCode'),
-      };
+      }];
     }
-    if (item.type === 'fileChange') return { id, kind: 'fileChange', timestamp, item };
     if (item.type === 'reasoning') {
       const summary = Array.isArray(item.summary) ? item.summary.filter((entry): entry is string => typeof entry === 'string') : [];
       const content = Array.isArray(item.content) ? item.content.filter((entry): entry is string => typeof entry === 'string') : [];
-      return { id, kind: 'notice', timestamp, text: [...summary, ...content].join('\n') };
+      return [{ id, kind: 'notice', timestamp, text: [...summary, ...content].join('\n') }];
     }
-    if (item.type === 'plan') return { id, kind: 'notice', timestamp, text: stringField(item, 'text') };
-    return { id, kind: 'tool', timestamp, item };
+    if (item.type === 'plan') return [{ id, kind: 'notice', timestamp, text: stringField(item, 'text') }];
+    if (item.type === 'warning') return [{ id, kind: 'warning', timestamp, text: stringField(item, 'message') || stringField(item, 'text') || item.type }];
+    if (item.type === 'error') return [{ id, kind: 'error', timestamp, text: stringField(item, 'message') || stringField(item, 'text') || item.type }];
+    return [{ id, kind: 'tool', timestamp, item }];
   });
 }
 

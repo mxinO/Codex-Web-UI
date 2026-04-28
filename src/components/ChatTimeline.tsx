@@ -1,3 +1,4 @@
+import type { UIEvent } from 'react';
 import type { TimelineItem } from '../lib/timeline';
 import ChatItem from './ChatItem';
 
@@ -10,6 +11,8 @@ interface ChatTimelineProps {
   loading?: boolean;
   onOpenDetail: (item: TimelineItem) => void;
   onApprovalDecision: (item: Extract<TimelineItem, { kind: 'approval' }>, decision: unknown) => Promise<void>;
+  onQueuedEdit?: (message: Extract<TimelineItem, { kind: 'queued' }>['message']) => void;
+  onQueuedRemove?: (id: string) => void;
 }
 
 export default function ChatTimeline({
@@ -21,9 +24,16 @@ export default function ChatTimeline({
   loading = false,
   onOpenDetail,
   onApprovalDecision,
+  onQueuedEdit,
+  onQueuedRemove,
 }: ChatTimelineProps) {
+  const handleScroll = (event: UIEvent<HTMLDivElement>) => {
+    if (!hasOlder || loading) return;
+    if (event.currentTarget.scrollTop <= 80) onLoadOlder();
+  };
+
   return (
-    <div className="chat-scroll">
+    <div className="chat-scroll" onScroll={handleScroll}>
       <div className="chat-column">
         {(hasOlder || showJumpToLatest) && (
           <div className="timeline-pager">
@@ -40,7 +50,14 @@ export default function ChatTimeline({
           </div>
         )}
         {items.map((item) => (
-          <ChatItem key={item.id} item={item} onOpenDetail={onOpenDetail} onApprovalDecision={onApprovalDecision} />
+          <ChatItem
+            key={item.id}
+            item={item}
+            onOpenDetail={onOpenDetail}
+            onApprovalDecision={onApprovalDecision}
+            onQueuedEdit={onQueuedEdit}
+            onQueuedRemove={onQueuedRemove}
+          />
         ))}
         {items.length === 0 && <div className="chat-empty">{loading ? 'Loading messages...' : 'No messages loaded.'}</div>}
       </div>

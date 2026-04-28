@@ -14,7 +14,7 @@ describe('bang commands', () => {
     expect(parseBangCommand('!   ')).toBeNull();
   });
 
-  it('builds command timeline items with submit-time cwd', () => {
+  it('builds user-side bang timeline items with submit-time cwd', () => {
     const item = bangOutputEventToTimelineItem(
       { command: 'pwd', cwd: '/submitted/cwd', threadId: 'thread-1', result: { exitCode: 0, stdout: '/submitted/cwd\n', stderr: '' } },
       'thread-1',
@@ -24,7 +24,7 @@ describe('bang commands', () => {
 
     expect(item).toMatchObject({
       id: 'bang:10:1',
-      kind: 'command',
+      kind: 'bangCommand',
       timestamp: 10,
       command: 'pwd',
       cwd: '/submitted/cwd',

@@ -1,6 +1,7 @@
 import { lazy, Suspense } from 'react';
 import type { TimelineItem } from '../lib/timeline';
 import ApprovalCard from './ApprovalCard';
+import QueueCard from './QueueCard';
 import StreamingCard from './StreamingCard';
 
 const MarkdownView = lazy(() => import('./MarkdownView'));
@@ -9,6 +10,8 @@ interface ChatItemProps {
   item: TimelineItem;
   onOpenDetail: (item: TimelineItem) => void;
   onApprovalDecision: (item: Extract<TimelineItem, { kind: 'approval' }>, decision: unknown) => Promise<void>;
+  onQueuedEdit?: (message: Extract<TimelineItem, { kind: 'queued' }>['message']) => void;
+  onQueuedRemove?: (id: string) => void;
 }
 
 function itemString(value: unknown, key: string, fallback: string): string {
@@ -17,7 +20,28 @@ function itemString(value: unknown, key: string, fallback: string): string {
   return typeof candidate === 'string' && candidate.trim() ? candidate : fallback;
 }
 
-export default function ChatItem({ item, onOpenDetail, onApprovalDecision }: ChatItemProps) {
+function basename(path: string | null): string {
+  if (!path) return 'file';
+  return path.replace(/\/+$/, '').split('/').pop() || path;
+}
+
+function toolLabel(item: TimelineItem): string {
+  if (item.kind !== 'tool') return 'Tool';
+  const raw = item.item;
+  const type = itemString(raw, 'type', 'unknown');
+  if (type === 'mcpToolCall') {
+    const server = itemString(raw, 'server', '');
+    const tool = itemString(raw, 'tool', 'tool');
+    return `MCP: ${server ? `${server}.` : ''}${tool}`;
+  }
+  if (/web.*search|search/i.test(type)) {
+    const query = itemString(raw, 'query', itemString(raw, 'text', 'search'));
+    return `Web search: ${query}`;
+  }
+  return `Tool: ${type}`;
+}
+
+export default function ChatItem({ item, onOpenDetail, onApprovalDecision, onQueuedEdit, onQueuedRemove }: ChatItemProps) {
   if (item.kind === 'user') {
     return (
       <div className="chat-row chat-row--user">
@@ -64,6 +88,33 @@ export default function ChatItem({ item, onOpenDetail, onApprovalDecision }: Cha
     );
   }
 
+  if (item.kind === 'bangCommand') {
+    const failed = item.exitCode !== null && item.exitCode !== 0;
+    return (
+      <div className="chat-row chat-row--user">
+        <article className={`bang-card${failed ? ' bang-card--failed' : ''}`}>
+          <button className="bang-card__header" type="button" onClick={() => onOpenDetail(item)} title={item.cwd}>
+            <span>$ {item.command}</span>
+            <small>{item.exitCode === null ? item.status : item.exitCode === 0 ? 'ok' : `exit ${item.exitCode}`}</small>
+          </button>
+          {item.output && <pre className="bang-card__output">{item.output}</pre>}
+        </article>
+      </div>
+    );
+  }
+
+  if (item.kind === 'queued') {
+    return (
+      <div className="chat-row chat-row--user">
+        <QueueCard
+          message={item.message}
+          onEdit={(message) => onQueuedEdit?.(message)}
+          onRemove={(id) => onQueuedRemove?.(id)}
+        />
+      </div>
+    );
+  }
+
   if (item.kind === 'notice') {
     return (
       <div className="chat-row chat-row--system">
@@ -72,11 +123,21 @@ export default function ChatItem({ item, onOpenDetail, onApprovalDecision }: Cha
     );
   }
 
+  if (item.kind === 'warning' || item.kind === 'error') {
+    return (
+      <div className="chat-row chat-row--system">
+        <div className={`chat-notice chat-notice--${item.kind}`}>{item.text || item.kind}</div>
+      </div>
+    );
+  }
+
   if (item.kind === 'fileChange') {
+    const label = item.filePath ? basename(item.filePath) : itemString(item.item, 'status', 'updated');
+    const count = (item.changeCount ?? 1) > 1 ? ` (${item.changeCount} edits)` : '';
     return (
       <div className="chat-row chat-row--system">
         <button className="tool-card" type="button" onClick={() => onOpenDetail(item)}>
-          File change: {itemString(item.item, 'status', 'updated')}
+          File change: {label}{count}
         </button>
       </div>
     );
@@ -85,7 +146,7 @@ export default function ChatItem({ item, onOpenDetail, onApprovalDecision }: Cha
   return (
     <div className="chat-row chat-row--system">
       <button className="tool-card" type="button" onClick={() => onOpenDetail(item)}>
-        Tool: {itemString(item.item, 'type', 'unknown')}
+        {toolLabel(item)}
       </button>
     </div>
   );

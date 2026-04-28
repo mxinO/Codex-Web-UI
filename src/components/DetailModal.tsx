@@ -159,9 +159,29 @@ function languageFromPath(filePath: string | null): string {
   return 'plaintext';
 }
 
-function fileChangeDiff(value: unknown): { before: string; after: string; language: string } | null {
+type FileChangeDetail =
+  | { type: 'twoWay'; before: string; after: string; language: string }
+  | { type: 'patch'; patch: string; language: string };
+
+function allRecordChanges(value: unknown): unknown[] {
+  if (!isRecord(value)) return [];
+  if (Array.isArray(value.changes)) return value.changes.filter(isRecord);
+  if (Array.isArray(value.data)) return value.data.filter(isRecord);
+  return [value];
+}
+
+function fileChangeDiff(value: unknown): FileChangeDetail | null {
   const change = firstRecordChange(value);
   if (!change) return null;
+
+  const patch = allRecordChanges(value)
+    .map((entry) => firstStringAt(entry, [['diff'], ['patch'], ['unifiedDiff'], ['unified_diff']]))
+    .filter((entry): entry is string => entry !== null && entry.length > 0)
+    .join('\n\n');
+  if (patch) {
+    const filePath = firstStringAt(change, [['path'], ['file'], ['filePath'], ['file_path']]);
+    return { type: 'patch', patch, language: languageFromPath(filePath) };
+  }
 
   const before = firstStringAt(change, [
     ['before'],
@@ -187,7 +207,7 @@ function fileChangeDiff(value: unknown): { before: string; after: string; langua
   if (before === null || after === null) return null;
 
   const filePath = firstStringAt(change, [['path'], ['file'], ['filePath'], ['file_path']]);
-  return { before, after, language: languageFromPath(filePath) };
+  return { type: 'twoWay', before, after, language: languageFromPath(filePath) };
 }
 
 function getFocusableElements(element: HTMLElement): HTMLElement[] {
@@ -249,9 +269,11 @@ export default function DetailModal({ item, onClose }: { item: TimelineItem | nu
       <Suspense fallback={<div className="detail-loading">Loading markdown...</div>}>
         <MarkdownView content={item.text} />
       </Suspense>
+    ) : item.kind === 'bangCommand' ? (
+      <pre className="detail-pre">{`$ ${item.command}\n${item.output}`}</pre>
     ) : diff ? (
       <Suspense fallback={<div className="detail-loading">Loading diff...</div>}>
-        <DiffViewer before={diff.before} after={diff.after} language={diff.language} />
+        {diff.type === 'patch' ? <DiffViewer patch={diff.patch} language={diff.language} /> : <DiffViewer before={diff.before} after={diff.after} language={diff.language} />}
       </Suspense>
     ) : item.kind === 'fileChange' ? (
       <pre className="detail-pre">{stringifyDetail({ kind: item.kind, metadata: item.item })}</pre>

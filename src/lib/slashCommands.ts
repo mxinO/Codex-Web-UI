@@ -19,6 +19,8 @@ export const SLASH_COMMANDS: SlashCommandDefinition[] = [
   { command: '/effort', description: 'Set reasoning effort', valueHint: '<level>', stateChanging: true },
   { command: '/mode', description: 'Set collaboration mode', valueHint: '<default|plan>', stateChanging: true },
   { command: '/sandbox', description: 'Set sandbox mode', valueHint: '<mode>', stateChanging: true },
+  { command: '/compact', description: 'Compact conversation when supported by Codex app-server', stateChanging: true },
+  { command: '/diff', description: 'Show current worktree or thread diff when supported', stateChanging: false },
 ];
 
 export const SLASH_ARGUMENT_SUGGESTIONS: Record<string, SlashArgumentSuggestion[]> = {

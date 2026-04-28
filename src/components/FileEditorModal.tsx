@@ -1,4 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
+
+const MonacoEditor = lazy(() => import('@monaco-editor/react'));
 
 interface FileEditorModalProps {
   path: string;
@@ -92,15 +94,22 @@ export default function FileEditorModal({ path, initialContent, readOnly, onClos
         </div>
         {error && <div className="file-editor-error">{error}</div>}
         <div className="file-editor-body">
-          <textarea
-            className="file-editor-textarea"
-            aria-label={`${language} file contents`}
-            value={content}
-            onChange={(event) => setContent(event.target.value)}
-            readOnly={readOnly}
-            spellCheck={false}
-            data-theme={theme}
-          />
+          <Suspense fallback={<div className="detail-loading">Loading editor...</div>}>
+            <MonacoEditor
+              className="file-editor-monaco"
+              language={language}
+              theme={theme}
+              value={content}
+              onChange={(value) => setContent(value ?? '')}
+              options={{
+                readOnly,
+                minimap: { enabled: false },
+                automaticLayout: true,
+                scrollBeyondLastLine: false,
+                wordWrap: 'on',
+              }}
+            />
+          </Suspense>
         </div>
       </div>
     </div>

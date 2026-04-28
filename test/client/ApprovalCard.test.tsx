@@ -39,4 +39,8 @@ describe('ApprovalCard', () => {
   it('offers both accept and decline for permission requests', async () => {
     expect(await renderCard('item/permissions/requestApproval', { permissions: ['network'] })).toEqual(['accept', 'decline']);
   });
+
+  it('uses protocol-provided decisions for file change approvals', async () => {
+    expect(await renderCard('item/fileChange/requestApproval', { availableDecisions: ['approve_once', 'deny'] })).toEqual(['approve_once', 'deny']);
+  });
 });

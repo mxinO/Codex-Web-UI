@@ -108,7 +108,30 @@ describe('useThreadTimeline', () => {
     expect((currentTimeline as HookResult & { isViewingLatest?: boolean })?.isViewingLatest).toBe(true);
   });
 
-  it('loadOlder keeps a bounded older page window', async () => {
+  it('loadOlder prepends older messages while preserving the latest page when under the window limit', async () => {
+    const latest = deferred<RpcResult>();
+    const older = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(latest.promise).mockReturnValueOnce(older.promise);
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      latest.resolve({ data: [makeTurn('latest-new'), makeTurn('latest-old')], nextCursor: 'cursor-1' });
+      await latest.promise;
+    });
+    await act(async () => {
+      currentTimeline?.loadOlder();
+    });
+    await act(async () => {
+      older.resolve({ data: [makeTurn('older-new'), makeTurn('older-old')], nextCursor: null });
+      await older.promise;
+    });
+
+    expect(currentTimeline?.items.map(itemText)).toEqual(['older-old', 'older-new', 'latest-old', 'latest-new']);
+    expect(currentTimeline?.hasOlder).toBe(false);
+    expect((currentTimeline as HookResult & { isViewingLatest?: boolean })?.isViewingLatest).toBe(false);
+  });
+
+  it('loadOlder keeps a bounded older-side window when the timeline is long', async () => {
     const latest = deferred<RpcResult>();
     const older = deferred<RpcResult>();
     const rpc = vi.fn().mockReturnValueOnce(latest.promise).mockReturnValueOnce(older.promise);
@@ -128,9 +151,9 @@ describe('useThreadTimeline', () => {
 
     const texts = currentTimeline?.items.map((item) => item.kind === 'assistant' ? item.text : '') ?? [];
     expect(currentTimeline?.items).toHaveLength(200);
-    expect(texts[0]).toBe('older-199');
-    expect(texts.at(-1)).toBe('older-0');
-    expect(texts).not.toContain('older-200');
+    expect(texts[0]).toBe('older-204');
+    expect(texts.at(-1)).toBe('older-5');
+    expect(texts).not.toContain('older-4');
     expect(texts).not.toContain('latest-0');
     expect(currentTimeline?.hasOlder).toBe(true);
     expect((currentTimeline as HookResult & { isViewingLatest?: boolean })?.isViewingLatest).toBe(false);
@@ -155,7 +178,7 @@ describe('useThreadTimeline', () => {
       await older.promise;
     });
 
-    expect(currentTimeline?.items.map((item) => item.kind === 'assistant' ? item.text : '')).toEqual(['older-page']);
+    expect(currentTimeline?.items.map((item) => item.kind === 'assistant' ? item.text : '')).toEqual(['older-page', 'latest-initial']);
 
     await act(async () => {
       currentTimeline?.jumpToLatest();

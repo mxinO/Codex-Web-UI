@@ -20,6 +20,52 @@ describe('timeline', () => {
     expect(turnToTimelineItems(turn).map((item) => item.kind)).toEqual(['user', 'assistant', 'command']);
   });
 
+  it('groups file changes by file within a turn', () => {
+    const turn: CodexTurn = {
+      id: 'turn-file',
+      status: 'completed',
+      startedAt: 10,
+      completedAt: 11,
+      items: [
+        { type: 'agentMessage', id: 'a1', text: 'editing', phase: 'commentary' },
+        { type: 'fileChange', id: 'f1', status: 'completed', changes: [{ path: '/repo/a.txt', diff: '@@ -1 +1 @@\n-old\n+new\n' }] },
+        { type: 'commandExecution', id: 'c1', command: 'sed -n 1p a.txt', cwd: '/repo', status: 'completed', aggregatedOutput: 'new\n', exitCode: 0, durationMs: 1 },
+        { type: 'fileChange', id: 'f2', status: 'completed', changes: [{ path: '/repo/a.txt', diff: '@@ -2 +2 @@\n-two\n+three\n' }] },
+        { type: 'fileChange', id: 'f3', status: 'completed', changes: [{ path: '/repo/b.txt', diff: 'created\n' }] },
+      ],
+    };
+
+    const items = turnToTimelineItems(turn);
+    const fileChanges = items.filter((item): item is Extract<TimelineItem, { kind: 'fileChange' }> => item.kind === 'fileChange');
+
+    expect(items.map((item) => item.kind)).toEqual(['assistant', 'fileChange', 'command', 'fileChange']);
+    expect(fileChanges).toHaveLength(2);
+    expect(fileChanges[0]).toMatchObject({ id: 'turn-file:file:/repo/a.txt', filePath: '/repo/a.txt', changeCount: 2 });
+    expect((fileChanges[0].item as { changes: unknown[] }).changes).toEqual([
+      { path: '/repo/a.txt', diff: '@@ -1 +1 @@\n-old\n+new\n' },
+      { path: '/repo/a.txt', diff: '@@ -2 +2 @@\n-two\n+three\n' },
+    ]);
+    expect(fileChanges[1]).toMatchObject({ id: 'turn-file:file:/repo/b.txt', filePath: '/repo/b.txt', changeCount: 1 });
+  });
+
+  it('renders warning and error items as severity-specific timeline cards', () => {
+    const turn: CodexTurn = {
+      id: 'turn-warning',
+      status: 'completed',
+      startedAt: 1,
+      completedAt: 2,
+      items: [
+        { type: 'warning', id: 'w1', message: 'low disk' },
+        { type: 'error', id: 'e1', message: 'failed turn' },
+      ],
+    };
+
+    expect(turnToTimelineItems(turn)).toEqual([
+      { id: 'turn-warning:w1', kind: 'warning', timestamp: 1000, text: 'low disk' },
+      { id: 'turn-warning:e1', kind: 'error', timestamp: 1000, text: 'failed turn' },
+    ]);
+  });
+
   it('trims old items while preserving newest window', () => {
     const items = Array.from({ length: 205 }, (_, i) => ({ id: String(i), kind: 'notice' as const, timestamp: i, text: String(i) }));
     const trimmed = trimTimelineWindow(items, 200);

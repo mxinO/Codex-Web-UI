@@ -155,7 +155,8 @@ describe('InputBox', () => {
     expect(textarea?.value).toBe('');
   });
 
-  it('rejects unsupported slash commands and preserves the draft', async () => {
+  it('dispatches compatibility-gated slash commands and clears the draft', async () => {
+    const dispatch = vi.spyOn(window, 'dispatchEvent');
     renderInputBox({ draftOverride: '/compact' });
     const textarea = document.querySelector<HTMLTextAreaElement>('textarea');
     const submit = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Send');
@@ -168,8 +169,9 @@ describe('InputBox', () => {
       await Promise.resolve();
     });
 
-    expect(textarea?.value).toBe('/compact');
-    expect(document.querySelector('.input-error')?.textContent).toBe('/compact is not supported in the web UI');
+    const slashEvent = dispatch.mock.calls.map(([event]) => event).find((event) => event.type === 'webui-slash-command') as CustomEvent | undefined;
+    expect(slashEvent?.detail).toMatchObject({ input: '/compact', command: '/compact' });
+    expect(textarea?.value).toBe('');
   });
 
   it('passes run options when starting a turn', async () => {

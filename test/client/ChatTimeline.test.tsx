@@ -55,4 +55,29 @@ describe('ChatTimeline', () => {
 
     expect(onJumpToLatest).toHaveBeenCalledTimes(1);
   });
+
+  it('loads older messages when scrolling near the top', () => {
+    const onLoadOlder = vi.fn();
+
+    render(
+      <ChatTimeline
+        items={[{ id: 'a1', kind: 'assistant', timestamp: 1, text: 'hello', phase: null }]}
+        onLoadOlder={onLoadOlder}
+        hasOlder
+        onOpenDetail={vi.fn()}
+        onApprovalDecision={vi.fn()}
+        showJumpToLatest={false}
+        onJumpToLatest={vi.fn()}
+      />,
+    );
+
+    const scroller = document.querySelector<HTMLDivElement>('.chat-scroll');
+    Object.defineProperty(scroller, 'scrollTop', { configurable: true, value: 24 });
+
+    act(() => {
+      scroller?.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+  });
 });

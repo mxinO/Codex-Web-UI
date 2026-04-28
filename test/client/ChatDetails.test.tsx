@@ -80,6 +80,55 @@ describe('ChatItem details', () => {
     expect(onOpenDetail).toHaveBeenCalledWith(item);
   });
 
+  it('renders bang command cards on the user side with inline output', () => {
+    const item: TimelineItem = {
+      id: 'bang-1',
+      kind: 'bangCommand',
+      timestamp: 1,
+      command: 'pwd',
+      cwd: '/repo',
+      output: '/repo\n',
+      status: 'completed',
+      exitCode: 0,
+    };
+
+    render(<ChatItem item={item} onOpenDetail={vi.fn()} onApprovalDecision={onApprovalDecision} />);
+
+    expect(document.querySelector('.chat-row--user .bang-card')?.textContent).toContain('$ pwd');
+    expect(document.querySelector('.chat-row--user .bang-card')?.textContent).toContain('/repo');
+    expect(document.querySelector('.chat-row--assistant .bang-card')).toBeNull();
+  });
+
+  it('renders queued messages as user-side chat items with edit and cancel controls', () => {
+    const onQueuedEdit = vi.fn();
+    const onQueuedRemove = vi.fn();
+    const item: TimelineItem = {
+      id: 'queued:q1',
+      kind: 'queued',
+      timestamp: 1,
+      message: { id: 'q1', text: 'next task', createdAt: 1 },
+    };
+
+    render(
+      <ChatItem
+        item={item}
+        onOpenDetail={vi.fn()}
+        onApprovalDecision={onApprovalDecision}
+        onQueuedEdit={onQueuedEdit}
+        onQueuedRemove={onQueuedRemove}
+      />,
+    );
+
+    expect(document.querySelector('.chat-row--user .queued-message')?.textContent).toContain('next task');
+    act(() => {
+      Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Edit')?.click();
+      Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Cancel')?.click();
+    });
+
+    expect(onQueuedEdit).toHaveBeenCalledWith(item.message);
+    expect(onQueuedRemove).toHaveBeenCalledWith('q1');
+  });
+
   it('opens file and tool cards through the detail callback', () => {
     const onOpenDetail = vi.fn();
     const fileItem: TimelineItem = {
@@ -110,6 +159,49 @@ describe('ChatItem details', () => {
 
     expect(onOpenDetail).toHaveBeenNthCalledWith(1, fileItem);
     expect(onOpenDetail).toHaveBeenNthCalledWith(2, toolItem);
+  });
+
+  it('renders MCP and web-search tool cards with specific labels', () => {
+    render(
+      <>
+        <ChatItem
+          item={{
+            id: 'mcp1',
+            kind: 'tool',
+            timestamp: 1,
+            item: { type: 'mcpToolCall', id: 'raw-tool', server: 'srv', tool: 'lookup', status: 'completed', arguments: {}, result: {}, error: null },
+          }}
+          onOpenDetail={vi.fn()}
+          onApprovalDecision={onApprovalDecision}
+        />
+        <ChatItem
+          item={{
+            id: 'web1',
+            kind: 'tool',
+            timestamp: 1,
+            item: { type: 'webSearch', id: 'raw-web', query: 'codex web ui', status: 'completed' },
+          }}
+          onOpenDetail={vi.fn()}
+          onApprovalDecision={onApprovalDecision}
+        />
+      </>,
+    );
+
+    const labels = Array.from(document.querySelectorAll('.tool-card')).map((item) => item.textContent);
+    expect(labels).toContain('MCP: srv.lookup');
+    expect(labels).toContain('Web search: codex web ui');
+  });
+
+  it('renders warning and error notices with severity classes', () => {
+    render(
+      <>
+        <ChatItem item={{ id: 'w1', kind: 'warning', timestamp: 1, text: 'low disk' }} onOpenDetail={vi.fn()} onApprovalDecision={onApprovalDecision} />
+        <ChatItem item={{ id: 'e1', kind: 'error', timestamp: 1, text: 'failed turn' }} onOpenDetail={vi.fn()} onApprovalDecision={onApprovalDecision} />
+      </>,
+    );
+
+    expect(document.querySelector('.chat-notice--warning')?.textContent).toContain('low disk');
+    expect(document.querySelector('.chat-notice--error')?.textContent).toContain('failed turn');
   });
 });
 
@@ -145,7 +237,6 @@ describe('DetailModal', () => {
 
     render(<DetailModal item={item} onClose={vi.fn()} />);
 
-    expect(document.querySelector('.detail-loading')?.textContent).toBe('Loading diff...');
     expect(document.querySelector('.detail-pre')).toBeNull();
 
     await act(async () => {
@@ -155,6 +246,38 @@ describe('DetailModal', () => {
 
     expect(document.querySelector('[aria-label="Before"]')?.textContent).toContain('old text');
     expect(document.querySelector('[aria-label="After"]')?.textContent).toContain('new text');
+  });
+
+  it('renders Codex patch diffs from grouped file changes', async () => {
+    const item: TimelineItem = {
+      id: 'f1',
+      kind: 'fileChange',
+      timestamp: 1,
+      filePath: '/repo/a.txt',
+      changeCount: 2,
+      item: {
+        type: 'fileChange',
+        id: 'raw-file',
+        status: 'completed',
+        changes: [
+          { path: '/repo/a.txt', diff: '@@ -1 +1 @@\n-old\n+new\n' },
+          { path: '/repo/a.txt', diff: '@@ -2 +2 @@\n-two\n+three\n' },
+        ],
+      },
+    };
+
+    render(<DetailModal item={item} onClose={vi.fn()} />);
+
+    expect(document.querySelector('.detail-pre')).toBeNull();
+
+    await act(async () => {
+      await import('../../src/components/DiffViewer');
+    });
+    await flushLazy();
+
+    const patch = document.querySelector('[aria-label="Patch"]');
+    expect(patch?.textContent).toContain('-old');
+    expect(patch?.textContent).toContain('+three');
   });
 
   it('caps large JSON details and renders dialog semantics', () => {

@@ -119,7 +119,7 @@ export function bangOutputEventToTimelineItem(
   const exitCode = bangExitCodeFromResult(detail.result);
   return {
     id: `bang:${timestamp}:${counter}`,
-    kind: 'command',
+    kind: 'bangCommand',
     timestamp,
     command: detail.command,
     cwd: detail.cwd,

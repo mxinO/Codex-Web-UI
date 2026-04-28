@@ -19,6 +19,10 @@ function normalizeTurns(turns: CodexTurn[]): TimelineItem[] {
   return turns.flatMap(turnToTimelineItems);
 }
 
+function trimOlderWindow<T>(items: T[], limit: number): T[] {
+  return items.length <= limit ? items : items.slice(0, limit);
+}
+
 function resultTurns(result: TurnListResult): CodexTurn[] {
   return Array.isArray(result.data) ? result.data : [];
 }
@@ -80,7 +84,8 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
       });
       if (!isCurrentRequest(threadId, generation)) return;
       const older = [...resultTurns(result)].reverse();
-      setItems(trimTimelineWindow(normalizeTurns(older), WINDOW_SIZE));
+      const olderItems = normalizeTurns(older);
+      setItems((current) => trimOlderWindow([...olderItems, ...current], WINDOW_SIZE));
       setCursor(getNextCursor(result));
       setIsViewingLatest(false);
     } catch {
