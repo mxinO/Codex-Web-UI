@@ -132,8 +132,10 @@ body {
   height: calc(100vh - 40px);
   min-height: 0;
   background: var(--bg-primary);
-  overflow: auto;
+  overflow: hidden;
   position: relative;
+  display: flex;
+  flex-direction: column;
 }
 
 .disconnect-banner {
@@ -247,8 +249,17 @@ body {
   color: var(--text-accent);
 }
 
+.main-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding-bottom: 0;
+}
+
 .chat-scroll {
-  height: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
 }
 
@@ -257,6 +268,104 @@ body {
   min-height: 100%;
   margin: 0 auto;
   padding: 64px 16px 16px;
+}
+
+.queue-list {
+  flex: 0 0 auto;
+  width: min(920px, 100%);
+  max-height: min(34vh, 260px);
+  margin: 0 auto;
+  padding: 8px 16px;
+  overflow-y: auto;
+}
+
+.queued-message {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 10px;
+  margin: 8px 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+}
+
+.queued-badge {
+  min-height: 24px;
+  padding: 4px 7px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--yellow);
+  font-size: 12px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.queued-text {
+  min-width: 0;
+  padding-top: 2px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.4;
+}
+
+.queued-actions {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+
+.input-panel {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 10px;
+  width: min(920px, 100%);
+  margin: 0 auto;
+  padding: 10px 16px 14px;
+  border-top: 1px solid var(--border);
+  background: var(--bg-primary);
+}
+
+.input-panel textarea {
+  grid-column: 1 / 2;
+  width: 100%;
+  min-height: 72px;
+  max-height: 180px;
+  resize: vertical;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font: inherit;
+  line-height: 1.4;
+}
+
+.input-panel textarea:focus {
+  border-color: var(--text-accent);
+  outline: none;
+}
+
+.input-panel textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+
+.input-actions {
+  grid-column: 2 / 3;
+  display: flex;
+  align-items: end;
+  gap: 8px;
+}
+
+.input-error {
+  grid-column: 1 / -1;
+  min-width: 0;
+  color: var(--red);
+  font-size: 13px;
+  overflow-wrap: anywhere;
 }
 
 .chat-row {
@@ -594,6 +703,23 @@ body {
     top: 12px;
     left: 12px;
     right: 12px;
+  }
+
+  .queued-message {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .queued-actions {
+    justify-content: flex-end;
+  }
+
+  .input-panel {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .input-actions {
+    grid-column: 1 / -1;
+    justify-content: flex-end;
   }
 }
 

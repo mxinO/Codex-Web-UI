@@ -1,11 +1,14 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import AuthOverlay from './components/AuthOverlay';
 import ChatTimeline from './components/ChatTimeline';
 import CwdPicker from './components/CwdPicker';
 import DetailModal from './components/DetailModal';
 import Header from './components/Header';
+import InputBox from './components/InputBox';
+import QueueCard from './components/QueueCard';
 import SessionPicker from './components/SessionPicker';
 import { useCodexSocket } from './hooks/useCodexSocket';
+import { useQueue, type ClientQueuedMessage } from './hooks/useQueue';
 import { useThreadTimeline } from './hooks/useThreadTimeline';
 import { useTheme } from './hooks/useTheme';
 import type { TimelineItem } from './lib/timeline';
@@ -17,12 +20,18 @@ export default function App() {
   const state = socket.hello?.state;
   const activeThreadId = state?.activeThreadId ?? null;
   const timeline = useThreadTimeline(activeThreadId, socket.rpc);
+  const { queue: queuedMessages, enqueue, remove: removeFromQueue, replace: replaceQueue } = useQueue(socket.rpc, state?.queue ?? []);
   const [threads, setThreads] = useState<CodexThread[]>([]);
   const [sessionPickerOpen, setSessionPickerOpen] = useState(false);
   const [cwdPickerOpen, setCwdPickerOpen] = useState(false);
   const [sessionLoading, setSessionLoading] = useState(false);
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [detailItem, setDetailItem] = useState<TimelineItem | null>(null);
+  const [composerDraft, setComposerDraft] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (state?.queue) replaceQueue(state.queue);
+  }, [replaceQueue, state?.queue]);
 
   const loadSessions = async () => {
     setSessionLoading(true);
@@ -62,6 +71,25 @@ export default function App() {
     }
   };
 
+  const editQueued = async (message: ClientQueuedMessage) => {
+    setSessionError(null);
+    try {
+      await removeFromQueue(message.id);
+      setComposerDraft(message.text);
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
+  const removeQueued = async (id: string) => {
+    setSessionError(null);
+    try {
+      await removeFromQueue(id);
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : String(error));
+    }
+  };
+
   return (
     <div className="app-shell">
       <Header
@@ -91,17 +119,36 @@ export default function App() {
             }}
           />
         </div>
-        {activeThreadId ? (
-          <ChatTimeline
-            items={timeline.items}
-            onLoadOlder={timeline.loadOlder}
-            hasOlder={timeline.hasOlder}
-            loading={timeline.loading}
-            onOpenDetail={setDetailItem}
-          />
-        ) : (
-          <div className="empty-state">No active session loaded.</div>
-        )}
+        <div className="main-content">
+          {activeThreadId ? (
+            <ChatTimeline
+              items={timeline.items}
+              onLoadOlder={timeline.loadOlder}
+              hasOlder={timeline.hasOlder}
+              loading={timeline.loading}
+              onOpenDetail={setDetailItem}
+            />
+          ) : (
+            <div className="empty-state">No active session loaded.</div>
+          )}
+          {queuedMessages.length > 0 && (
+            <div className="queue-list">
+              {queuedMessages.map((message) => (
+                <QueueCard key={message.id} message={message} onEdit={(item) => void editQueued(item)} onRemove={(id) => void removeQueued(id)} />
+              ))}
+            </div>
+          )}
+        </div>
+        <InputBox
+          rpc={socket.rpc}
+          threadId={activeThreadId}
+          isRunning={Boolean(state?.activeTurnId)}
+          activeCwd={state?.activeCwd ?? null}
+          draftOverride={composerDraft}
+          disabled={socket.connectionState !== 'connected'}
+          onDraftConsumed={() => setComposerDraft(null)}
+          onEnqueue={enqueue}
+        />
       </main>
       {cwdPickerOpen && (
         <CwdPicker

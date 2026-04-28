@@ -5,6 +5,8 @@ import type { CodexAppServer } from './appServer.js';
 import type { ServerConfig } from './config.js';
 import type { HostStateStore } from './hostState.js';
 import { logWarn } from './logger.js';
+import { enqueueMessage, removeQueuedMessage, shiftQueuedMessage, updateQueuedMessage } from './queue.js';
+import type { HostRuntimeState, QueuedMessage } from './types.js';
 
 interface BrowserSocketDeps {
   config: ServerConfig;
@@ -26,6 +28,11 @@ interface SessionStartParams {
 
 interface SessionResumeParams {
   threadId: string;
+}
+
+interface TurnStartParams {
+  threadId: string;
+  text: string;
 }
 
 export interface BrowserSocketCleanup {
@@ -92,6 +99,10 @@ function extractThreadCwd(result: unknown): string | null {
   return getStringPath(result, ['thread', 'cwd']) ?? getStringPath(result, ['data', 'cwd']) ?? getStringPath(result, ['cwd']);
 }
 
+function extractTurnId(result: unknown): string | null {
+  return getStringPath(result, ['turn', 'id']) ?? getStringPath(result, ['data', 'id']) ?? getStringPath(result, ['id']) ?? getStringPath(result, ['turnId']);
+}
+
 function rememberCwd(cwds: string[], cwd: string): string[] {
   return [cwd, ...cwds.filter((item) => item !== cwd)].slice(0, 20);
 }
@@ -113,9 +124,74 @@ function sanitizeThreadHistory(value: unknown): unknown {
 export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps): BrowserSocketCleanup {
   const wss = new WebSocketServer({ server, path: '/ws' });
   let closed = false;
+  let queuedStartInFlight: { threadId: string; queuedMessage: QueuedMessage } | null = null;
+
+  const broadcastHello = (state: HostRuntimeState = deps.stateStore.read()) => {
+    for (const client of wss.clients) {
+      send(client, { type: 'server/hello', hostname: deps.config.hostname, state });
+    }
+  };
+
+  const startTurn = async ({ threadId, text }: TurnStartParams) => {
+    return deps.codex.request<{ turn: { id: string } }>('turn/start', {
+      threadId,
+      input: [{ type: 'text', text, text_elements: [] }],
+    });
+  };
+
+  const handleTurnCompleted = async () => {
+    if (queuedStartInFlight) return;
+
+    const claim: { threadId?: string; queuedMessage?: QueuedMessage } = {};
+
+    const claimed = deps.stateStore.update((current) => {
+      if (!current.activeThreadId) {
+        return { ...current, activeTurnId: null };
+      }
+
+      const shifted = shiftQueuedMessage(current.queue);
+      if (!shifted.next) {
+        return { ...current, activeTurnId: null };
+      }
+
+      claim.threadId = current.activeThreadId;
+      claim.queuedMessage = shifted.next;
+      return { ...current, activeTurnId: null, queue: shifted.queue };
+    });
+    broadcastHello(claimed);
+
+    const { threadId, queuedMessage } = claim;
+    if (!threadId || !queuedMessage) {
+      return;
+    }
+
+    queuedStartInFlight = { threadId, queuedMessage };
+
+    try {
+      const result = await startTurn({ threadId, text: queuedMessage.text });
+      const next = deps.stateStore.update((current) => ({
+        ...current,
+        activeTurnId: current.activeThreadId === threadId ? extractTurnId(result) : current.activeTurnId,
+      }));
+      broadcastHello(next);
+    } catch (error) {
+      logWarn('Failed to start queued turn', error);
+      const next = deps.stateStore.update((current) => ({
+        ...current,
+        activeTurnId: current.activeThreadId === threadId ? null : current.activeTurnId,
+        queue: current.queue.some((message) => message.id === queuedMessage.id)
+          ? current.queue
+          : [queuedMessage, ...current.queue].slice(0, deps.config.queueLimit),
+      }));
+      broadcastHello(next);
+    } finally {
+      queuedStartInFlight = null;
+    }
+  };
 
   deps.codex.onNotification((message) => {
     for (const client of wss.clients) send(client, { type: 'codex/notification', message });
+    if (message.method === 'turn/completed') void handleTurnCompleted();
   });
 
   const close = () => {
@@ -193,13 +269,15 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           };
           const result = await deps.codex.request('thread/start', params);
           const activeCwd = extractThreadCwd(result) ?? cwd;
-          deps.stateStore.update((state) => ({
+          const state = deps.stateStore.update((state) => ({
             ...state,
             activeThreadId: extractThreadId(result),
+            activeTurnId: null,
             activeCwd,
             recentCwds: rememberCwd(state.recentCwds, activeCwd),
           }));
           send(ws, { type: 'rpc/result', id: request.id, result });
+          broadcastHello(state);
           return;
         }
 
@@ -216,13 +294,106 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           };
           const result = await deps.codex.request('thread/resume', params);
           const activeCwd = extractThreadCwd(result) ?? deps.stateStore.read().activeCwd;
-          deps.stateStore.update((state) => ({
+          const state = deps.stateStore.update((state) => ({
             ...state,
             activeThreadId: threadId,
+            activeTurnId: null,
             activeCwd,
             recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
           }));
           send(ws, { type: 'rpc/result', id: request.id, result: sanitizeThreadHistory(result) });
+          broadcastHello(state);
+          return;
+        }
+
+        if (request.method === 'webui/queue/enqueue') {
+          const text = getRequiredString(request.params, 'text');
+          if (!text) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'text is required' });
+            return;
+          }
+
+          const state = deps.stateStore.update((current) => ({
+            ...current,
+            queue: enqueueMessage(current.queue, text, deps.config.queueLimit),
+          }));
+          send(ws, { type: 'rpc/result', id: request.id, result: state.queue });
+          broadcastHello(state);
+          return;
+        }
+
+        if (request.method === 'webui/queue/remove') {
+          const id = getRequiredString(request.params, 'id');
+          if (!id) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'id is required' });
+            return;
+          }
+
+          const state = deps.stateStore.update((current) => ({
+            ...current,
+            queue: removeQueuedMessage(current.queue, id),
+          }));
+          send(ws, { type: 'rpc/result', id: request.id, result: state.queue });
+          broadcastHello(state);
+          return;
+        }
+
+        if (request.method === 'webui/queue/update') {
+          const id = getRequiredString(request.params, 'id');
+          const text = getRequiredString(request.params, 'text');
+          if (!id) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'id is required' });
+            return;
+          }
+          if (!text) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'text is required' });
+            return;
+          }
+
+          const state = deps.stateStore.update((current) => ({
+            ...current,
+            queue: updateQueuedMessage(current.queue, id, text),
+          }));
+          send(ws, { type: 'rpc/result', id: request.id, result: state.queue });
+          broadcastHello(state);
+          return;
+        }
+
+        if (request.method === 'webui/turn/start') {
+          const threadId = getRequiredString(request.params, 'threadId');
+          const text = getRequiredString(request.params, 'text');
+          if (!threadId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
+            return;
+          }
+          if (!text) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'text is required' });
+            return;
+          }
+
+          const result = await startTurn({ threadId, text });
+          const state = deps.stateStore.update((current) => ({
+            ...current,
+            activeTurnId: current.activeThreadId === threadId ? extractTurnId(result) : current.activeTurnId,
+          }));
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          broadcastHello(state);
+          return;
+        }
+
+        if (request.method === 'webui/turn/interrupt') {
+          const state = deps.stateStore.read();
+          if (!state.activeThreadId || !state.activeTurnId) {
+            throw new Error('no active turn to interrupt');
+          }
+
+          const result = await deps.codex.request('turn/interrupt', {
+            threadId: state.activeThreadId,
+            turnId: state.activeTurnId,
+          });
+          const next = deps.stateStore.update((current) => ({ ...current, activeTurnId: null }));
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          broadcastHello(next);
           return;
         }
 
