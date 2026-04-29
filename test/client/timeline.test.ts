@@ -3,10 +3,12 @@ import {
   approvalItemsFromRequests,
   liveStreamingItemFromNotifications,
   mergeTimelineItemsByTimestamp,
+  nextLiveNotificationWindow,
   notificationsSinceCount,
   notificationIsTurnComplete,
   notificationMatchesActiveTurn,
   requestKey,
+  shouldShowLiveStreamingItem,
   turnToTimelineItems,
   trimTimelineWindow,
 } from '../../src/lib/timeline';
@@ -200,20 +202,53 @@ describe('timeline', () => {
       false,
     );
 
-    expect(item).toBeNull();
+    expect(item).toMatchObject({ kind: 'streaming', text: 'Hello', active: false, turnId: 'turn-1' });
   });
 
-  it('clears Codex event message streaming text on task completion', () => {
+  it('keeps scoped Codex event message text after task completion', () => {
     const item = liveStreamingItemFromNotifications(
       [
-        { method: 'event_msg', params: { type: 'agent_message', message: 'Working', phase: 'commentary' } },
+        { method: 'event_msg', params: { type: 'agent_message', message: 'Working', phase: 'commentary', turn_id: 'turn-1' } },
         { method: 'event_msg', params: { type: 'task_complete', turn_id: 'turn-1' } },
       ],
       { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
       false,
     );
 
-    expect(item).toBeNull();
+    expect(item).toMatchObject({ kind: 'streaming', text: 'Working', active: false, turnId: 'turn-1' });
+  });
+
+  it('keeps the completed turn notification window until a new turn starts', () => {
+    const current = { activeThreadId: 'thread-1', activeTurnId: 'turn-1', startCount: 10 };
+
+    expect(nextLiveNotificationWindow(current, { activeThreadId: 'thread-1', activeTurnId: null }, 20)).toBe(current);
+    expect(nextLiveNotificationWindow(current, { activeThreadId: 'thread-1', activeTurnId: 'turn-2' }, 25)).toEqual({
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-2',
+      startCount: 25,
+    });
+    expect(nextLiveNotificationWindow(current, { activeThreadId: 'thread-2', activeTurnId: null }, 30)).toEqual({
+      activeThreadId: 'thread-2',
+      activeTurnId: null,
+      startCount: 30,
+    });
+  });
+
+  it('keeps completed live output visible only until persisted history contains that turn', () => {
+    const liveItem: Extract<TimelineItem, { kind: 'streaming' }> = {
+      id: 'live:streaming-assistant',
+      kind: 'streaming',
+      timestamp: 100,
+      text: 'Hello',
+      active: false,
+      turnId: 'turn-1',
+    };
+    const staleHistory: TimelineItem[] = [{ id: 'turn-old:a1', kind: 'assistant', timestamp: 1, text: 'old', phase: null }];
+    const caughtUpHistory: TimelineItem[] = [{ id: 'turn-1:a1', kind: 'assistant', timestamp: 2, text: 'Hello', phase: null }];
+
+    expect(shouldShowLiveStreamingItem(staleHistory, liveItem)).toBe(true);
+    expect(shouldShowLiveStreamingItem(caughtUpHistory, liveItem)).toBe(false);
+    expect(shouldShowLiveStreamingItem(staleHistory, null)).toBe(false);
   });
 
   it('ignores live deltas from a different thread', () => {

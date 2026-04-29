@@ -30,7 +30,7 @@ export type TimelineItem =
   | { id: string; kind: 'warning'; timestamp: number; text: string }
   | { id: string; kind: 'error'; timestamp: number; text: string }
   | { id: string; kind: 'queued'; timestamp: number; message: { id: string; text: string; createdAt: number; options?: Partial<CodexRunOptions> } }
-  | { id: string; kind: 'streaming'; timestamp: number; text: string; active: boolean }
+  | { id: string; kind: 'streaming'; timestamp: number; text: string; active: boolean; turnId?: string | null }
   | { id: string; kind: 'approval'; timestamp: number; requestId: number | string; method: string; params: unknown };
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -44,6 +44,12 @@ export function requestKey(id: number | string): string {
 export interface TimelineNotificationScope {
   activeThreadId: string | null;
   activeTurnId: string | null;
+}
+
+export interface LiveNotificationWindow {
+  activeThreadId: string | null;
+  activeTurnId: string | null;
+  startCount: number;
 }
 
 function stringAtPath(value: unknown, path: string[]): string | null {
@@ -321,10 +327,38 @@ export function mergeTimelineItemsByTimestamp(items: TimelineItem[]): TimelineIt
     .map(({ item }) => item);
 }
 
+export function timelineItemTurnId(item: TimelineItem): string | null {
+  if ('turnId' in item && typeof item.turnId === 'string') return item.turnId;
+  const separator = item.id.indexOf(':');
+  return separator > 0 ? item.id.slice(0, separator) : null;
+}
+
+export function shouldShowLiveStreamingItem(items: TimelineItem[], liveItem: Extract<TimelineItem, { kind: 'streaming' }> | null): boolean {
+  if (!liveItem) return false;
+  return !liveItem.turnId || !items.some((item) => timelineItemTurnId(item) === liveItem.turnId);
+}
+
 export function notificationsSinceCount<T>(notifications: T[], totalCount: number, startCount: number): T[] {
   const retainedAfterStart = Math.max(0, totalCount - startCount);
   const firstRetainedAfterStart = Math.max(0, notifications.length - retainedAfterStart);
   return notifications.slice(firstRetainedAfterStart);
+}
+
+export function nextLiveNotificationWindow(
+  current: LiveNotificationWindow,
+  scope: TimelineNotificationScope,
+  notificationCount: number,
+): LiveNotificationWindow {
+  if (current.activeThreadId !== scope.activeThreadId) {
+    return { ...scope, startCount: notificationCount };
+  }
+  if (scope.activeTurnId && current.activeTurnId !== scope.activeTurnId) {
+    return { ...scope, startCount: notificationCount };
+  }
+  if (!current.activeTurnId && !scope.activeTurnId) {
+    return { ...scope, startCount: notificationCount };
+  }
+  return current;
 }
 
 export function liveStreamingItemFromNotifications(
@@ -332,14 +366,15 @@ export function liveStreamingItemFromNotifications(
   scope: TimelineNotificationScope,
   active: boolean,
   now = Date.now(),
-): TimelineItem | null {
+): Extract<TimelineItem, { kind: 'streaming' }> | null {
   let text = '';
+  let turnId: string | null = null;
 
   for (const notification of notifications) {
     if (!isRecord(notification) || typeof notification.method !== 'string') continue;
 
     if (notification.method === 'turn/completed') {
-      if (notificationMatchesActiveTurn(notification, scope)) text = '';
+      if (notificationMatchesActiveTurn(notification, scope)) turnId = notificationTurnId(notification) ?? turnId;
       continue;
     }
 
@@ -347,6 +382,7 @@ export function liveStreamingItemFromNotifications(
       if (!notificationMatchesActiveTurn(notification, scope)) continue;
       const delta = notification.params.delta;
       if (typeof delta === 'string') text += delta;
+      turnId = notificationTurnId(notification) ?? turnId;
       continue;
     }
 
@@ -354,7 +390,7 @@ export function liveStreamingItemFromNotifications(
     const payload = notificationPayload(notification);
     if (!isRecord(payload)) continue;
     if (payload.type === 'task_complete') {
-      if (notificationIsTurnComplete(notification, scope)) text = '';
+      if (notificationIsTurnComplete(notification, scope)) turnId = notificationTurnId(notification) ?? turnId;
       continue;
     }
     if (payload.type !== 'agent_message') continue;
@@ -363,6 +399,7 @@ export function liveStreamingItemFromNotifications(
     if (!hasScopeId && !active) continue;
     const message = payload.message;
     if (typeof message === 'string' && message.trim()) text = text ? `${text}\n\n${message}` : message;
+    turnId = notificationTurnId(notification) ?? turnId;
   }
 
   if (!text && !active) return null;
@@ -373,6 +410,7 @@ export function liveStreamingItemFromNotifications(
     timestamp: now,
     text,
     active,
+    turnId,
   };
 }
 

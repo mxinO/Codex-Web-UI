@@ -30,10 +30,12 @@ import {
   approvalItemsFromRequests,
   liveStreamingItemFromNotifications,
   mergeTimelineItemsByTimestamp,
+  nextLiveNotificationWindow,
   notificationsSinceCount,
   notificationIsTurnComplete,
   notificationMatchesActiveTurn,
   requestKey,
+  shouldShowLiveStreamingItem,
   type TimelineItem,
 } from './lib/timeline';
 import type { CodexThread } from './types/codex';
@@ -160,11 +162,12 @@ export default function App() {
   const bangCounterRef = useRef(0);
   const pendingUserCounterRef = useRef(0);
   const activeFileSummaryScopeRef = useRef({ threadId: activeThreadId, threadPath: activeThreadPath, turnId: state?.activeTurnId ?? null });
-  const liveTurnKey = `${activeThreadId ?? ''}\0${state?.activeTurnId ?? ''}`;
-  const liveNotificationWindowRef = useRef({ key: liveTurnKey, startCount: socket.notificationCount });
-  if (liveNotificationWindowRef.current.key !== liveTurnKey) {
-    liveNotificationWindowRef.current = { key: liveTurnKey, startCount: socket.notificationCount };
-  }
+  const liveNotificationWindowRef = useRef({ activeThreadId, activeTurnId: state?.activeTurnId ?? null, startCount: socket.notificationCount });
+  liveNotificationWindowRef.current = nextLiveNotificationWindow(
+    liveNotificationWindowRef.current,
+    { activeThreadId, activeTurnId: state?.activeTurnId ?? null },
+    socket.notificationCount,
+  );
   const liveNotificationStartCount = liveNotificationWindowRef.current.startCount;
   const lastNotification = socket.notifications.at(-1);
   const liveNotifications = useMemo(
@@ -172,9 +175,15 @@ export default function App() {
     [liveNotificationStartCount, socket.notificationCount, socket.notifications],
   );
   const liveStreamingItem = useMemo(
-    () => liveStreamingItemFromNotifications(liveNotifications, { activeThreadId, activeTurnId: state?.activeTurnId ?? null }, Boolean(state?.activeTurnId)),
+    () =>
+      liveStreamingItemFromNotifications(
+        liveNotifications,
+        { activeThreadId, activeTurnId: liveNotificationWindowRef.current.activeTurnId },
+        Boolean(state?.activeTurnId),
+      ),
     [activeThreadId, liveNotifications, state?.activeTurnId],
   );
+  const liveStreamingItemVisible = shouldShowLiveStreamingItem(timeline.items, liveStreamingItem);
   const approvalItems = useMemo(() => approvalItemsFromRequests(socket.requests, answeredApprovals), [answeredApprovals, socket.requests]);
   const queuedTimelineItems = useMemo<TimelineItem[]>(
     () =>
@@ -193,10 +202,10 @@ export default function App() {
       ...pendingUserItems,
       ...queuedTimelineItems,
       ...ephemeralItems,
-      ...(liveStreamingItem ? [liveStreamingItem] : []),
+      ...(liveStreamingItemVisible && liveStreamingItem ? [liveStreamingItem] : []),
       ...approvalItems,
     ]);
-  }, [approvalItems, ephemeralItems, liveStreamingItem, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items]);
+  }, [approvalItems, ephemeralItems, liveStreamingItem, liveStreamingItemVisible, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items]);
   const runOptions = useMemo<CodexRunOptions>(() => ({ model, mode: effectiveMode(mode, model), effort, sandbox }), [effort, mode, model, sandbox]);
 
   useEffect(() => {
