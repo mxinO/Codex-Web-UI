@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import type http from 'node:http';
@@ -251,6 +252,12 @@ function isTaskCompleteEvent(message: { method?: unknown; params?: unknown; payl
   if (message.method !== 'event_msg') return false;
   const payload = notificationPayload(message);
   return getStringPath(payload, ['type']) === 'task_complete';
+}
+
+function isTaskStartedEvent(message: { method?: unknown; params?: unknown; payload?: unknown }): boolean {
+  if (message.method !== 'event_msg') return false;
+  const payload = notificationPayload(message);
+  return getStringPath(payload, ['type']) === 'task_started';
 }
 
 function extractThreadId(result: unknown): string | null {
@@ -526,6 +533,10 @@ function isPatch(text: string): boolean {
   return /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/m.test(text);
 }
 
+function patchContentHash(text: string): string {
+  return createHash('sha256').update(text).digest('hex');
+}
+
 function splitContentLines(text: string): string[] {
   if (!text) return [];
   const lines = text.split('\n');
@@ -729,10 +740,9 @@ function extractResolvedRequestId(message: { method: string; params?: unknown })
   return typeof requestId === 'string' || typeof requestId === 'number' ? requestId : null;
 }
 
-function patchApplyPayload(message: { params?: unknown }): Record<string, unknown> | null {
-  if (!isRecord(message.params)) return null;
-  const payload = isRecord(message.params.payload) ? message.params.payload : message.params;
-  return getStringPath(payload, ['type']) === 'patch_apply_end' ? payload : null;
+function patchApplyPayload(message: { params?: unknown; payload?: unknown }): Record<string, unknown> | null {
+  const payload = notificationPayload(message);
+  return isRecord(payload) && getStringPath(payload, ['type']) === 'patch_apply_end' ? payload : null;
 }
 
 export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps): BrowserSocketCleanup {
@@ -740,6 +750,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   let closed = false;
   let queuedStartInFlight: { threadId: string; queuedMessage: QueuedMessage } | null = null;
   let bangCommandInFlight = false;
+  const pendingTurnStartContexts: TurnContext[] = [];
   const pendingServerRequests = new Map<string, JsonRpcServerRequest>();
   const resumedThreadIds = new Set<string>();
   const resumeThreadPromises = new Map<string, Promise<void>>();
@@ -754,6 +765,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const turnThreadPaths = new Map<string, string>();
   const turnCwds = new Map<string, string>();
   const livePatchTurnKeys = new Set<string>();
+  const capturedPatchEventKeys = new Set<string>();
 
   const turnKey = (threadId: string | null, turnId: string): string => `${threadId ?? ''}\0${turnId}`;
 
@@ -961,6 +973,35 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
   };
 
+  const patchEventKey = (threadId: string | null, turnId: string, filePath: string, patch: string): string =>
+    `${turnKey(threadId, turnId)}\0${filePath}\0${patchContentHash(patch)}`;
+
+  const rememberCapturedPatchEvent = (key: string): void => {
+    capturedPatchEventKeys.add(key);
+    while (capturedPatchEventKeys.size > 1000) {
+      const oldest = capturedPatchEventKeys.keys().next().value;
+      if (typeof oldest !== 'string') break;
+      capturedPatchEventKeys.delete(oldest);
+    }
+  };
+
+  const hasCapturedPatchEvent = (key: string): boolean => capturedPatchEventKeys.has(key);
+
+  const startContextForThread = (threadId: string): TurnContext => {
+    const state = deps.stateStore.read();
+    if (state.activeThreadId === threadId) {
+      return { threadId, threadPath: state.activeThreadPath, cwd: state.activeCwd };
+    }
+    return { threadId, threadPath: knownThreadPaths.get(threadId) ?? null, cwd: null };
+  };
+
+  const takePendingTurnStartContext = (threadId: string | null): TurnContext | null => {
+    const index = threadId ? pendingTurnStartContexts.findIndex((context) => context.threadId === threadId) : 0;
+    if (index < 0) return null;
+    const [context] = pendingTurnStartContexts.splice(index, 1);
+    return context ?? null;
+  };
+
   const captureFileChangeSnapshots = (params: unknown, requestId: number | string) => {
     const state = deps.stateStore.read();
     if (!state.activeCwd) return;
@@ -1003,21 +1044,18 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
   };
 
-  const capturePatchApplyPayload = async (payload: Record<string, unknown>) => {
-    if (!isRecord(payload.changes)) return;
-    const state = deps.stateStore.read();
-    const turnId = getStringPath(payload, ['turn_id']) ?? getStringPath(payload, ['turnId']);
-    if (!turnId) return;
-
-    const activeThreadId = state.activeTurnId === turnId ? state.activeThreadId : null;
-    const turnContext = findTurnContext(activeThreadId, turnId, state);
+  const capturePatchChangeEntries = async (
+    turnContext: TurnContext,
+    turnId: string,
+    itemId: string | null,
+    entries: Array<{ filePath: string; rawChange: Record<string, unknown> }>,
+  ): Promise<boolean> => {
     const store = openFileEditStore(turnContext.threadPath);
-    if (!store) return;
+    if (!store) return false;
 
     let storedAny = false;
     try {
-      for (const [filePath, rawChange] of Object.entries(payload.changes)) {
-        if (!isRecord(rawChange)) continue;
+      for (const { filePath, rawChange } of entries) {
         const patch = getStringPath(rawChange, ['unified_diff']) ?? diffText(rawChange);
         if (!patch) continue;
 
@@ -1028,12 +1066,14 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         } catch {
           continue;
         }
+        const eventKey = patchEventKey(turnContext.threadId, turnId, resolvedPath, patch);
+        if (hasCapturedPatchEvent(eventKey)) continue;
 
         const key = snapshotKey(turnContext.threadId, turnId, resolvedPath);
         const completePatchSequence = livePatchTurnKeys.has(turnKey(turnContext.threadId, turnId));
         const patchSnapshot = isPatch(patch) ? appendTurnPatch(turnContext.threadId, turnId, key, patch, completePatchSequence) : null;
         const after = await readCurrentFileForDiff(resolvedPath);
-        const changeType = getStringPath(rawChange, ['type']);
+        const changeType = changeKindType(rawChange);
         const existingSnapshot = store.getSnapshot(turnId, resolvedPath);
         const patchBefore = patchSnapshot ? beforeFromTurnPatches(patchSnapshot, after) : null;
         if (patchSnapshot && patchBefore === null) {
@@ -1052,12 +1092,13 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
         store.recordPatchSnapshot({
           turnId,
-          itemId: getStringPath(payload, ['call_id']) ?? null,
+          itemId,
           path: resolvedPath,
           before,
           replaceBefore: replacePatchBaseline,
         });
         store.finalizeFile({ turnId, path: resolvedPath, after });
+        rememberCapturedPatchEvent(eventKey);
         rememberKnownThreadPath(turnContext.threadId, turnContext.threadPath);
         rememberTurnThreadPath(turnContext.threadId, turnId, turnContext.threadPath);
         rememberTurnCwd(turnContext.threadId, turnId, turnContext.cwd);
@@ -1067,10 +1108,45 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       store.close();
     }
 
+    return storedAny;
+  };
+
+  const capturePatchApplyPayload = async (payload: Record<string, unknown>) => {
+    if (!isRecord(payload.changes)) return;
+    const state = deps.stateStore.read();
+    const turnId = getStringPath(payload, ['turn_id']) ?? getStringPath(payload, ['turnId']);
+    if (!turnId) return;
+
+    const activeThreadId = state.activeTurnId === turnId ? state.activeThreadId : null;
+    const turnContext = findTurnContext(activeThreadId, turnId, state);
+    const entries = Object.entries(payload.changes)
+      .filter((entry): entry is [string, Record<string, unknown>] => isRecord(entry[1]))
+      .map(([filePath, rawChange]) => ({ filePath, rawChange }));
+    const storedAny = await capturePatchChangeEntries(turnContext, turnId, getStringPath(payload, ['call_id']) ?? null, entries);
     if (storedAny && turnContext.threadId) broadcastFileChangeSummaryChanged(turnContext.threadId, turnId);
   };
 
-  const enqueuePatchApplyEnd = (message: { params?: unknown }) => {
+  const captureStructuredFileChange = async (message: { params?: unknown; payload?: unknown }) => {
+    if (!isRecord(message.params) || !isRecord(message.params.item)) return;
+    const item = message.params.item;
+    if (item.type !== 'fileChange' || !Array.isArray(item.changes)) return;
+    const turnId = notificationTurnId(message);
+    if (!turnId) return;
+
+    const state = deps.stateStore.read();
+    const turnContext = findTurnContext(notificationThreadId(message), turnId, state);
+    const entries = item.changes
+      .filter(isRecord)
+      .map((rawChange) => {
+        const filePath = changePath(rawChange);
+        return filePath ? { filePath, rawChange } : null;
+      })
+      .filter((entry): entry is { filePath: string; rawChange: Record<string, unknown> } => entry !== null);
+    const storedAny = await capturePatchChangeEntries(turnContext, turnId, stringValue(item, 'id'), entries);
+    if (storedAny && turnContext.threadId) broadcastFileChangeSummaryChanged(turnContext.threadId, turnId);
+  };
+
+  const enqueuePatchApplyEnd = (message: { params?: unknown; payload?: unknown }) => {
     const payload = patchApplyPayload(message);
     if (!payload) return;
     const turnId = getStringPath(payload, ['turn_id']) ?? getStringPath(payload, ['turnId']);
@@ -1089,6 +1165,29 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       .catch(() => undefined)
       .then(() => capturePatchApplyPayload(payload))
       .catch((error) => logWarn('Failed to capture patch apply notification', error))
+      .finally(() => {
+        patchCaptureQueueDepth -= 1;
+      });
+  };
+
+  const enqueueStructuredFileChange = (message: { params?: unknown; payload?: unknown }) => {
+    if (!isRecord(message.params) || !isRecord(message.params.item)) return;
+    const item = message.params.item;
+    if (item.type !== 'fileChange' || !Array.isArray(item.changes)) return;
+    const turnId = notificationTurnId(message);
+    if (!turnId) return;
+
+    if (patchCaptureQueueDepth >= FILE_DIFF_PATCH_MAX_PENDING_NOTIFICATIONS) {
+      const state = deps.stateStore.read();
+      markPatchTurnIncomplete(findTurnContext(notificationThreadId(message), turnId, state).threadId, turnId);
+      return;
+    }
+
+    patchCaptureQueueDepth += 1;
+    patchCaptureChain = patchCaptureChain
+      .catch(() => undefined)
+      .then(() => captureStructuredFileChange(message))
+      .catch((error) => logWarn('Failed to capture structured file change notification', error))
       .finally(() => {
         patchCaptureQueueDepth -= 1;
       });
@@ -1258,7 +1357,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     if (existing) return existing;
 
     let resumePromise: Promise<void>;
-    resumePromise = requestCodex('thread/resume', { threadId, persistExtendedHistory: true })
+    resumePromise = requestCodex('thread/resume', { threadId, experimentalRawEvents: true, persistExtendedHistory: true })
       .then((result) => {
         const activeCwd = extractThreadCwd(result);
         const activeThreadPath = extractThreadPath(result);
@@ -1287,19 +1386,25 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   };
 
   const startTurn = async ({ threadId, text, options }: TurnStartParams) => {
-    const state = deps.stateStore.read();
     await ensureThreadResumed(threadId);
-    return requestCodex<{ turn: { id: string } }>(
-      'turn/start',
-      applyTurnRunOptions(
-        {
-          threadId,
-          input: [{ type: 'text', text, text_elements: [] }],
-        },
-        options,
-        state.activeCwd,
-      ),
-    );
+    const context = startContextForThread(threadId);
+    pendingTurnStartContexts.push(context);
+    try {
+      return await requestCodex<{ turn: { id: string } }>(
+        'turn/start',
+        applyTurnRunOptions(
+          {
+            threadId,
+            input: [{ type: 'text', text, text_elements: [] }],
+          },
+          options,
+          context.cwd,
+        ),
+      );
+    } finally {
+      const index = pendingTurnStartContexts.indexOf(context);
+      if (index >= 0) pendingTurnStartContexts.splice(index, 1);
+    }
   };
 
   const handleTurnCompleted = async (message: { params?: unknown }) => {
@@ -1413,6 +1518,36 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
   };
 
+  const handleTaskStarted = (message: { params?: unknown; payload?: unknown }) => {
+    const turnId = notificationTurnId(message);
+    if (!turnId) return;
+
+    const notifiedThreadId = notificationThreadId(message);
+    const pendingContext = takePendingTurnStartContext(notifiedThreadId);
+    const current = deps.stateStore.read();
+    const threadId = notifiedThreadId ?? pendingContext?.threadId ?? current.activeThreadId;
+    const threadPath =
+      pendingContext?.threadPath ??
+      (threadId && threadId === current.activeThreadId ? current.activeThreadPath : threadId ? knownThreadPaths.get(threadId) ?? null : null);
+    const cwd = pendingContext?.cwd ?? (threadId && threadId === current.activeThreadId ? current.activeCwd : null);
+
+    rememberKnownThreadPath(threadId, threadPath);
+    rememberTurnThreadPath(threadId, turnId, threadPath);
+    rememberTurnCwd(threadId, turnId, cwd);
+    rememberLivePatchTurn(threadId, turnId);
+
+    if (!threadId || current.activeThreadId !== threadId || current.activeTurnId === turnId) return;
+    if (current.activeTurnId && current.activeTurnId !== turnId) return;
+
+    const next = deps.stateStore.update((state) => ({
+      ...state,
+      activeTurnId: state.activeThreadId === threadId ? turnId : state.activeTurnId,
+      activeThreadPath: state.activeThreadId === threadId ? (threadPath ?? state.activeThreadPath) : state.activeThreadPath,
+      activeCwd: state.activeThreadId === threadId ? (cwd ?? state.activeCwd) : state.activeCwd,
+    }));
+    broadcastHello(next);
+  };
+
   const unsubscribeNotification = deps.codex.onNotification((message) => {
     for (const client of wss.clients) send(client, { type: 'codex/notification', message });
     const resolvedRequestId = extractResolvedRequestId(message);
@@ -1421,8 +1556,11 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
     if (message.method === 'event_msg') {
       enqueuePatchApplyEnd(message);
+      if (isTaskStartedEvent(message)) handleTaskStarted(message);
       if (isTaskCompleteEvent(message)) void handleTurnCompleted(message);
     }
+    if (message.method === 'turn/started') handleTaskStarted(message);
+    if (message.method === 'item/completed') enqueueStructuredFileChange(message);
     if (message.method === 'turn/completed') void handleTurnCompleted(message);
   });
 
@@ -1513,7 +1651,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
           const params = applyThreadRunOptions<SessionStartParams & { experimentalRawEvents: boolean; persistExtendedHistory: boolean; [key: string]: unknown }>({
             cwd,
-            experimentalRawEvents: false,
+            experimentalRawEvents: true,
             persistExtendedHistory: true,
           }, runOptionsFromParams(request.params));
           const result = await requestCodex('thread/start', params);
@@ -1543,8 +1681,9 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
           const requestedThreadPath = getOptionalString(request.params, 'threadPath');
 
-          const params = applyThreadRunOptions<SessionResumeParams & { persistExtendedHistory: boolean; [key: string]: unknown }>({
+          const params = applyThreadRunOptions<SessionResumeParams & { experimentalRawEvents: boolean; persistExtendedHistory: boolean; [key: string]: unknown }>({
             threadId,
+            experimentalRawEvents: true,
             persistExtendedHistory: true,
           }, runOptionsFromParams(request.params));
           const result = await requestCodex('thread/resume', params);

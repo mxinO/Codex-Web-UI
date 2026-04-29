@@ -89,6 +89,9 @@ async function makeHarness(request: TestRequest) {
   const notify = (method: string, params?: unknown) => {
     notificationHandler?.({ jsonrpc: '2.0', method, params });
   };
+  const notifyRaw = (message: Parameters<NotificationHandler>[0]) => {
+    notificationHandler?.(message);
+  };
   const requestFromServer = (message: Parameters<ServerRequestHandler>[0]) => {
     serverRequestHandler?.(message);
   };
@@ -96,7 +99,7 @@ async function makeHarness(request: TestRequest) {
     healthHandler?.();
   };
 
-  return { ws, stateStore, notify, requestFromServer, emitHealthChange, respond, start, health, port };
+  return { ws, stateStore, notify, notifyRaw, requestFromServer, emitHealthChange, respond, start, health, port };
 }
 
 function nextMessage(ws: WebSocket): Promise<RpcMessage> {
@@ -183,7 +186,7 @@ describe('attachBrowserSocket session RPCs', () => {
 
     expect(request).toHaveBeenCalledWith('thread/start', {
       cwd: '/work/project',
-      experimentalRawEvents: false,
+      experimentalRawEvents: true,
       persistExtendedHistory: true,
     });
     expect(response).toEqual({ type: 'rpc/result', id: 2, result: { thread: { id: 'thread-1', cwd: '/normalized/project' } } });
@@ -213,7 +216,7 @@ describe('attachBrowserSocket session RPCs', () => {
 
     expect(request).toHaveBeenCalledWith('thread/start', {
       cwd: '/work/project',
-      experimentalRawEvents: false,
+      experimentalRawEvents: true,
       persistExtendedHistory: true,
       model: 'gpt-5.5',
       sandbox: 'workspace-write',
@@ -237,7 +240,7 @@ describe('attachBrowserSocket session RPCs', () => {
 
     expect(request).toHaveBeenCalledWith('thread/start', {
       cwd: '/work/project',
-      experimentalRawEvents: false,
+      experimentalRawEvents: true,
       persistExtendedHistory: true,
       config: { model_reasoning_effort: 'minimal' },
     });
@@ -258,6 +261,7 @@ describe('attachBrowserSocket session RPCs', () => {
 
     expect(request).toHaveBeenCalledWith('thread/resume', {
       threadId: 'thread-2',
+      experimentalRawEvents: true,
       persistExtendedHistory: true,
     });
     expect(response).toEqual({
@@ -339,6 +343,7 @@ describe('attachBrowserSocket session RPCs', () => {
 
     expect(request).toHaveBeenCalledWith('thread/resume', {
       threadId: 'thread-2',
+      experimentalRawEvents: true,
       persistExtendedHistory: true,
       model: 'gpt-5.5',
       sandbox: 'danger-full-access',
@@ -766,6 +771,299 @@ describe('attachBrowserSocket app-server requests', () => {
         source: 'stored',
       },
     });
+  });
+
+  it('marks task_started turns active before turn/start returns so patch diffs use the turn-start baseline', async () => {
+    let resolveStart: (value: unknown) => void = () => undefined;
+    const startPromise = new Promise<unknown>((resolve) => {
+      resolveStart = resolve;
+    });
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const threadPath = join(sessionDir, 'rollout-2026-04-29T00-00-00-thread-1.jsonl');
+    const filePath = join(root, 'early-task-start.txt');
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: root, path: threadPath } } as T);
+      if (method === 'turn/start') return startPromise as Promise<T>;
+      return Promise.reject(new Error(`unexpected method: ${method}`));
+    });
+    const { ws, stateStore, notifyRaw } = await makeHarness(request);
+    writeFileSync(threadPath, '');
+    writeFileSync(filePath, 'alpha\nbeta\ngamma\n');
+    stateStore.update((state) => ({
+      ...state,
+      activeCwd: root,
+      activeThreadId: 'thread-1',
+      activeTurnId: null,
+      activeThreadPath: threadPath,
+    }));
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 680, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'edit' } }));
+    await waitForRequestCalls(request, 2);
+
+    notifyRaw({ jsonrpc: '2.0', method: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-early' } });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-early' });
+
+    writeFileSync(filePath, 'alpha\nbeta changed\ngamma\n');
+    notifyRaw({
+      jsonrpc: '2.0',
+      method: 'event_msg',
+      payload: {
+        type: 'patch_apply_end',
+        turn_id: 'turn-early',
+        call_id: 'patch-early',
+        changes: {
+          [filePath]: {
+            type: 'update',
+            unified_diff: '@@ -1,3 +1,3 @@\n alpha\n-beta\n+beta changed\n gamma\n',
+          },
+        },
+      },
+    });
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      ws.send(
+        JSON.stringify({
+          type: 'rpc',
+          id: 6810 + attempt,
+          method: 'webui/fileChange/diff',
+          params: { threadId: 'thread-1', threadPath, turnId: 'turn-early', path: filePath, changes: [{ path: filePath }] },
+        }),
+      );
+      const response = await nextRpcResponse(ws, 6810 + attempt);
+      const result = response.result as { source?: string; before?: string; after?: string } | undefined;
+      if (result?.source === 'stored' && result.before === 'alpha\nbeta\ngamma\n' && result.after === 'alpha\nbeta changed\ngamma\n') break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 681,
+        method: 'webui/fileChange/diff',
+        params: { threadId: 'thread-1', threadPath, turnId: 'turn-early', path: filePath, changes: [{ path: filePath }] },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 681)).toEqual({
+      type: 'rpc/result',
+      id: 681,
+      result: { path: filePath, before: 'alpha\nbeta\ngamma\n', after: 'alpha\nbeta changed\ngamma\n', source: 'stored' },
+    });
+
+    resolveStart({ turn: { id: 'turn-early' } });
+    expect(await nextRpcResponse(ws, 680)).toEqual({ type: 'rpc/result', id: 680, result: { turn: { id: 'turn-early' } } });
+  });
+
+  it('captures structured fileChange notifications from raw app-server events', async () => {
+    let resolveStart: (value: unknown) => void = () => undefined;
+    const startPromise = new Promise<unknown>((resolve) => {
+      resolveStart = resolve;
+    });
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const threadPath = join(sessionDir, 'rollout-2026-04-29T00-00-00-thread-structured.jsonl');
+    const filePath = join(root, 'structured-file-change.txt');
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-structured', cwd: root, path: threadPath } } as T);
+      if (method === 'turn/start') return startPromise as Promise<T>;
+      return Promise.reject(new Error(`unexpected method: ${method}`));
+    });
+    const { ws, stateStore, notifyRaw } = await makeHarness(request);
+    writeFileSync(threadPath, '');
+    writeFileSync(filePath, 'alpha\nbeta\ngamma\n');
+    stateStore.update((state) => ({
+      ...state,
+      activeCwd: root,
+      activeThreadId: 'thread-structured',
+      activeTurnId: null,
+      activeThreadPath: threadPath,
+    }));
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 6820, method: 'webui/turn/start', params: { threadId: 'thread-structured', text: 'edit' } }));
+    await waitForRequestCalls(request, 2);
+
+    notifyRaw({
+      jsonrpc: '2.0',
+      method: 'turn/started',
+      params: {
+        threadId: 'thread-structured',
+        turn: { id: 'turn-structured', items: [], status: 'inProgress' },
+      },
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-structured', activeTurnId: 'turn-structured' });
+
+    writeFileSync(filePath, 'alpha\nbeta changed\ngamma\n');
+    notifyRaw({
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-structured',
+        turnId: 'turn-structured',
+        item: {
+          type: 'fileChange',
+          id: 'file-change-1',
+          changes: [
+            {
+              path: filePath,
+              kind: { type: 'update' },
+              diff: '@@ -1,3 +1,3 @@\n alpha\n-beta\n+beta changed\n gamma\n',
+            },
+          ],
+          status: 'completed',
+        },
+      },
+    });
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      ws.send(
+        JSON.stringify({
+          type: 'rpc',
+          id: 6830 + attempt,
+          method: 'webui/fileChange/diff',
+          params: {
+            threadId: 'thread-structured',
+            threadPath,
+            turnId: 'turn-structured',
+            path: filePath,
+            changes: [{ path: filePath }],
+          },
+        }),
+      );
+      const response = await nextRpcResponse(ws, 6830 + attempt);
+      const result = response.result as { source?: string; before?: string; after?: string } | undefined;
+      if (result?.source === 'stored' && result.before === 'alpha\nbeta\ngamma\n' && result.after === 'alpha\nbeta changed\ngamma\n') break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 683,
+        method: 'webui/fileChange/diff',
+        params: {
+          threadId: 'thread-structured',
+          threadPath,
+          turnId: 'turn-structured',
+          path: filePath,
+          changes: [{ path: filePath }],
+        },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 683)).toEqual({
+      type: 'rpc/result',
+      id: 683,
+      result: { path: filePath, before: 'alpha\nbeta\ngamma\n', after: 'alpha\nbeta changed\ngamma\n', source: 'stored' },
+    });
+
+    resolveStart({ turn: { id: 'turn-structured' } });
+    expect(await nextRpcResponse(ws, 6820)).toEqual({ type: 'rpc/result', id: 6820, result: { turn: { id: 'turn-structured' } } });
+  });
+
+  it('deduplicates mixed legacy and structured file-change notifications for the same edit', async () => {
+    for (const order of ['legacy-first', 'structured-first'] as const) {
+      const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+      const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+      cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+      cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+      const threadPath = join(sessionDir, `rollout-2026-04-29T00-00-00-thread-${order}.jsonl`);
+      const filePath = join(root, 'mixed-events.txt');
+      const request = vi.fn<CodexAppServer['request']>();
+      const { ws, stateStore, notifyRaw } = await makeHarness(request);
+      writeFileSync(threadPath, '');
+      writeFileSync(filePath, 'alpha\nbeta\ngamma\n');
+      stateStore.update((state) => ({
+        ...state,
+        activeCwd: root,
+        activeThreadId: `thread-${order}`,
+        activeTurnId: `turn-${order}`,
+        activeThreadPath: threadPath,
+      }));
+      notifyRaw({
+        jsonrpc: '2.0',
+        method: 'turn/started',
+        params: { threadId: `thread-${order}`, turn: { id: `turn-${order}`, items: [], status: 'inProgress' } },
+      });
+
+      const legacy = () =>
+        notifyRaw({
+          jsonrpc: '2.0',
+          method: 'event_msg',
+          payload: {
+            type: 'patch_apply_end',
+            turn_id: `turn-${order}`,
+            call_id: 'duplicate-edit',
+            changes: {
+              [filePath]: {
+                type: 'update',
+                unified_diff: '@@ -1,3 +1,3 @@\n alpha\n-beta\n+beta changed\n gamma\n',
+              },
+            },
+          },
+        });
+      const structured = () =>
+        notifyRaw({
+          jsonrpc: '2.0',
+          method: 'item/completed',
+          params: {
+            threadId: `thread-${order}`,
+            turnId: `turn-${order}`,
+            item: {
+              type: 'fileChange',
+              id: 'duplicate-edit',
+              changes: [
+                {
+                  path: filePath,
+                  kind: { type: 'update' },
+                  diff: '@@ -1,3 +1,3 @@\n alpha\n-beta\n+beta changed\n gamma\n',
+                },
+              ],
+              status: 'completed',
+            },
+          },
+        });
+
+      writeFileSync(filePath, 'alpha\nbeta changed\ngamma\n');
+      if (order === 'legacy-first') {
+        legacy();
+        structured();
+      } else {
+        structured();
+        legacy();
+      }
+
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        ws.send(
+          JSON.stringify({
+            type: 'rpc',
+            id: 6840 + attempt,
+            method: 'webui/fileChange/diff',
+            params: { threadId: `thread-${order}`, threadPath, turnId: `turn-${order}`, path: filePath, changes: [{ path: filePath }] },
+          }),
+        );
+        const response = await nextRpcResponse(ws, 6840 + attempt);
+        const result = response.result as { source?: string; before?: string; after?: string } | undefined;
+        if (result?.source === 'stored' && result.before === 'alpha\nbeta\ngamma\n' && result.after === 'alpha\nbeta changed\ngamma\n') break;
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+
+      ws.send(
+        JSON.stringify({
+          type: 'rpc',
+          id: order === 'legacy-first' ? 684 : 685,
+          method: 'webui/fileChange/diff',
+          params: { threadId: `thread-${order}`, threadPath, turnId: `turn-${order}`, path: filePath, changes: [{ path: filePath }] },
+        }),
+      );
+      expect(await nextRpcResponse(ws, order === 'legacy-first' ? 684 : 685)).toEqual({
+        type: 'rpc/result',
+        id: order === 'legacy-first' ? 684 : 685,
+        result: { path: filePath, before: 'alpha\nbeta\ngamma\n', after: 'alpha\nbeta changed\ngamma\n', source: 'stored' },
+      });
+    }
   });
 
   it('does not overwrite a persisted turn-start baseline with an incomplete patch sequence', async () => {
@@ -1973,7 +2271,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     await waitForRequestCalls(request, 2);
 
     expect(request).toHaveBeenCalledTimes(2);
-    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', persistExtendedHistory: true });
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true });
     expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'next', text_elements: [] }],
@@ -1998,7 +2296,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     notify('event_msg', { payload: { type: 'task_complete', thread_id: 'thread-1', turn_id: 'turn-old' } });
     await waitForRequestCalls(request, 2);
 
-    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', persistExtendedHistory: true });
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true });
     expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'next', text_elements: [] }],
@@ -2097,7 +2395,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     await waitForRequestCalls(request, 2);
 
     expect(request).toHaveBeenCalledTimes(2);
-    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', persistExtendedHistory: true });
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true });
     expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'first', text_elements: [] }],
