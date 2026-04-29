@@ -37,7 +37,7 @@ codex-web-ui --host 0.0.0.0 --port 3001
 You can also install directly from GitHub:
 
 ```bash
-npm install -g git+ssh://git@github.com/mxinO/Codex-Web-UI.git
+npm install -g https://github.com/mxinO/Codex-Web-UI/archive/refs/heads/main.tar.gz
 ```
 
 The installed command serves the committed UI bundle from the package install directory, while new Codex sessions default to the directory where `codex-web-ui` is launched. Runtime state defaults to `${XDG_STATE_HOME:-~/.local/state}/codex-web-ui`; override it with `--state-dir <path>` or `CODEX_WEB_UI_STATE_DIR`.
