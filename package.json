@@ -20,7 +20,7 @@
     "dev:server": "tsx watch server/index.ts --mock",
     "start": "tsx scripts/start.ts",
     "install:global": "npm link --ignore-scripts",
-    "prepare": "npm run build",
+    "prepublishOnly": "npm run build && npm test",
     "build": "vite build && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.server.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
