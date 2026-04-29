@@ -29,7 +29,7 @@ export default function DiffViewer({ before = '', after = '', patch, language }:
         options={{
           readOnly: true,
           minimap: { enabled: false },
-          renderSideBySide: true,
+          renderSideBySide: false,
           automaticLayout: true,
           scrollBeyondLastLine: false,
           wordWrap: 'on',

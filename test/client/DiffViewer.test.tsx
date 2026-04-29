@@ -6,8 +6,18 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import DiffViewer from '../../src/components/DiffViewer';
 
 vi.mock('@monaco-editor/react', () => ({
-  DiffEditor: ({ original, modified, language }: { original?: string; modified?: string; language?: string }) => (
-    <div className="monaco-diff-mock" data-language={language}>
+  DiffEditor: ({
+    original,
+    modified,
+    language,
+    options,
+  }: {
+    original?: string;
+    modified?: string;
+    language?: string;
+    options?: { renderSideBySide?: boolean };
+  }) => (
+    <div className="monaco-diff-mock" data-language={language} data-side-by-side={String(options?.renderSideBySide)}>
       <pre aria-label="Before">{original}</pre>
       <pre aria-label="After">{modified}</pre>
     </div>
@@ -42,6 +52,7 @@ describe('DiffViewer', () => {
     render(<DiffViewer before="old" after="new" language="typescript" />);
 
     expect(document.querySelector('.monaco-diff-mock')?.getAttribute('data-language')).toBe('typescript');
+    expect(document.querySelector('.monaco-diff-mock')?.getAttribute('data-side-by-side')).toBe('false');
     expect(document.querySelector('[aria-label="Before"]')?.textContent).toBe('old');
     expect(document.querySelector('[aria-label="After"]')?.textContent).toBe('new');
   });
