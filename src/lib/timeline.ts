@@ -335,13 +335,106 @@ export function timelineItemTurnId(item: TimelineItem): string | null {
 
 export function shouldShowLiveStreamingItem(items: TimelineItem[], liveItem: Extract<TimelineItem, { kind: 'streaming' }> | null): boolean {
   if (!liveItem) return false;
-  return !liveItem.turnId || !items.some((item) => item.kind === 'assistant' && timelineItemTurnId(item) === liveItem.turnId);
+  if (liveItem.active || !liveItem.turnId) return true;
+  return !items.some(
+    (item) =>
+      item.kind === 'assistant' &&
+      timelineItemTurnId(item) === liveItem.turnId &&
+      (item.phase === null || item.phase === 'final_answer' || item.phase === 'final'),
+  );
+}
+
+function normalizedMessageBlock(text: string): string {
+  return text.trim().replace(/\r\n/g, '\n');
+}
+
+export function liveStreamingItemForTimeline(
+  items: TimelineItem[],
+  liveItem: Extract<TimelineItem, { kind: 'streaming' }> | null,
+): Extract<TimelineItem, { kind: 'streaming' }> | null {
+  if (!shouldShowLiveStreamingItem(items, liveItem)) return null;
+  if (!liveItem?.turnId || !liveItem.text) return liveItem;
+
+  const persistedCommentary = new Set(
+    items
+      .filter(
+        (item): item is Extract<TimelineItem, { kind: 'assistant' }> =>
+          item.kind === 'assistant' &&
+          timelineItemTurnId(item) === liveItem.turnId &&
+          item.phase !== null &&
+          item.phase !== 'final_answer' &&
+          item.phase !== 'final' &&
+          normalizedMessageBlock(item.text).length > 0,
+      )
+      .map((item) => normalizedMessageBlock(item.text)),
+  );
+  if (persistedCommentary.size === 0) return liveItem;
+
+  const text = liveItem.text
+    .split(/\n{2,}/)
+    .filter((block) => !persistedCommentary.has(normalizedMessageBlock(block)))
+    .join('\n\n');
+  if (!text && !liveItem.active) return null;
+  return { ...liveItem, text };
 }
 
 export function notificationsSinceCount<T>(notifications: T[], totalCount: number, startCount: number): T[] {
   const retainedAfterStart = Math.max(0, totalCount - startCount);
   const firstRetainedAfterStart = Math.max(0, notifications.length - retainedAfterStart);
   return notifications.slice(firstRetainedAfterStart);
+}
+
+export function latestCompletionNotificationCount(
+  notifications: unknown[],
+  totalCount: number,
+  scope: TimelineNotificationScope,
+): number | null {
+  const firstNotificationCount = totalCount - notifications.length + 1;
+  for (let index = notifications.length - 1; index >= 0; index -= 1) {
+    if (notificationIsTurnComplete(notifications[index], scope)) return firstNotificationCount + index;
+  }
+  return null;
+}
+
+export function liveTimelineItemsFromNotifications(
+  notifications: unknown[],
+  scope: TimelineNotificationScope,
+  now = Date.now(),
+): TimelineItem[] {
+  const items: TimelineItem[] = [];
+  const seenIds = new Set<string>();
+
+  for (const notification of notifications) {
+    if (!isRecord(notification) || notification.method !== 'item/completed') continue;
+    if (!notificationMatchesActiveTurn(notification, scope)) continue;
+    if (!isRecord(notification.params) || !isRecord(notification.params.item)) continue;
+
+    const rawItem = notification.params.item as CodexItem;
+    if (rawItem.type === 'agentMessage' || rawItem.type === 'userMessage') continue;
+
+    const turnId = notificationTurnId(notification) ?? scope.activeTurnId ?? 'live';
+    const converted = turnToTimelineItems({
+      id: turnId,
+      status: 'inProgress',
+      startedAt: now / 1000,
+      completedAt: null,
+      items: [rawItem],
+    });
+    items.push(
+      ...converted.filter(
+        (item) => {
+          if (item.kind !== 'command' && item.kind !== 'fileChange' && item.kind !== 'tool' && item.kind !== 'warning' && item.kind !== 'error') {
+            return false;
+          }
+          if (seenIds.has(item.id)) return false;
+          seenIds.add(item.id);
+          return true;
+        },
+      ),
+    );
+  }
+
+  return items;
 }
 
 export function nextLiveNotificationWindow(
@@ -366,9 +459,11 @@ export function liveStreamingItemFromNotifications(
   scope: TimelineNotificationScope,
   active: boolean,
   now = Date.now(),
+  options: { acceptUnscoped?: boolean } = {},
 ): Extract<TimelineItem, { kind: 'streaming' }> | null {
   let text = '';
   let turnId: string | null = null;
+  const acceptUnscoped = options.acceptUnscoped ?? active;
 
   for (const notification of notifications) {
     if (!isRecord(notification) || typeof notification.method !== 'string') continue;
@@ -396,7 +491,7 @@ export function liveStreamingItemFromNotifications(
     if (payload.type !== 'agent_message') continue;
     const hasScopeId = Boolean(notificationThreadId(notification) || notificationTurnId(notification));
     if (hasScopeId && !notificationMatchesActiveTurn(notification, scope)) continue;
-    if (!hasScopeId && !active) continue;
+    if (!hasScopeId && !acceptUnscoped) continue;
     const message = payload.message;
     if (typeof message === 'string' && message.trim()) text = text ? `${text}\n\n${message}` : message;
     turnId = notificationTurnId(notification) ?? turnId;

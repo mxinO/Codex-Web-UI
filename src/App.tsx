@@ -28,14 +28,15 @@ import {
 import { parseSlashCommand } from './lib/slashCommands';
 import {
   approvalItemsFromRequests,
+  latestCompletionNotificationCount,
+  liveStreamingItemForTimeline,
   liveStreamingItemFromNotifications,
+  liveTimelineItemsFromNotifications,
   mergeTimelineItemsByTimestamp,
   nextLiveNotificationWindow,
   notificationsSinceCount,
-  notificationIsTurnComplete,
   notificationMatchesActiveTurn,
   requestKey,
-  shouldShowLiveStreamingItem,
   type TimelineItem,
 } from './lib/timeline';
 import type { CodexThread } from './types/codex';
@@ -163,11 +164,13 @@ export default function App() {
   const pendingUserCounterRef = useRef(0);
   const activeFileSummaryScopeRef = useRef({ threadId: activeThreadId, threadPath: activeThreadPath, turnId: state?.activeTurnId ?? null });
   const liveNotificationWindowRef = useRef({ activeThreadId, activeTurnId: state?.activeTurnId ?? null, startCount: socket.notificationCount });
+  const lastHandledCompletionCountRef = useRef<number | null>(null);
   liveNotificationWindowRef.current = nextLiveNotificationWindow(
     liveNotificationWindowRef.current,
     { activeThreadId, activeTurnId: state?.activeTurnId ?? null },
     socket.notificationCount,
   );
+  const liveNotificationActiveTurnId = liveNotificationWindowRef.current.activeTurnId;
   const liveNotificationStartCount = liveNotificationWindowRef.current.startCount;
   const lastNotification = socket.notifications.at(-1);
   const liveNotifications = useMemo(
@@ -178,12 +181,30 @@ export default function App() {
     () =>
       liveStreamingItemFromNotifications(
         liveNotifications,
-        { activeThreadId, activeTurnId: liveNotificationWindowRef.current.activeTurnId },
+        { activeThreadId, activeTurnId: liveNotificationActiveTurnId },
         Boolean(state?.activeTurnId),
+        Date.now(),
+        { acceptUnscoped: Boolean(liveNotificationActiveTurnId) },
       ),
-    [activeThreadId, liveNotifications, state?.activeTurnId],
+    [activeThreadId, liveNotificationActiveTurnId, liveNotifications, state?.activeTurnId],
   );
-  const liveStreamingItemVisible = shouldShowLiveStreamingItem(timeline.items, liveStreamingItem);
+  const latestCompletionCount = useMemo(
+    () =>
+      latestCompletionNotificationCount(liveNotifications, socket.notificationCount, {
+        activeThreadId,
+        activeTurnId: liveNotificationActiveTurnId,
+      }),
+    [activeThreadId, liveNotificationActiveTurnId, liveNotifications, socket.notificationCount],
+  );
+  const liveTimelineItems = useMemo(
+    () => liveTimelineItemsFromNotifications(liveNotifications, { activeThreadId, activeTurnId: liveNotificationActiveTurnId }),
+    [activeThreadId, liveNotificationActiveTurnId, liveNotifications],
+  );
+  const visibleLiveTimelineItems = useMemo(() => {
+    const persistedIds = new Set(timeline.items.map((item) => item.id));
+    return liveTimelineItems.filter((item) => !persistedIds.has(item.id));
+  }, [liveTimelineItems, timeline.items]);
+  const visibleLiveStreamingItem = useMemo(() => liveStreamingItemForTimeline(timeline.items, liveStreamingItem), [liveStreamingItem, timeline.items]);
   const approvalItems = useMemo(() => approvalItemsFromRequests(socket.requests, answeredApprovals), [answeredApprovals, socket.requests]);
   const queuedTimelineItems = useMemo<TimelineItem[]>(
     () =>
@@ -202,10 +223,11 @@ export default function App() {
       ...pendingUserItems,
       ...queuedTimelineItems,
       ...ephemeralItems,
-      ...(liveStreamingItemVisible && liveStreamingItem ? [liveStreamingItem] : []),
+      ...visibleLiveTimelineItems,
+      ...(visibleLiveStreamingItem ? [visibleLiveStreamingItem] : []),
       ...approvalItems,
     ]);
-  }, [approvalItems, ephemeralItems, liveStreamingItem, liveStreamingItemVisible, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items]);
+  }, [approvalItems, ephemeralItems, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items, visibleLiveStreamingItem, visibleLiveTimelineItems]);
   const runOptions = useMemo<CodexRunOptions>(() => ({ model, mode: effectiveMode(mode, model), effort, sandbox }), [effort, mode, model, sandbox]);
 
   useEffect(() => {
@@ -271,16 +293,21 @@ export default function App() {
   }, [timeline.items]);
 
   useEffect(() => {
-    if (
-      !activeThreadId ||
-      typeof lastNotification !== 'object' ||
-      lastNotification === null ||
-      !notificationIsTurnComplete(lastNotification, { activeThreadId, activeTurnId: state?.activeTurnId ?? null })
-    ) {
-      return;
-    }
-    if (timeline.isViewingLatest) void timeline.reload();
-  }, [activeThreadId, lastNotification, state?.activeTurnId, timeline.isViewingLatest, timeline.reload]);
+    if (!activeThreadId || latestCompletionCount === null || !timeline.isViewingLatest) return;
+    if (lastHandledCompletionCountRef.current === latestCompletionCount) return;
+    lastHandledCompletionCountRef.current = latestCompletionCount;
+
+    let cancelled = false;
+    const reload = () => {
+      if (!cancelled) void timeline.reload();
+    };
+    reload();
+    const timers = [500, 1500, 3000].map((delay) => window.setTimeout(reload, delay));
+    return () => {
+      cancelled = true;
+      timers.forEach((timer) => window.clearTimeout(timer));
+    };
+  }, [activeThreadId, latestCompletionCount, timeline.isViewingLatest, timeline.reload]);
 
   useEffect(() => {
     if (!activeThreadId || socket.connectionState !== 'connected' || socket.reconnectEpoch === 0) return;

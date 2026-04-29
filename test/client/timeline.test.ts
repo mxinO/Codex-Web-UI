@@ -7,6 +7,9 @@ import {
   notificationsSinceCount,
   notificationIsTurnComplete,
   notificationMatchesActiveTurn,
+  latestCompletionNotificationCount,
+  liveStreamingItemForTimeline,
+  liveTimelineItemsFromNotifications,
   requestKey,
   shouldShowLiveStreamingItem,
   turnToTimelineItems,
@@ -218,6 +221,21 @@ describe('timeline', () => {
     expect(item).toMatchObject({ kind: 'streaming', text: 'Working', active: false, turnId: 'turn-1' });
   });
 
+  it('keeps unscoped live output from a retained completed-turn notification window', () => {
+    const item = liveStreamingItemFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', message: 'Final answer after edit' } },
+        { method: 'event_msg', params: { type: 'task_complete', turn_id: 'turn-1' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      100,
+      { acceptUnscoped: true },
+    );
+
+    expect(item).toMatchObject({ kind: 'streaming', text: 'Final answer after edit', active: false, turnId: 'turn-1' });
+  });
+
   it('keeps the completed turn notification window until a new turn starts', () => {
     const current = { activeThreadId: 'thread-1', activeTurnId: 'turn-1', startCount: 10 };
 
@@ -297,6 +315,140 @@ describe('timeline', () => {
     ];
 
     expect(shouldShowLiveStreamingItem(nonAssistantHistory, liveItem)).toBe(true);
+  });
+
+  it('does not hide completed live output when only same-turn commentary is persisted', () => {
+    const liveItem: Extract<TimelineItem, { kind: 'streaming' }> = {
+      id: 'live:streaming-assistant',
+      kind: 'streaming',
+      timestamp: 100,
+      text: 'Final answer after the edit.',
+      active: false,
+      turnId: 'turn-1',
+    };
+    const partialHistory: TimelineItem[] = [
+      {
+        id: 'turn-1:a1',
+        kind: 'assistant',
+        timestamp: 100,
+        text: 'I will edit the file.',
+        phase: 'commentary',
+      },
+      {
+        id: 'turn-1:file-1',
+        kind: 'fileChange',
+        timestamp: 100,
+        turnId: 'turn-1',
+        item: { type: 'fileChange', id: 'file-1', changes: [{ path: '/repo/a.txt' }], status: 'completed' },
+        filePath: '/repo/a.txt',
+        changeCount: 1,
+      },
+    ];
+
+    expect(shouldShowLiveStreamingItem(partialHistory, liveItem)).toBe(true);
+  });
+
+  it('removes already persisted same-turn commentary from the visible live output', () => {
+    const liveItem: Extract<TimelineItem, { kind: 'streaming' }> = {
+      id: 'live:streaming-assistant',
+      kind: 'streaming',
+      timestamp: 100,
+      text: 'I will edit the file.\n\nFinal answer after the edit.',
+      active: false,
+      turnId: 'turn-1',
+    };
+    const partialHistory: TimelineItem[] = [
+      {
+        id: 'turn-1:a1',
+        kind: 'assistant',
+        timestamp: 100,
+        text: 'I will edit the file.',
+        phase: 'commentary',
+      },
+    ];
+
+    expect(liveStreamingItemForTimeline(partialHistory, liveItem)).toMatchObject({
+      kind: 'streaming',
+      text: 'Final answer after the edit.',
+    });
+  });
+
+  it('finds a completion notification even when a file summary notification follows it', () => {
+    const notifications = [
+      { method: 'event_msg', params: { type: 'agent_message', message: 'Working', turn_id: 'turn-1' } },
+      { method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-1' } },
+      { method: 'webui/fileChange/summaryChanged', params: { threadId: 'thread-1', turnId: 'turn-1' } },
+    ];
+
+    expect(latestCompletionNotificationCount(notifications, 42, { activeThreadId: 'thread-1', activeTurnId: 'turn-1' })).toBe(41);
+  });
+
+  it('derives live command, file, and tool cards from completed item notifications', () => {
+    const items = liveTimelineItemsFromNotifications(
+      [
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'reasoning', id: 'reason-1', summary: ['thinking'], content: [] },
+          },
+        },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: {
+              type: 'commandExecution',
+              id: 'cmd-1',
+              command: 'pwd',
+              cwd: '/repo',
+              status: 'completed',
+              aggregatedOutput: '/repo\n',
+              exitCode: 0,
+            },
+          },
+        },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: {
+              type: 'commandExecution',
+              id: 'cmd-1',
+              command: 'pwd',
+              cwd: '/repo',
+              status: 'completed',
+              aggregatedOutput: '/repo\n',
+              exitCode: 0,
+            },
+          },
+        },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'fileChange', id: 'file-1', changes: [{ path: '/repo/a.txt' }], status: 'completed' },
+          },
+        },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'mcpToolCall', id: 'tool-1', server: 'test', tool: 'lookup', status: 'completed', arguments: {}, result: {}, error: null },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      100,
+    );
+
+    expect(items.map((item) => item.kind)).toEqual(['command', 'fileChange', 'tool']);
+    expect(items.map((item) => item.id)).toEqual(['turn-1:cmd-1', 'turn-1:file-1', 'turn-1:tool-1']);
   });
 
   it('ignores live deltas from a different thread', () => {
