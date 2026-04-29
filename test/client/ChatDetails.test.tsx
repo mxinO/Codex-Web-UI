@@ -279,6 +279,33 @@ describe('DetailModal', () => {
     expect(document.querySelector('[aria-label="After"]')?.textContent).toContain('new text');
   });
 
+  it('prefers resolved file diffs over inline patch metadata', async () => {
+    const item: TimelineItem = {
+      id: 'f1',
+      kind: 'fileChange',
+      timestamp: 1,
+      filePath: '/repo/a.txt',
+      resolvedDiff: { before: 'resolved old\n', after: 'resolved new\n', path: '/repo/a.txt' },
+      item: {
+        type: 'fileChange',
+        id: 'raw-file',
+        status: 'ok',
+        changes: [{ path: '/repo/a.txt', diff: '@@ -42 +99 @@\n-old\n+new\n' }],
+      },
+    };
+
+    render(<DetailModal item={item} onClose={vi.fn()} />);
+
+    await act(async () => {
+      await import('../../src/components/DiffViewer');
+    });
+    await flushLazy();
+
+    expect(document.querySelector('[aria-label="Patch"]')).toBeNull();
+    expect(document.querySelector('[aria-label="Before"]')?.textContent).toContain('resolved old');
+    expect(document.querySelector('[aria-label="After"]')?.textContent).toContain('resolved new');
+  });
+
   it('renders grouped add-and-update file changes as one final before/after diff', async () => {
     const item: TimelineItem = {
       id: 'f1',
@@ -356,7 +383,7 @@ describe('DetailModal', () => {
     expect(document.querySelector('.detail-pre')?.textContent).not.toBe('raw edit log that is not a patch');
   });
 
-  it('renders Codex patch hunks as side-by-side diff snippets', async () => {
+  it('renders Codex patch hunks with their actual hunk line numbers', async () => {
     const item: TimelineItem = {
       id: 'f1',
       kind: 'fileChange',
@@ -368,8 +395,8 @@ describe('DetailModal', () => {
         id: 'raw-file',
         status: 'completed',
         changes: [
-          { path: '/repo/a.txt', diff: '@@ -1 +1 @@\n-old\n+new\n' },
-          { path: '/repo/a.txt', diff: '@@ -2 +2 @@\n-two\n+three\n' },
+          { path: '/repo/a.txt', diff: '@@ -42,2 +99,3 @@\n context\n-old\n+new\n+extra\n' },
+          { path: '/repo/a.txt', diff: '@@ -120 +180 @@\n-two\n+three\n' },
         ],
       },
     };
@@ -383,9 +410,13 @@ describe('DetailModal', () => {
     });
     await flushLazy();
 
-    expect(document.querySelector('[aria-label="Patch"]')).toBeNull();
-    expect(document.querySelector('[aria-label="Before"]')?.textContent).toContain('old');
-    expect(document.querySelector('[aria-label="After"]')?.textContent).toContain('three');
+    expect(document.querySelector('[aria-label="Before"]')).toBeNull();
+    expect(document.querySelector('[aria-label="After"]')).toBeNull();
+    expect(document.querySelector('[aria-label="Patch"]')).not.toBeNull();
+    expect(Array.from(document.querySelectorAll('.diff-line__old')).map((node) => node.textContent)).toContain('42');
+    expect(Array.from(document.querySelectorAll('.diff-line__old')).map((node) => node.textContent)).toContain('120');
+    expect(Array.from(document.querySelectorAll('.diff-line__new')).map((node) => node.textContent)).toContain('99');
+    expect(Array.from(document.querySelectorAll('.diff-line__new')).map((node) => node.textContent)).toContain('180');
   });
 
   it('caps large JSON details and renders dialog semantics', () => {

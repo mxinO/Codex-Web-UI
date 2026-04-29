@@ -56,4 +56,27 @@ describe('DiffViewer', () => {
     expect(document.querySelector('[aria-label="Before"]')?.textContent).toBe('old');
     expect(document.querySelector('[aria-label="After"]')?.textContent).toBe('new');
   });
+
+  it('renders unified patch hunks with actual old and new line numbers', () => {
+    render(<DiffViewer patch={'@@ -42,2 +99,3 @@\n context\n-old\n+new\n+extra\n'} language="typescript" />);
+
+    const rows = Array.from(document.querySelectorAll<HTMLElement>('.diff-line'));
+    expect(rows.map((row) => row.querySelector('.diff-line__old')?.textContent)).toEqual(['', '42', '43', '', '']);
+    expect(rows.map((row) => row.querySelector('.diff-line__new')?.textContent)).toEqual(['', '99', '', '100', '101']);
+    expect(rows.map((row) => row.querySelector('.diff-line__code')?.textContent)).toEqual([
+      '@@ -42,2 +99,3 @@',
+      ' context',
+      '-old',
+      '+new',
+      '+extra',
+    ]);
+  });
+
+  it('resets patch line numbers at each hunk header', () => {
+    render(<DiffViewer patch={'@@ -5 +10 @@\n-old\n+new\n@@ -20 +30 @@\n-before\n+after\n'} language="typescript" />);
+
+    const rows = Array.from(document.querySelectorAll<HTMLElement>('.diff-line'));
+    expect(rows.map((row) => row.querySelector('.diff-line__old')?.textContent)).toEqual(['', '5', '', '', '20', '']);
+    expect(rows.map((row) => row.querySelector('.diff-line__new')?.textContent)).toEqual(['', '', '10', '', '', '30']);
+  });
 });

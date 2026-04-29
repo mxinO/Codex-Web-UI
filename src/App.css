@@ -1439,6 +1439,61 @@ input:focus-visible {
   font: 12px/1.45 Consolas, 'SFMono-Regular', 'Liberation Mono', monospace;
 }
 
+.diff-patch {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  font: 12px/1.45 Consolas, 'SFMono-Regular', 'Liberation Mono', monospace;
+}
+
+.diff-line {
+  display: grid;
+  grid-template-columns: 54px 54px minmax(0, 1fr);
+  min-height: 20px;
+}
+
+.diff-line__old,
+.diff-line__new {
+  padding: 1px 8px;
+  border-right: 1px solid var(--border);
+  color: var(--text-secondary);
+  text-align: right;
+  user-select: none;
+}
+
+.diff-line__code {
+  min-width: 0;
+  padding: 1px 10px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-primary);
+}
+
+.diff-line--hunk .diff-line__code,
+.diff-line--meta .diff-line__code {
+  color: var(--text-accent);
+}
+
+.diff-line--hunk {
+  background: var(--text-accent-soft);
+}
+
+.diff-line--add {
+  background: color-mix(in srgb, var(--green) 14%, transparent);
+}
+
+.diff-line--delete {
+  background: color-mix(in srgb, var(--red) 14%, transparent);
+}
+
+.diff-line--add .diff-line__code {
+  color: var(--green);
+}
+
+.diff-line--delete .diff-line__code {
+  color: var(--red);
+}
+
 .markdown-body {
   min-width: 0;
   max-width: 100%;

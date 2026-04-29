@@ -327,29 +327,11 @@ function explicitBeforeAfterDiff(changes: unknown[]): { before: string; after: s
   };
 }
 
-function patchSnippetDiff(changes: unknown[]): { before: string; after: string } | null {
-  const beforeParts: string[] = [];
-  const afterParts: string[] = [];
-
-  for (const change of changes) {
-    const patch = diffText(change);
-    if (!patch || !isPatch(patch)) continue;
-
-    const beforeLines: string[] = [];
-    const afterLines: string[] = [];
-    for (const line of patch.split('\n')) {
-      if (!line || line.startsWith('@@ ') || line === '\\ No newline at end of file') continue;
-      const marker = line[0];
-      const text = line.slice(1);
-      if (marker === ' ' || marker === '-') beforeLines.push(text);
-      if (marker === ' ' || marker === '+') afterLines.push(text);
-    }
-    beforeParts.push(beforeLines.join('\n'));
-    afterParts.push(afterLines.join('\n'));
-  }
-
-  if (beforeParts.length === 0 && afterParts.length === 0) return null;
-  return { before: beforeParts.join('\n~~~ ... ~~~\n'), after: afterParts.join('\n~~~ ... ~~~\n') };
+function patchHunkDiff(changes: unknown[]): string | null {
+  const patches = changes
+    .map(diffText)
+    .filter((entry): entry is string => entry !== null && isPatch(entry));
+  return patches.length > 0 ? patches.join('\n\n') : null;
 }
 
 function fileChangeDiff(item: Extract<TimelineItem, { kind: 'fileChange' }>): FileChangeDetail | null {
@@ -372,10 +354,16 @@ function fileChangeDiff(item: Extract<TimelineItem, { kind: 'fileChange' }>): Fi
     return { type: 'twoWay', before: explicit.before, after: explicit.after, language: languageFromPath(explicit.filePath) };
   }
 
-  const reconstructed = reconstructAddedFileDiff(changes) ?? patchSnippetDiff(changes);
+  const reconstructed = reconstructAddedFileDiff(changes);
   if (reconstructed) {
     const filePath = firstStringAt(change, [['path'], ['file'], ['filePath'], ['file_path']]);
     return { type: 'twoWay', before: reconstructed.before, after: reconstructed.after, language: languageFromPath(filePath) };
+  }
+
+  const hunkPatch = patchHunkDiff(changes);
+  if (hunkPatch) {
+    const filePath = firstStringAt(change, [['path'], ['file'], ['filePath'], ['file_path']]);
+    return { type: 'patch', patch: hunkPatch, language: languageFromPath(filePath) };
   }
 
   const patch = changes
