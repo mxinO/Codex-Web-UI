@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { approvalItemsFromRequests, liveStreamingItemFromNotifications, notificationMatchesActiveTurn, requestKey, turnToTimelineItems, trimTimelineWindow } from '../../src/lib/timeline';
+import {
+  approvalItemsFromRequests,
+  liveStreamingItemFromNotifications,
+  mergeTimelineItemsByTimestamp,
+  notificationMatchesActiveTurn,
+  requestKey,
+  turnToTimelineItems,
+  trimTimelineWindow,
+} from '../../src/lib/timeline';
 import type { TimelineItem } from '../../src/lib/timeline';
 import type { CodexTurn } from '../../src/types/codex';
 
@@ -72,6 +80,23 @@ describe('timeline', () => {
 
     expect(trimmed).toHaveLength(200);
     expect(trimmed[0].id).toBe('5');
+  });
+
+  it('merges ephemeral bang output by timestamp instead of pinning it to the bottom', () => {
+    const bang: TimelineItem = {
+      id: 'bang:1000:1',
+      kind: 'bangCommand',
+      timestamp: 1000,
+      command: 'pwd',
+      cwd: '/repo',
+      output: '/repo\n',
+      status: 'completed',
+      exitCode: 0,
+    };
+    const user: TimelineItem = { id: 'u1', kind: 'user', timestamp: 2000, text: 'next prompt' };
+    const assistant: TimelineItem = { id: 'a1', kind: 'assistant', timestamp: 2000, text: 'reply', phase: null };
+
+    expect(mergeTimelineItemsByTimestamp([user, assistant, bang]).map((item) => item.id)).toEqual(['bang:1000:1', 'u1', 'a1']);
   });
 
   it('normalizes malformed arrays and missing item ids defensively', () => {

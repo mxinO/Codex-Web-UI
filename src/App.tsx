@@ -25,7 +25,14 @@ import {
   sanitizeStoredSandbox,
 } from './lib/runOptions';
 import { parseSlashCommand } from './lib/slashCommands';
-import { approvalItemsFromRequests, liveStreamingItemFromNotifications, notificationMatchesActiveTurn, requestKey, type TimelineItem } from './lib/timeline';
+import {
+  approvalItemsFromRequests,
+  liveStreamingItemFromNotifications,
+  mergeTimelineItemsByTimestamp,
+  notificationMatchesActiveTurn,
+  requestKey,
+  type TimelineItem,
+} from './lib/timeline';
 import type { CodexThread } from './types/codex';
 import type { CodexRunOptions } from './types/ui';
 
@@ -164,7 +171,14 @@ export default function App() {
   );
   const chatItems = useMemo<TimelineItem[]>(() => {
     if (!timeline.isViewingLatest) return timeline.items;
-    return [...timeline.items, ...pendingUserItems, ...queuedTimelineItems, ...ephemeralItems, ...(liveStreamingItem ? [liveStreamingItem] : []), ...approvalItems];
+    return mergeTimelineItemsByTimestamp([
+      ...timeline.items,
+      ...pendingUserItems,
+      ...queuedTimelineItems,
+      ...ephemeralItems,
+      ...(liveStreamingItem ? [liveStreamingItem] : []),
+      ...approvalItems,
+    ]);
   }, [approvalItems, ephemeralItems, liveStreamingItem, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items]);
   const runOptions = useMemo<CodexRunOptions>(() => ({ model, mode: effectiveMode(mode, model), effort, sandbox }), [effort, mode, model, sandbox]);
 

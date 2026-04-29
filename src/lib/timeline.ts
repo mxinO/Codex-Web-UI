@@ -240,6 +240,17 @@ export function trimTimelineWindow<T>(items: T[], limit: number): T[] {
   return items.length <= limit ? items : items.slice(items.length - limit);
 }
 
+export function mergeTimelineItemsByTimestamp(items: TimelineItem[]): TimelineItem[] {
+  return items
+    .map((item, index) => ({ item, index }))
+    .sort((a, b) => {
+      const aTime = Number.isFinite(a.item.timestamp) ? a.item.timestamp : 0;
+      const bTime = Number.isFinite(b.item.timestamp) ? b.item.timestamp : 0;
+      return aTime - bTime || a.index - b.index;
+    })
+    .map(({ item }) => item);
+}
+
 export function liveStreamingItemFromNotifications(
   notifications: unknown[],
   scope: TimelineNotificationScope,
