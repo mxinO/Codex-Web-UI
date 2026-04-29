@@ -175,4 +175,66 @@ describe('ChatTimeline', () => {
     expect(observe).toHaveBeenCalledWith(column);
     expect(scroller?.scrollTop).toBe(800);
   });
+
+  it('groups only adjacent activity items and preserves message ordering', () => {
+    const firstCommand: TimelineItem = {
+      id: 'cmd-1',
+      kind: 'command',
+      timestamp: 1,
+      command: 'rg retry',
+      cwd: '/repo',
+      output: 'retry.ts\n',
+      status: 'completed',
+      exitCode: 0,
+    };
+    const firstEdit: TimelineItem = {
+      id: 'edit-1',
+      kind: 'fileChange',
+      timestamp: 2,
+      turnId: 'turn-1',
+      item: { type: 'fileChange', id: 'edit-1', status: 'completed', changes: [{ path: '/repo/retry.ts' }] },
+      filePath: '/repo/retry.ts',
+      changeCount: 1,
+    };
+    const assistant: TimelineItem = { id: 'assistant-1', kind: 'assistant', timestamp: 3, text: 'I found the reset. I am patching it now.', phase: null };
+    const secondCommand: TimelineItem = {
+      id: 'cmd-2',
+      kind: 'command',
+      timestamp: 4,
+      command: 'npm test -- retry',
+      cwd: '/repo',
+      output: 'ok\n',
+      status: 'completed',
+      exitCode: 0,
+    };
+
+    render(<ChatTimeline {...baseProps} items={[firstCommand, firstEdit, assistant, secondCommand]} />);
+
+    const children = Array.from(document.querySelector('.chat-column')?.children ?? []);
+    expect(children.map((node) => (node as HTMLElement).className)).toEqual(['activity-block', 'chat-row chat-row--assistant', 'activity-block']);
+    const blocks = Array.from(document.querySelectorAll('.activity-block'));
+    expect(blocks[0].textContent).toContain('$ rg retry');
+    expect(blocks[0].textContent).toContain('Edited retry.ts');
+    expect(blocks[1].textContent).toContain('$ npm test -- retry');
+  });
+
+  it('keeps file summary diff actions working inside activity blocks', () => {
+    const onOpenFileSummary = vi.fn();
+    const item: TimelineItem = {
+      id: 'turn-1:file-summary',
+      kind: 'fileChangeSummary',
+      timestamp: 1,
+      turnId: 'turn-1',
+      files: [{ path: '/repo/a.txt', changeCount: 2 }],
+    };
+
+    render(<ChatTimeline {...baseProps} items={[item]} onOpenFileSummary={onOpenFileSummary} />);
+
+    expect(document.querySelector('.activity-block')?.textContent).toContain('Files changed');
+    act(() => {
+      document.querySelector<HTMLButtonElement>('.activity-file__diff')?.click();
+    });
+
+    expect(onOpenFileSummary).toHaveBeenCalledWith('turn-1', '/repo/a.txt', 2);
+  });
 });

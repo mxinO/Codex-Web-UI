@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, type UIEvent } from 'react';
 import type { TimelineItem } from '../lib/timeline';
+import ActivityBlock from './ActivityBlock';
 import ChatItem from './ChatItem';
 
 interface ChatTimelineProps {
@@ -17,6 +18,38 @@ interface ChatTimelineProps {
 }
 
 const BOTTOM_STICKY_THRESHOLD_PX = 80;
+
+function isActivityItem(item: TimelineItem): boolean {
+  return (
+    item.kind === 'command' ||
+    item.kind === 'tool' ||
+    item.kind === 'fileChange' ||
+    item.kind === 'fileChangeSummary' ||
+    item.kind === 'notice' ||
+    item.kind === 'warning' ||
+    item.kind === 'error'
+  );
+}
+
+function groupTimelineItems(items: TimelineItem[]): Array<TimelineItem | TimelineItem[]> {
+  const groups: Array<TimelineItem | TimelineItem[]> = [];
+  let activityRun: TimelineItem[] = [];
+
+  for (const item of items) {
+    if (isActivityItem(item)) {
+      activityRun.push(item);
+      continue;
+    }
+    if (activityRun.length > 0) {
+      groups.push(activityRun);
+      activityRun = [];
+    }
+    groups.push(item);
+  }
+
+  if (activityRun.length > 0) groups.push(activityRun);
+  return groups;
+}
 
 function scrollToBottom(scroller: HTMLDivElement) {
   scroller.scrollTop = scroller.scrollHeight;
@@ -89,17 +122,26 @@ export default function ChatTimeline({
             )}
           </div>
         )}
-        {items.map((item) => (
-          <ChatItem
-            key={item.id}
-            item={item}
-            onOpenDetail={onOpenDetail}
-            onApprovalDecision={onApprovalDecision}
-            onQueuedEdit={onQueuedEdit}
-            onQueuedRemove={onQueuedRemove}
-            onOpenFileSummary={onOpenFileSummary}
-          />
-        ))}
+        {groupTimelineItems(items).map((entry) =>
+          Array.isArray(entry) ? (
+            <ActivityBlock
+              key={`activity:${entry.map((item) => item.id).join('|')}`}
+              items={entry}
+              onOpenDetail={onOpenDetail}
+              onOpenFileSummary={onOpenFileSummary}
+            />
+          ) : (
+            <ChatItem
+              key={entry.id}
+              item={entry}
+              onOpenDetail={onOpenDetail}
+              onApprovalDecision={onApprovalDecision}
+              onQueuedEdit={onQueuedEdit}
+              onQueuedRemove={onQueuedRemove}
+              onOpenFileSummary={onOpenFileSummary}
+            />
+          ),
+        )}
         {items.length === 0 && <div className="chat-empty">{loading ? 'Loading messages...' : 'No messages loaded.'}</div>}
       </div>
     </div>
