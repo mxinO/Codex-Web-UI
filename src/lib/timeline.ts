@@ -182,67 +182,27 @@ function changePath(change: unknown): string | null {
   );
 }
 
-function safePathKey(path: string | null, fallback: string): string {
-  return path ?? `unknown:${fallback}`;
-}
-
-interface FileChangeGroup {
-  key: string;
-  firstIndex: number;
-  order: number;
-  filePath: string | null;
-  changes: unknown[];
-  itemIds: string[];
-  lastStatus: string;
-  firstItem: CodexItem;
-}
-
 function fileChangeItemsForTurnItem(turn: CodexTurn, item: CodexItem, index: number, timestamp: number): TimelineItem[] {
-  const groups = new Map<string, FileChangeGroup>();
-  let order = 0;
   const itemId = safeItemId(turn, item, index);
-
-  for (const change of itemChanges(item)) {
+  const changes = itemChanges(item);
+  return changes.map((change, changeIndex) => {
     const filePath = changePath(change);
-    const key = safePathKey(filePath, itemId);
-    const existing = groups.get(key);
-    if (existing) {
-      existing.changes.push(change);
-      existing.itemIds.push(item.id ?? `${index}`);
-      existing.lastStatus = stringField(item, 'status', existing.lastStatus);
-      continue;
-    }
-
-    groups.set(key, {
-      key,
-      firstIndex: index,
-      order: order++,
-      filePath,
-      changes: [change],
-      itemIds: [item.id ?? `${index}`],
-      lastStatus: stringField(item, 'status', 'updated'),
-      firstItem: item,
-    });
-  }
-
-  const sorted = Array.from(groups.values()).sort((a, b) => a.order - b.order);
-  return sorted.map((group) => {
-    const item: CodexItem = {
-      ...group.firstItem,
-      id: group.itemIds.join('+'),
+    const rawItemId = item.id ?? `${index}`;
+    const rawItem: CodexItem = {
+      ...item,
+      id: changes.length === 1 ? rawItemId : `${rawItemId}:${changeIndex}`,
       type: 'fileChange',
-      changes: group.changes,
-      status: group.lastStatus,
-      groupedItemIds: group.itemIds,
+      changes: [change],
+      status: stringField(item, 'status', 'updated'),
     };
     return {
-      id: sorted.length === 1 ? itemId : `${itemId}:file:${group.key}`,
+      id: changes.length === 1 ? itemId : `${itemId}:edit:${changeIndex}`,
       kind: 'fileChange',
       timestamp,
       turnId: turn.id,
-      item,
-      filePath: group.filePath,
-      changeCount: group.changes.length,
+      item: rawItem,
+      filePath,
+      changeCount: 1,
     } satisfies TimelineItem;
   });
 }
@@ -331,6 +291,31 @@ export function timelineItemTurnId(item: TimelineItem): string | null {
   if ('turnId' in item && typeof item.turnId === 'string') return item.turnId;
   const separator = item.id.indexOf(':');
   return separator > 0 ? item.id.slice(0, separator) : null;
+}
+
+function hasStringAtPath(value: unknown, path: string[]): boolean {
+  return stringAtPath(value, path) !== null;
+}
+
+export function fileChangeHasInlineDiff(item: Extract<TimelineItem, { kind: 'fileChange' }>): boolean {
+  const itemRecord = item.item as Record<string, unknown>;
+  const changes: unknown[] = Array.isArray(itemRecord.changes) ? itemRecord.changes : [item.item];
+  return changes.some((change) =>
+    hasStringAtPath(change, ['diff']) ||
+    hasStringAtPath(change, ['patch']) ||
+    hasStringAtPath(change, ['unifiedDiff']) ||
+    hasStringAtPath(change, ['unified_diff']) ||
+    hasStringAtPath(change, ['before']) ||
+    hasStringAtPath(change, ['after']) ||
+    hasStringAtPath(change, ['oldText']) ||
+    hasStringAtPath(change, ['newText']) ||
+    hasStringAtPath(change, ['old_text']) ||
+    hasStringAtPath(change, ['new_text']) ||
+    hasStringAtPath(change, ['beforeContent']) ||
+    hasStringAtPath(change, ['afterContent']) ||
+    hasStringAtPath(change, ['before_content']) ||
+    hasStringAtPath(change, ['after_content'])
+  );
 }
 
 export function shouldShowLiveStreamingItem(items: TimelineItem[], liveItem: Extract<TimelineItem, { kind: 'streaming' }> | null): boolean {

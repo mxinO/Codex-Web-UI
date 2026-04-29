@@ -8,6 +8,7 @@ import {
   notificationIsTurnComplete,
   notificationMatchesActiveTurn,
   latestCompletionNotificationCount,
+  fileChangeHasInlineDiff,
   liveStreamingItemForTimeline,
   liveTimelineItemsFromNotifications,
   requestKey,
@@ -70,6 +71,74 @@ describe('timeline', () => {
           { path: '/repo/b.txt', changeCount: 1 },
         ],
       },
+    ]);
+  });
+
+  it('splits multiple raw changes from one Codex fileChange item into per-edit history cards', () => {
+    const turn: CodexTurn = {
+      id: 'turn-file',
+      status: 'completed',
+      startedAt: 10,
+      completedAt: 11,
+      items: [
+        {
+          type: 'fileChange',
+          id: 'f1',
+          status: 'completed',
+          changes: [
+            { path: '/repo/a.txt', kind: { type: 'add' }, diff: 'first\n' },
+            { path: '/repo/a.txt', kind: { type: 'update' }, diff: '@@ -1 +1 @@\n-first\n+second\n' },
+          ],
+        },
+      ],
+    };
+
+    const items = turnToTimelineItems(turn);
+    const fileChanges = items.filter((item): item is Extract<TimelineItem, { kind: 'fileChange' }> => item.kind === 'fileChange');
+    const fileSummary = items.find((item): item is Extract<TimelineItem, { kind: 'fileChangeSummary' }> => item.kind === 'fileChangeSummary');
+
+    expect(items.map((item) => item.kind)).toEqual(['fileChange', 'fileChange', 'fileChangeSummary']);
+    expect(fileChanges.map((item) => item.id)).toEqual(['turn-file:f1:edit:0', 'turn-file:f1:edit:1']);
+    expect(fileChanges.map((item) => item.changeCount)).toEqual([1, 1]);
+    expect(fileChanges.map((item) => (item.item as { changes: unknown[] }).changes)).toEqual([
+      [{ path: '/repo/a.txt', kind: { type: 'add' }, diff: 'first\n' }],
+      [{ path: '/repo/a.txt', kind: { type: 'update' }, diff: '@@ -1 +1 @@\n-first\n+second\n' }],
+    ]);
+    expect(fileSummary?.files).toEqual([{ path: '/repo/a.txt', changeCount: 2 }]);
+  });
+
+  it('splits multi-path raw changes into per-edit history cards and per-file summary counts', () => {
+    const turn: CodexTurn = {
+      id: 'turn-file',
+      status: 'completed',
+      startedAt: 10,
+      completedAt: 11,
+      items: [
+        {
+          type: 'fileChange',
+          id: 'f1',
+          status: 'completed',
+          changes: [
+            { path: '/repo/a.txt', diff: '@@ -1 +1 @@\n-a\n+b\n' },
+            { path: '/repo/b.txt', diff: 'created\n' },
+            { path: '/repo/a.txt', diff: '@@ -2 +2 @@\n-c\n+d\n' },
+          ],
+        },
+      ],
+    };
+
+    const items = turnToTimelineItems(turn);
+    const fileChanges = items.filter((item): item is Extract<TimelineItem, { kind: 'fileChange' }> => item.kind === 'fileChange');
+    const fileSummary = items.find((item): item is Extract<TimelineItem, { kind: 'fileChangeSummary' }> => item.kind === 'fileChangeSummary');
+
+    expect(fileChanges.map((item) => ({ id: item.id, path: item.filePath, count: item.changeCount }))).toEqual([
+      { id: 'turn-file:f1:edit:0', path: '/repo/a.txt', count: 1 },
+      { id: 'turn-file:f1:edit:1', path: '/repo/b.txt', count: 1 },
+      { id: 'turn-file:f1:edit:2', path: '/repo/a.txt', count: 1 },
+    ]);
+    expect(fileSummary?.files).toEqual([
+      { path: '/repo/a.txt', changeCount: 2 },
+      { path: '/repo/b.txt', changeCount: 1 },
     ]);
   });
 
@@ -449,6 +518,36 @@ describe('timeline', () => {
 
     expect(items.map((item) => item.kind)).toEqual(['command', 'fileChange', 'tool']);
     expect(items.map((item) => item.id)).toEqual(['turn-1:cmd-1', 'turn-1:file-1', 'turn-1:tool-1']);
+  });
+
+  it('detects file-change cards that already carry per-edit diff data', () => {
+    expect(
+      fileChangeHasInlineDiff({
+        id: 'turn-1:file-1',
+        kind: 'fileChange',
+        timestamp: 100,
+        turnId: 'turn-1',
+        item: {
+          type: 'fileChange',
+          id: 'file-1',
+          changes: [{ path: '/repo/a.txt', diff: '@@ -1 +1 @@\n-old\n+new\n' }],
+          status: 'completed',
+        },
+        filePath: '/repo/a.txt',
+        changeCount: 1,
+      }),
+    ).toBe(true);
+    expect(
+      fileChangeHasInlineDiff({
+        id: 'turn-1:file:/repo/a.txt',
+        kind: 'fileChange',
+        timestamp: 100,
+        turnId: 'turn-1',
+        item: { type: 'fileChange', id: 'summary:/repo/a.txt', changes: [{ path: '/repo/a.txt' }], status: 'completed' },
+        filePath: '/repo/a.txt',
+        changeCount: 3,
+      }),
+    ).toBe(false);
   });
 
   it('ignores live deltas from a different thread', () => {

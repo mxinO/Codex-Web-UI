@@ -28,6 +28,7 @@ import {
 import { parseSlashCommand } from './lib/slashCommands';
 import {
   approvalItemsFromRequests,
+  fileChangeHasInlineDiff,
   latestCompletionNotificationCount,
   liveStreamingItemForTimeline,
   liveStreamingItemFromNotifications,
@@ -378,6 +379,10 @@ export default function App() {
 
   const openDetailItem = useCallback((item: TimelineItem) => {
     if (item.kind !== 'fileChange') {
+      setDetailItem(item);
+      return;
+    }
+    if (fileChangeHasInlineDiff(item)) {
       setDetailItem(item);
       return;
     }
