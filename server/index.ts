@@ -10,8 +10,11 @@ import { readConfig } from './config.js';
 import { resolveExistingPathInsideRoot, resolveWritablePathInsideRoot } from './fileTransfer.js';
 import { HostStateStore } from './hostState.js';
 import { logError, logInfo } from './logger.js';
+import { resolvePackageRoot, resolveStartCwd } from './paths.js';
 
 const config = readConfig();
+const packageRoot = resolvePackageRoot();
+const startCwd = resolveStartCwd();
 const app = express();
 const server = http.createServer(app);
 const stateStore = new HostStateStore(config.stateDir, config.hostname);
@@ -20,7 +23,7 @@ const tokenHash = hashToken(token);
 
 stateStore.update((state) => ({ ...state, authTokenHash: tokenHash }));
 
-const codex = new CodexAppServer({ cwd: process.cwd(), mock: config.mock });
+const codex = new CodexAppServer({ cwd: startCwd, mock: config.mock });
 await codex.start();
 stateStore.update((state) => ({
   ...state,
@@ -94,7 +97,7 @@ app.get('/api/status', (req, res) => {
   });
 });
 
-const dist = path.join(process.cwd(), 'dist');
+const dist = path.join(packageRoot, 'dist');
 const indexHtml = path.join(dist, 'index.html');
 app.use(express.static(dist));
 app.get('*', (_req, res) => {
