@@ -11,11 +11,21 @@ export interface FileEditSnapshotInput {
   createdAtMs?: number;
 }
 
+export interface FileEditPatchSnapshotInput extends FileEditSnapshotInput {
+  source?: string;
+  replaceBefore?: boolean;
+}
+
 export interface FileEditFinalizeInput {
   turnId: string;
   path: string;
   after: string;
   updatedAtMs?: number;
+}
+
+export interface FileEditPathInput {
+  turnId: string;
+  path: string;
 }
 
 export interface StoredFileDiff {
@@ -44,6 +54,7 @@ interface DiffRow {
   path: string;
   before_text: string | null;
   after_text: string | null;
+  source: string;
   edit_count: number;
   updated_at_ms: number | null;
 }
@@ -102,6 +113,77 @@ export class FileEditStore {
     insert();
   }
 
+  recordPatchSnapshot(input: FileEditPatchSnapshotInput): void {
+    const createdAtMs = nowMs(input.createdAtMs);
+    const hash = pathHash(input.path);
+    const source = input.source ?? 'patch';
+    const replaceBefore = input.replaceBefore ? 1 : 0;
+    const insert = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `INSERT INTO file_edit_events
+            (turn_id, item_id, path_hash, path, before_text, after_text, source, created_at_ms, updated_at_ms)
+           VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+        )
+        .run(input.turnId, input.itemId ?? null, hash, input.path, input.before, source, createdAtMs, createdAtMs);
+
+      this.db
+        .prepare(
+          `INSERT INTO turn_file_diffs
+            (turn_id, path_hash, path, before_text, after_text, source, edit_count, created_at_ms, updated_at_ms)
+           VALUES (?, ?, ?, ?, NULL, ?, 1, ?, ?)
+           ON CONFLICT(turn_id, path_hash) DO UPDATE SET
+             path = excluded.path,
+             before_text = CASE
+               WHEN ? = 1 THEN excluded.before_text
+               ELSE COALESCE(turn_file_diffs.before_text, excluded.before_text)
+             END,
+             source = CASE
+               WHEN ? = 1 OR turn_file_diffs.before_text IS NULL THEN excluded.source
+               ELSE turn_file_diffs.source
+             END,
+             edit_count = turn_file_diffs.edit_count + 1,
+             updated_at_ms = excluded.updated_at_ms`,
+        )
+        .run(input.turnId, hash, input.path, input.before, source, createdAtMs, createdAtMs, replaceBefore, replaceBefore);
+    });
+    insert();
+  }
+
+  discardPatchDiff(input: FileEditPathInput): void {
+    const hash = pathHash(input.path);
+    const discard = this.db.transaction(() => {
+      const fallback = this.db
+        .prepare(
+          `SELECT path, before_text, source
+           FROM file_edit_events
+           WHERE turn_id = ? AND path_hash = ? AND source != 'patch'
+           ORDER BY id ASC
+           LIMIT 1`,
+        )
+        .get(input.turnId, hash) as Pick<DiffRow, 'path' | 'before_text' | 'source'> | undefined;
+
+      if (fallback) {
+        this.db
+          .prepare(
+            `UPDATE turn_file_diffs
+             SET path = ?, before_text = ?, source = ?, updated_at_ms = ?
+             WHERE turn_id = ? AND path_hash = ?`,
+          )
+          .run(fallback.path, fallback.before_text ?? '', fallback.source, Date.now(), input.turnId, hash);
+        return;
+      }
+
+      this.db
+        .prepare(
+          `DELETE FROM turn_file_diffs
+           WHERE turn_id = ? AND path_hash = ? AND source = 'patch'`,
+        )
+        .run(input.turnId, hash);
+    });
+    discard();
+  }
+
   finalizeFile(input: FileEditFinalizeInput): void {
     const updatedAtMs = nowMs(input.updatedAtMs);
     const hash = pathHash(input.path);
@@ -153,16 +235,16 @@ export class FileEditStore {
     };
   }
 
-  getSnapshot(turnId: string, filePath: string): { path: string; before: string; editCount: number } | null {
+  getSnapshot(turnId: string, filePath: string): { path: string; before: string; editCount: number; source: string } | null {
     const row = this.db
       .prepare(
-        `SELECT path, before_text, edit_count
+        `SELECT path, before_text, edit_count, source
          FROM turn_file_diffs
          WHERE turn_id = ? AND path_hash = ?`,
       )
-      .get(turnId, pathHash(filePath)) as Pick<DiffRow, 'path' | 'before_text' | 'edit_count'> | undefined;
+      .get(turnId, pathHash(filePath)) as Pick<DiffRow, 'path' | 'before_text' | 'edit_count' | 'source'> | undefined;
     if (!row) return null;
-    return { path: row.path, before: row.before_text ?? '', editCount: row.edit_count };
+    return { path: row.path, before: row.before_text ?? '', editCount: row.edit_count, source: row.source };
   }
 
   listTurnFiles(turnId: string): TurnFileSummary[] {

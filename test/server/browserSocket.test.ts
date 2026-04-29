@@ -682,6 +682,336 @@ describe('attachBrowserSocket app-server requests', () => {
     });
   });
 
+  it('uses patch apply notifications to build active tray diffs from the first edit in a turn', async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const threadPath = join(sessionDir, 'rollout-2026-04-29T00-00-00-thread-1.jsonl');
+    const filePath = join(root, 'patch-notification.txt');
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: root, path: threadPath } } as T;
+      if (method === 'turn/start') return { turn: { id: 'turn-1' } } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    writeFileSync(threadPath, '');
+    writeFileSync(filePath, 'title\n\nline one\n');
+    stateStore.update((state) => ({
+      ...state,
+      activeCwd: root,
+      activeThreadId: 'thread-1',
+      activeTurnId: null,
+      activeThreadPath: threadPath,
+    }));
+    ws.send(JSON.stringify({ type: 'rpc', id: 66, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'edit' } }));
+    expect(await nextRpcResponse(ws, 66)).toEqual({ type: 'rpc/result', id: 66, result: { turn: { id: 'turn-1' } } });
+
+    writeFileSync(filePath, 'title changed\n\nline one\n');
+    notify('event_msg', {
+      type: 'patch_apply_end',
+      turn_id: 'turn-1',
+      call_id: 'patch-1',
+      changes: {
+        [filePath]: {
+          type: 'update',
+          unified_diff: '@@ -1,3 +1,3 @@\n-title\n+title changed\n \n line one\n',
+        },
+      },
+    });
+
+    writeFileSync(filePath, 'title changed\n\nline one\nline two\n');
+    notify('event_msg', {
+      type: 'patch_apply_end',
+      turn_id: 'turn-1',
+      call_id: 'patch-2',
+      changes: {
+        [filePath]: {
+          type: 'update',
+          unified_diff: '@@ -3 +3,2 @@\n line one\n+line two\n',
+        },
+      },
+    });
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      ws.send(
+        JSON.stringify({
+          type: 'rpc',
+          id: 6700 + attempt,
+          method: 'webui/fileChange/diff',
+          params: { threadId: 'thread-1', threadPath, turnId: 'turn-1', path: filePath, changes: [{ path: filePath }] },
+        }),
+      );
+      const response = await nextRpcResponse(ws, 6700 + attempt);
+      const result = response.result as { source?: string; after?: string } | undefined;
+      if (result?.source === 'stored' && result.after === 'title changed\n\nline one\nline two\n') break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 67,
+        method: 'webui/fileChange/diff',
+        params: { threadId: 'thread-1', threadPath, turnId: 'turn-1', path: filePath, changes: [{ path: filePath }] },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 67)).toEqual({
+      type: 'rpc/result',
+      id: 67,
+      result: {
+        path: filePath,
+        before: 'title\n\nline one\n',
+        after: 'title changed\n\nline one\nline two\n',
+        source: 'stored',
+      },
+    });
+  });
+
+  it('does not overwrite a persisted turn-start baseline with an incomplete patch sequence', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, notify } = await makeHarness(request);
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const threadPath = join(sessionDir, 'rollout-2026-04-29T00-00-00-thread-1.jsonl');
+    const filePath = join(root, 'patch-after-restart.txt');
+    writeFileSync(threadPath, '');
+    writeFileSync(filePath, 'middle\n');
+    const store = new FileEditStore(sessionFileEditDbPath(threadPath));
+    store.recordSnapshot({ turnId: 'turn-1', itemId: 'snapshot-1', path: filePath, before: 'turn start\n' });
+    store.finalizeFile({ turnId: 'turn-1', path: filePath, after: 'middle\n' });
+    store.close();
+    stateStore.update((state) => ({
+      ...state,
+      activeCwd: root,
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-1',
+      activeThreadPath: threadPath,
+    }));
+
+    writeFileSync(filePath, 'final\n');
+    notify('event_msg', {
+      type: 'patch_apply_end',
+      turn_id: 'turn-1',
+      call_id: 'patch-after-restart',
+      changes: {
+        [filePath]: {
+          type: 'update',
+          unified_diff: '@@ -1 +1 @@\n-middle\n+final\n',
+        },
+      },
+    });
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      ws.send(
+        JSON.stringify({
+          type: 'rpc',
+          id: 6800 + attempt,
+          method: 'webui/fileChange/diff',
+          params: { threadId: 'thread-1', threadPath, turnId: 'turn-1', path: filePath, changes: [{ path: filePath }] },
+        }),
+      );
+      const response = await nextRpcResponse(ws, 6800 + attempt);
+      const result = response.result as { source?: string; after?: string } | undefined;
+      if (result?.source === 'stored' && result.after === 'final\n') break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 68,
+        method: 'webui/fileChange/diff',
+        params: { threadId: 'thread-1', threadPath, turnId: 'turn-1', path: filePath, changes: [{ path: filePath }] },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 68)).toEqual({
+      type: 'rpc/result',
+      id: 68,
+      result: { path: filePath, before: 'turn start\n', after: 'final\n', source: 'stored' },
+    });
+  });
+
+  it('restores a snapshot baseline when patch notifications are not a valid ordered sequence', async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const threadPath = join(sessionDir, 'rollout-2026-04-29T00-00-00-thread-1.jsonl');
+    const filePath = join(root, 'out-of-order-patches.txt');
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: root, path: threadPath } } as T;
+      if (method === 'turn/start') return { turn: { id: 'turn-1' } } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    writeFileSync(threadPath, '');
+    writeFileSync(filePath, 'c\n');
+    stateStore.update((state) => ({
+      ...state,
+      activeCwd: root,
+      activeThreadId: 'thread-1',
+      activeTurnId: null,
+      activeThreadPath: threadPath,
+    }));
+    ws.send(JSON.stringify({ type: 'rpc', id: 69, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'edit' } }));
+    expect(await nextRpcResponse(ws, 69)).toEqual({ type: 'rpc/result', id: 69, result: { turn: { id: 'turn-1' } } });
+    const store = new FileEditStore(sessionFileEditDbPath(threadPath));
+    store.recordSnapshot({ turnId: 'turn-1', itemId: 'snapshot-1', path: filePath, before: 'a\n' });
+    store.finalizeFile({ turnId: 'turn-1', path: filePath, after: 'b\n' });
+    store.close();
+
+    notify('event_msg', {
+      type: 'patch_apply_end',
+      turn_id: 'turn-1',
+      call_id: 'patch-2-first',
+      changes: {
+        [filePath]: {
+          type: 'update',
+          unified_diff: '@@ -1 +1 @@\n-b\n+c\n',
+        },
+      },
+    });
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      ws.send(
+        JSON.stringify({
+          type: 'rpc',
+          id: 6900 + attempt,
+          method: 'webui/fileChange/diff',
+          params: { threadId: 'thread-1', threadPath, turnId: 'turn-1', path: filePath, changes: [{ path: filePath }] },
+        }),
+      );
+      const response = await nextRpcResponse(ws, 6900 + attempt);
+      const result = response.result as { source?: string; after?: string } | undefined;
+      if (result?.source === 'stored' && result.after === 'c\n') break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+
+    notify('event_msg', {
+      type: 'patch_apply_end',
+      turn_id: 'turn-1',
+      call_id: 'patch-1-late',
+      changes: {
+        [filePath]: {
+          type: 'update',
+          unified_diff: '@@ -1 +1 @@\n-a\n+b\n',
+        },
+      },
+    });
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      ws.send(
+        JSON.stringify({
+          type: 'rpc',
+          id: 6950 + attempt,
+          method: 'webui/fileChange/diff',
+          params: { threadId: 'thread-1', threadPath, turnId: 'turn-1', path: filePath, changes: [{ path: filePath }] },
+        }),
+      );
+      const response = await nextRpcResponse(ws, 6950 + attempt);
+      const result = response.result as { source?: string; before?: string; after?: string } | undefined;
+      if (result?.source === 'stored' && result.before === 'a\n' && result.after === 'c\n') break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 70,
+        method: 'webui/fileChange/diff',
+        params: { threadId: 'thread-1', threadPath, turnId: 'turn-1', path: filePath, changes: [{ path: filePath }] },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 70)).toEqual({
+      type: 'rpc/result',
+      id: 70,
+      result: { path: filePath, before: 'a\n', after: 'c\n', source: 'stored' },
+    });
+  });
+
+  it('captures late multi-patch notifications after turn completion', async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const threadPath = join(sessionDir, 'rollout-2026-04-29T00-00-00-thread-1.jsonl');
+    const filePath = join(root, 'late-patch.txt');
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: root, path: threadPath } } as T;
+      if (method === 'turn/start') return { turn: { id: 'turn-1' } } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    writeFileSync(threadPath, '');
+    writeFileSync(filePath, 'before\n');
+    stateStore.update((state) => ({
+      ...state,
+      activeCwd: root,
+      activeThreadId: 'thread-1',
+      activeTurnId: null,
+      activeThreadPath: threadPath,
+    }));
+    ws.send(JSON.stringify({ type: 'rpc', id: 71, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'edit' } }));
+    expect(await nextRpcResponse(ws, 71)).toEqual({ type: 'rpc/result', id: 71, result: { turn: { id: 'turn-1' } } });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-1' });
+    await flushPromises();
+    writeFileSync(filePath, 'after\n');
+    notify('event_msg', {
+      type: 'patch_apply_end',
+      turn_id: 'turn-1',
+      call_id: 'late-patch-1',
+      changes: {
+        [filePath]: {
+          type: 'update',
+          unified_diff: '@@ -1 +1 @@\n-before\n+middle\n',
+        },
+      },
+    });
+    notify('event_msg', {
+      type: 'patch_apply_end',
+      turn_id: 'turn-1',
+      call_id: 'late-patch-2',
+      changes: {
+        [filePath]: {
+          type: 'update',
+          unified_diff: '@@ -1 +1 @@\n-middle\n+after\n',
+        },
+      },
+    });
+
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      ws.send(
+        JSON.stringify({
+          type: 'rpc',
+          id: 7100 + attempt,
+          method: 'webui/fileChange/diff',
+          params: { threadId: 'thread-1', threadPath, turnId: 'turn-1', path: filePath, changes: [{ path: filePath }] },
+        }),
+      );
+      const response = await nextRpcResponse(ws, 7100 + attempt);
+      const result = response.result as { source?: string; after?: string } | undefined;
+      if (result?.source === 'stored' && result.after === 'after\n') break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 72,
+        method: 'webui/fileChange/diff',
+        params: { threadId: 'thread-1', threadPath, turnId: 'turn-1', path: filePath, changes: [{ path: filePath }] },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 72)).toEqual({
+      type: 'rpc/result',
+      id: 72,
+      result: { path: filePath, before: 'before\n', after: 'after\n', source: 'stored' },
+    });
+  });
+
   it('finalizes a completed turn using its captured session path after switching sessions', async () => {
     const request = vi.fn<CodexAppServer['request']>();
     const { ws, stateStore, requestFromServer, notify } = await makeHarness(request);
@@ -1497,7 +1827,7 @@ describe('attachBrowserSocket app-server lifecycle', () => {
 
   it('resumes the active thread before starting a turn after app-server restart', async () => {
     const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
-      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project' } } as T;
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T;
       if (method === 'turn/start') return { turn: { id: 'turn-1' } } as T;
       throw new Error(`unexpected method: ${method}`);
     });
@@ -1516,6 +1846,7 @@ describe('attachBrowserSocket app-server lifecycle', () => {
     expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'turn/start']);
     expect(start.mock.invocationCallOrder[0]).toBeLessThan(request.mock.invocationCallOrder[0]);
     expect(request.mock.invocationCallOrder[0]).toBeLessThan(request.mock.invocationCallOrder[1]);
+    expect(stateStore.read()).toMatchObject({ activeThreadPath: '/sessions/thread-1.jsonl', activeTurnId: 'turn-1' });
   });
 });
 

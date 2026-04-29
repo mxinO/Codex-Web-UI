@@ -105,6 +105,10 @@ const BROWSE_DIRECTORY_LIMIT = 500;
 const FILE_DIFF_SNAPSHOT_MAX_BYTES = 1024 * 1024;
 const FILE_DIFF_SNAPSHOT_TTL_MS = 10 * 60 * 1000;
 const FILE_DIFF_SNAPSHOT_MAX_ENTRIES = 50;
+const FILE_DIFF_PATCH_MAX_PATCHES_PER_FILE = 100;
+const FILE_DIFF_PATCH_MAX_BYTES_PER_FILE = FILE_DIFF_SNAPSHOT_MAX_BYTES;
+const FILE_DIFF_PATCH_MAX_PENDING_NOTIFICATIONS = 100;
+const FILE_DIFF_PATCH_MAX_INCOMPLETE_TURNS = 200;
 
 function getOptionalString(params: unknown, key: string): string | null {
   if (!isRecord(params) || !hasOwn(params, key)) return null;
@@ -364,6 +368,21 @@ interface FileSnapshot {
   createdAt: number;
 }
 
+interface PatchSnapshot {
+  threadId: string | null;
+  turnId: string;
+  patches: string[];
+  bytes: number;
+  updatedAt: number;
+  complete: boolean;
+}
+
+interface TurnContext {
+  threadId: string | null;
+  threadPath: string | null;
+  cwd: string | null;
+}
+
 interface FileDiffParams {
   threadId: string | null;
   threadPath: string | null;
@@ -516,6 +535,7 @@ function applyUnifiedPatch(content: string, patch: string): string | null {
       output.push(source[sourceIndex]);
       sourceIndex += 1;
     }
+    if (sourceIndex < targetIndex) return null;
 
     index += 1;
     while (index < lines.length && !lines[index].startsWith('@@ ')) {
@@ -539,6 +559,71 @@ function applyUnifiedPatch(content: string, patch: string): string | null {
       } else if (marker === '+') {
         output.push(text);
         trailingNewline = true;
+      }
+      index += 1;
+    }
+  }
+
+  if (!applied) return null;
+  while (sourceIndex < source.length) {
+    output.push(source[sourceIndex]);
+    sourceIndex += 1;
+  }
+  return joinContentLines(output, trailingNewline);
+}
+
+function reverseUnifiedPatch(content: string, patch: string): string | null {
+  const source = splitContentLines(content);
+  const output: string[] = [];
+  let sourceIndex = 0;
+  let trailingNewline = content.endsWith('\n');
+  const lines = patch.split('\n');
+  let index = 0;
+  let applied = false;
+
+  while (index < lines.length) {
+    const header = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(lines[index]);
+    if (!header) {
+      index += 1;
+      continue;
+    }
+
+    applied = true;
+    const newStart = Number(header[1]);
+    const targetIndex = newStart > 0 ? newStart - 1 : 0;
+    if (targetIndex < sourceIndex) return null;
+    while (sourceIndex < targetIndex && sourceIndex < source.length) {
+      output.push(source[sourceIndex]);
+      sourceIndex += 1;
+    }
+    if (sourceIndex < targetIndex) return null;
+
+    index += 1;
+    while (index < lines.length && !lines[index].startsWith('@@ ')) {
+      const line = lines[index];
+      if (line === '\\ No newline at end of file') {
+        trailingNewline = false;
+        index += 1;
+        continue;
+      }
+      if (!line) {
+        index += 1;
+        continue;
+      }
+      const marker = line[0];
+      const text = line.slice(1);
+      if (marker === ' ') {
+        if (source[sourceIndex] !== text) return null;
+        output.push(text);
+        sourceIndex += 1;
+      } else if (marker === '+') {
+        if (source[sourceIndex] !== text) return null;
+        sourceIndex += 1;
+      } else if (marker === '-') {
+        output.push(text);
+        trailingNewline = true;
+      } else {
+        return null;
       }
       index += 1;
     }
@@ -618,6 +703,12 @@ function extractResolvedRequestId(message: { method: string; params?: unknown })
   return typeof requestId === 'string' || typeof requestId === 'number' ? requestId : null;
 }
 
+function patchApplyPayload(message: { params?: unknown }): Record<string, unknown> | null {
+  if (!isRecord(message.params)) return null;
+  const payload = isRecord(message.params.payload) ? message.params.payload : message.params;
+  return getStringPath(payload, ['type']) === 'patch_apply_end' ? payload : null;
+}
+
 export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps): BrowserSocketCleanup {
   const wss = new WebSocketServer({ server, path: '/ws' });
   let closed = false;
@@ -628,9 +719,15 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const resumeThreadPromises = new Map<string, Promise<void>>();
   const knownThreadPaths = new Map<string, string>();
   const fileSnapshots = new Map<string, FileSnapshot>();
+  const patchSnapshots = new Map<string, PatchSnapshot>();
+  const incompletePatchTurnKeys = new Set<string>();
+  let patchCaptureChain: Promise<void> = Promise.resolve();
+  let patchCaptureQueueDepth = 0;
   const completingTurnKeys = new Set<string>();
   const completedTurnKeys = new Set<string>();
   const turnThreadPaths = new Map<string, string>();
+  const turnCwds = new Map<string, string>();
+  const livePatchTurnKeys = new Set<string>();
 
   const turnKey = (threadId: string | null, turnId: string): string => `${threadId ?? ''}\0${turnId}`;
 
@@ -697,7 +794,47 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       const oldest = turnThreadPaths.keys().next().value;
       if (typeof oldest !== 'string') break;
       turnThreadPaths.delete(oldest);
+      turnCwds.delete(oldest);
     }
+  };
+
+  const rememberTurnCwd = (threadId: string | null, turnId: string | null, cwd: string | null) => {
+    if (!turnId || !cwd) return;
+    turnCwds.set(turnKey(threadId, turnId), cwd);
+    while (turnCwds.size > 200) {
+      const oldest = turnCwds.keys().next().value;
+      if (typeof oldest !== 'string') break;
+      turnCwds.delete(oldest);
+      turnThreadPaths.delete(oldest);
+    }
+  };
+
+  const findTurnContext = (preferredThreadId: string | null, turnId: string, state: HostRuntimeState): TurnContext => {
+    const exactKey = turnKey(preferredThreadId, turnId);
+    let threadId = preferredThreadId;
+    let threadPath = turnThreadPaths.get(exactKey) ?? null;
+    let cwd = turnCwds.get(exactKey) ?? null;
+
+    if (!threadPath || !cwd) {
+      const suffix = `\0${turnId}`;
+      for (const key of new Set([...turnThreadPaths.keys(), ...turnCwds.keys()])) {
+        if (!key.endsWith(suffix)) continue;
+        const matchedThreadId = key.slice(0, -suffix.length) || null;
+        threadId = threadId ?? matchedThreadId;
+        threadPath = threadPath ?? turnThreadPaths.get(key) ?? null;
+        cwd = cwd ?? turnCwds.get(key) ?? null;
+        if (threadPath && cwd) break;
+      }
+    }
+
+    const activeTurn = state.activeTurnId === turnId && (!threadId || threadId === state.activeThreadId);
+    if (activeTurn) {
+      threadId = threadId ?? state.activeThreadId;
+      threadPath = threadPath ?? state.activeThreadPath;
+      cwd = cwd ?? state.activeCwd;
+    }
+
+    return { threadId, threadPath, cwd };
   };
 
   const pruneFileSnapshots = () => {
@@ -709,6 +846,92 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       const oldest = fileSnapshots.keys().next().value;
       if (typeof oldest !== 'string') break;
       fileSnapshots.delete(oldest);
+    }
+  };
+
+  const prunePatchSnapshots = () => {
+    const now = Date.now();
+    const incompleteSnapshots: PatchSnapshot[] = [];
+    for (const snapshot of patchSnapshots.values()) {
+      if (now - snapshot.updatedAt > FILE_DIFF_SNAPSHOT_TTL_MS) {
+        incompleteSnapshots.push(snapshot);
+      }
+    }
+    for (const snapshot of incompleteSnapshots) markPatchTurnIncomplete(snapshot.threadId, snapshot.turnId);
+    while (patchSnapshots.size > FILE_DIFF_SNAPSHOT_MAX_ENTRIES) {
+      const oldest = patchSnapshots.values().next().value;
+      if (!oldest) break;
+      markPatchTurnIncomplete(oldest.threadId, oldest.turnId);
+    }
+  };
+
+  function isPatchTurnIncomplete(threadId: string | null, turnId: string): boolean {
+    return incompletePatchTurnKeys.has(turnKey(threadId, turnId)) || incompletePatchTurnKeys.has(turnKey(null, turnId));
+  }
+
+  function markPatchTurnIncomplete(threadId: string | null, turnId: string): void {
+    const scoped = `${threadId ?? ''}\0${turnId}\0`;
+    const unscoped = `\0${turnId}\0`;
+    for (const key of patchSnapshots.keys()) {
+      if (key.startsWith(scoped) || key.startsWith(unscoped)) patchSnapshots.delete(key);
+    }
+    const key = turnKey(threadId, turnId);
+    incompletePatchTurnKeys.add(key);
+    livePatchTurnKeys.delete(key);
+    livePatchTurnKeys.delete(turnKey(null, turnId));
+    while (incompletePatchTurnKeys.size > FILE_DIFF_PATCH_MAX_INCOMPLETE_TURNS) {
+      const oldest = incompletePatchTurnKeys.keys().next().value;
+      if (typeof oldest !== 'string') break;
+      incompletePatchTurnKeys.delete(oldest);
+      livePatchTurnKeys.delete(oldest);
+      const separator = oldest.indexOf('\0');
+      if (separator >= 0) livePatchTurnKeys.delete(turnKey(null, oldest.slice(separator + 1)));
+    }
+  }
+
+  const appendTurnPatch = (threadId: string | null, turnId: string, key: string, patch: string, complete: boolean): PatchSnapshot | null => {
+    prunePatchSnapshots();
+    if (isPatchTurnIncomplete(threadId, turnId)) return null;
+    const patchBytes = Buffer.byteLength(patch, 'utf8');
+    if (patchBytes > FILE_DIFF_PATCH_MAX_BYTES_PER_FILE) {
+      markPatchTurnIncomplete(threadId, turnId);
+      return null;
+    }
+
+    const snapshot = patchSnapshots.get(key) ?? { threadId, turnId, patches: [], bytes: 0, updatedAt: Date.now(), complete };
+    if (
+      snapshot.patches.length >= FILE_DIFF_PATCH_MAX_PATCHES_PER_FILE ||
+      snapshot.bytes + patchBytes > FILE_DIFF_PATCH_MAX_BYTES_PER_FILE
+    ) {
+      markPatchTurnIncomplete(threadId, turnId);
+      return null;
+    }
+
+    snapshot.patches.push(patch);
+    snapshot.bytes += patchBytes;
+    snapshot.updatedAt = Date.now();
+    snapshot.complete = snapshot.complete && complete;
+    patchSnapshots.set(key, snapshot);
+    return snapshot;
+  };
+
+  const beforeFromTurnPatches = (snapshot: PatchSnapshot, after: string): string | null => {
+    let before = after;
+    for (const candidate of [...snapshot.patches].reverse()) {
+      const previous = reverseUnifiedPatch(before, candidate);
+      if (previous === null) return null;
+      before = previous;
+    }
+    return before;
+  };
+
+  const rememberLivePatchTurn = (threadId: string | null, turnId: string | null) => {
+    if (!turnId) return;
+    livePatchTurnKeys.add(turnKey(threadId, turnId));
+    while (livePatchTurnKeys.size > 200) {
+      const oldest = livePatchTurnKeys.keys().next().value;
+      if (typeof oldest !== 'string') break;
+      livePatchTurnKeys.delete(oldest);
     }
   };
 
@@ -735,6 +958,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         }
         if (store && state.activeTurnId) {
           rememberTurnThreadPath(state.activeThreadId, state.activeTurnId, state.activeThreadPath);
+          rememberTurnCwd(state.activeThreadId, state.activeTurnId, state.activeCwd);
           store.recordSnapshot({
             turnId: state.activeTurnId,
             itemId: String(requestId),
@@ -751,6 +975,97 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     if (storedAny && state.activeThreadId && state.activeTurnId) {
       broadcastFileChangeSummaryChanged(state.activeThreadId, state.activeTurnId);
     }
+  };
+
+  const capturePatchApplyPayload = async (payload: Record<string, unknown>) => {
+    if (!isRecord(payload.changes)) return;
+    const state = deps.stateStore.read();
+    const turnId = getStringPath(payload, ['turn_id']) ?? getStringPath(payload, ['turnId']);
+    if (!turnId) return;
+
+    const activeThreadId = state.activeTurnId === turnId ? state.activeThreadId : null;
+    const turnContext = findTurnContext(activeThreadId, turnId, state);
+    const store = openFileEditStore(turnContext.threadPath);
+    if (!store) return;
+
+    let storedAny = false;
+    try {
+      for (const [filePath, rawChange] of Object.entries(payload.changes)) {
+        if (!isRecord(rawChange)) continue;
+        const patch = getStringPath(rawChange, ['unified_diff']) ?? diffText(rawChange);
+        if (!patch) continue;
+
+        let resolvedPath: string;
+        try {
+          resolvedPath = turnContext.cwd ? resolveSnapshotPathInsideRoot(turnContext.cwd, filePath) : (normalizedAbsolutePath(filePath) ?? '');
+          if (!resolvedPath) continue;
+        } catch {
+          continue;
+        }
+
+        const key = snapshotKey(turnContext.threadId, turnId, resolvedPath);
+        const completePatchSequence = livePatchTurnKeys.has(turnKey(turnContext.threadId, turnId));
+        const patchSnapshot = isPatch(patch) ? appendTurnPatch(turnContext.threadId, turnId, key, patch, completePatchSequence) : null;
+        const after = await readCurrentFileForDiff(resolvedPath);
+        const changeType = getStringPath(rawChange, ['type']);
+        const existingSnapshot = store.getSnapshot(turnId, resolvedPath);
+        const patchBefore = patchSnapshot ? beforeFromTurnPatches(patchSnapshot, after) : null;
+        if (patchSnapshot && patchBefore === null) {
+          if (existingSnapshot?.source === 'patch') store.discardPatchDiff({ turnId, path: resolvedPath });
+          continue;
+        }
+        const replacePatchBaseline = Boolean(patchSnapshot?.complete && (!existingSnapshot || existingSnapshot.source === 'patch'));
+        const before = replacePatchBaseline
+          ? patchBefore
+          : existingSnapshot
+            ? existingSnapshot.before
+            : changeType === 'add'
+              ? ''
+              : null;
+        if (before === null) continue;
+
+        store.recordPatchSnapshot({
+          turnId,
+          itemId: getStringPath(payload, ['call_id']) ?? null,
+          path: resolvedPath,
+          before,
+          replaceBefore: replacePatchBaseline,
+        });
+        store.finalizeFile({ turnId, path: resolvedPath, after });
+        rememberKnownThreadPath(turnContext.threadId, turnContext.threadPath);
+        rememberTurnThreadPath(turnContext.threadId, turnId, turnContext.threadPath);
+        rememberTurnCwd(turnContext.threadId, turnId, turnContext.cwd);
+        storedAny = true;
+      }
+    } finally {
+      store.close();
+    }
+
+    if (storedAny && turnContext.threadId) broadcastFileChangeSummaryChanged(turnContext.threadId, turnId);
+  };
+
+  const enqueuePatchApplyEnd = (message: { params?: unknown }) => {
+    const payload = patchApplyPayload(message);
+    if (!payload) return;
+    const turnId = getStringPath(payload, ['turn_id']) ?? getStringPath(payload, ['turnId']);
+    if (!turnId) return;
+
+    if (patchCaptureQueueDepth >= FILE_DIFF_PATCH_MAX_PENDING_NOTIFICATIONS) {
+      const state = deps.stateStore.read();
+      const activeThreadId = state.activeTurnId === turnId ? state.activeThreadId : null;
+      const turnContext = findTurnContext(activeThreadId, turnId, state);
+      markPatchTurnIncomplete(turnContext.threadId, turnId);
+      return;
+    }
+
+    patchCaptureQueueDepth += 1;
+    patchCaptureChain = patchCaptureChain
+      .catch(() => undefined)
+      .then(() => capturePatchApplyPayload(payload))
+      .catch((error) => logWarn('Failed to capture patch apply notification', error))
+      .finally(() => {
+        patchCaptureQueueDepth -= 1;
+      });
   };
 
   const findFileSnapshot = (threadId: string | null, turnId: string | null, filePath: string): FileSnapshot | null => {
@@ -918,7 +1233,22 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
     let resumePromise: Promise<void>;
     resumePromise = requestCodex('thread/resume', { threadId, persistExtendedHistory: true })
-      .then(() => {
+      .then((result) => {
+        const activeCwd = extractThreadCwd(result);
+        const activeThreadPath = extractThreadPath(result);
+        rememberKnownThreadPath(threadId, activeThreadPath);
+        if (activeCwd || activeThreadPath) {
+          deps.stateStore.update((state) =>
+            state.activeThreadId === threadId
+              ? {
+                  ...state,
+                  activeCwd: activeCwd ?? state.activeCwd,
+                  activeThreadPath: activeThreadPath ?? state.activeThreadPath,
+                  recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
+                }
+              : state,
+          );
+        }
         resumedThreadIds.add(threadId);
       })
       .finally(() => {
@@ -987,7 +1317,6 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         completingTurnKeys.delete(completionKey);
         if (finalizedForCompletionKey) {
           rememberCompletedTurnKey(completionKey);
-          turnThreadPaths.delete(completionKey);
         }
       }
       return;
@@ -1017,7 +1346,6 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         completingTurnKeys.delete(completionKey);
         if (finalizedForCompletionKey) {
           rememberCompletedTurnKey(completionKey);
-          turnThreadPaths.delete(completionKey);
         }
       }
       return;
@@ -1028,7 +1356,6 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       completingTurnKeys.delete(completionKey);
       if (finalizedForCompletionKey) {
         rememberCompletedTurnKey(completionKey);
-        turnThreadPaths.delete(completionKey);
       }
     }
 
@@ -1039,7 +1366,11 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         ...current,
         activeTurnId: current.activeThreadId === threadId ? nextTurnId : current.activeTurnId,
       }));
-      if (next.activeThreadId === threadId) rememberTurnThreadPath(threadId, nextTurnId, next.activeThreadPath);
+      if (next.activeThreadId === threadId) {
+        rememberTurnThreadPath(threadId, nextTurnId, next.activeThreadPath);
+        rememberTurnCwd(threadId, nextTurnId, next.activeCwd);
+        rememberLivePatchTurn(threadId, nextTurnId);
+      }
       broadcastHello(next);
     } catch (error) {
       logWarn('Failed to start queued turn', error);
@@ -1062,6 +1393,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     if (resolvedRequestId !== null && pendingServerRequests.delete(requestKey(resolvedRequestId))) {
       broadcastRequestResolved(resolvedRequestId);
     }
+    if (message.method === 'event_msg') enqueuePatchApplyEnd(message);
     if (message.method === 'turn/completed') void handleTurnCompleted(message);
   });
 
@@ -1456,7 +1788,11 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             ...current,
             activeTurnId: current.activeThreadId === threadId ? nextTurnId : current.activeTurnId,
           }));
-          if (state.activeThreadId === threadId) rememberTurnThreadPath(threadId, nextTurnId, state.activeThreadPath);
+          if (state.activeThreadId === threadId) {
+            rememberTurnThreadPath(threadId, nextTurnId, state.activeThreadPath);
+            rememberTurnCwd(threadId, nextTurnId, state.activeCwd);
+            rememberLivePatchTurn(threadId, nextTurnId);
+          }
           send(ws, { type: 'rpc/result', id: request.id, result });
           broadcastHello(state);
           return;
