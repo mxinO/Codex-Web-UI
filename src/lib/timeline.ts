@@ -10,12 +10,20 @@ export type TimelineItem =
       id: string;
       kind: 'fileChange';
       timestamp: number;
+      turnId?: string;
       item: CodexItem;
       filePath?: string | null;
       changeCount?: number;
       resolvedDiff?: { before: string; after: string; path?: string | null };
       diffLoading?: boolean;
       diffError?: string;
+    }
+  | {
+      id: string;
+      kind: 'fileChangeSummary';
+      timestamp: number;
+      turnId: string;
+      files: Array<{ path: string; changeCount: number }>;
     }
   | { id: string; kind: 'tool'; timestamp: number; item: CodexItem }
   | { id: string; kind: 'notice'; timestamp: number; text: string }
@@ -145,39 +153,36 @@ interface FileChangeGroup {
   firstItem: CodexItem;
 }
 
-function groupedFileChangeItems(turn: CodexTurn, timestamp: number): Map<number, TimelineItem[]> {
+function fileChangeItemsForTurnItem(turn: CodexTurn, item: CodexItem, index: number, timestamp: number): TimelineItem[] {
   const groups = new Map<string, FileChangeGroup>();
   let order = 0;
+  const itemId = safeItemId(turn, item, index);
 
-  turn.items.forEach((item, index) => {
-    if (item.type !== 'fileChange') return;
-
-    for (const change of itemChanges(item)) {
-      const path = changePath(change);
-      const key = safePathKey(path, safeItemId(turn, item, index));
-      const existing = groups.get(key);
-      if (existing) {
-        existing.changes.push(change);
-        existing.itemIds.push(item.id ?? `${index}`);
-        existing.lastStatus = stringField(item, 'status', existing.lastStatus);
-        continue;
-      }
-
-      groups.set(key, {
-        key,
-        firstIndex: index,
-        order: order++,
-        filePath: path,
-        changes: [change],
-        itemIds: [item.id ?? `${index}`],
-        lastStatus: stringField(item, 'status', 'updated'),
-        firstItem: item,
-      });
+  for (const change of itemChanges(item)) {
+    const filePath = changePath(change);
+    const key = safePathKey(filePath, itemId);
+    const existing = groups.get(key);
+    if (existing) {
+      existing.changes.push(change);
+      existing.itemIds.push(item.id ?? `${index}`);
+      existing.lastStatus = stringField(item, 'status', existing.lastStatus);
+      continue;
     }
-  });
 
-  const byFirstIndex = new Map<number, TimelineItem[]>();
-  for (const group of Array.from(groups.values()).sort((a, b) => a.firstIndex - b.firstIndex || a.order - b.order)) {
+    groups.set(key, {
+      key,
+      firstIndex: index,
+      order: order++,
+      filePath,
+      changes: [change],
+      itemIds: [item.id ?? `${index}`],
+      lastStatus: stringField(item, 'status', 'updated'),
+      firstItem: item,
+    });
+  }
+
+  const sorted = Array.from(groups.values()).sort((a, b) => a.order - b.order);
+  return sorted.map((group) => {
     const item: CodexItem = {
       ...group.firstItem,
       id: group.itemIds.join('+'),
@@ -186,30 +191,55 @@ function groupedFileChangeItems(turn: CodexTurn, timestamp: number): Map<number,
       status: group.lastStatus,
       groupedItemIds: group.itemIds,
     };
-    const timelineItem: TimelineItem = {
-      id: `${turn.id}:file:${group.key}`,
+    return {
+      id: sorted.length === 1 ? itemId : `${itemId}:file:${group.key}`,
       kind: 'fileChange',
       timestamp,
+      turnId: turn.id,
       item,
       filePath: group.filePath,
       changeCount: group.changes.length,
-    };
-    const entries = byFirstIndex.get(group.firstIndex) ?? [];
-    entries.push(timelineItem);
-    byFirstIndex.set(group.firstIndex, entries);
+    } satisfies TimelineItem;
+  });
+}
+
+function fileChangeSummaryItem(turn: CodexTurn, timestamp: number): TimelineItem | null {
+  if (turn.status === 'inProgress') return null;
+
+  const files = new Map<string, { path: string; changeCount: number; order: number }>();
+  let order = 0;
+  for (const item of turn.items) {
+    if (item.type !== 'fileChange') continue;
+    for (const change of itemChanges(item)) {
+      const filePath = changePath(change);
+      if (!filePath) continue;
+      const existing = files.get(filePath);
+      if (existing) {
+        existing.changeCount += 1;
+        continue;
+      }
+      files.set(filePath, { path: filePath, changeCount: 1, order: order++ });
+    }
   }
 
-  return byFirstIndex;
+  if (files.size === 0) return null;
+  return {
+    id: `${turn.id}:file-summary`,
+    kind: 'fileChangeSummary',
+    timestamp,
+    turnId: turn.id,
+    files: Array.from(files.values())
+      .sort((a, b) => a.order - b.order)
+      .map(({ path, changeCount }) => ({ path, changeCount })),
+  };
 }
 
 export function turnToTimelineItems(turn: CodexTurn): TimelineItem[] {
   const timestamp = (turn.startedAt ?? 0) * 1000;
   const items = Array.isArray(turn.items) ? turn.items : [];
-  const fileChangesByIndex = groupedFileChangeItems({ ...turn, items }, timestamp);
-
-  return items.flatMap((item, index): TimelineItem[] => {
+  const timelineItems = items.flatMap((item, index): TimelineItem[] => {
     const id = safeItemId(turn, item, index);
-    if (item.type === 'fileChange') return fileChangesByIndex.get(index) ?? [];
+    if (item.type === 'fileChange') return fileChangeItemsForTurnItem({ ...turn, items }, item, index, timestamp);
     if (item.type === 'userMessage') return [{ id, kind: 'user', timestamp, text: userText(item) }];
     if (item.type === 'agentMessage') return [{ id, kind: 'assistant', timestamp, text: stringField(item, 'text'), phase: nullableStringField(item, 'phase') }];
     if (item.type === 'commandExecution') {
@@ -234,6 +264,8 @@ export function turnToTimelineItems(turn: CodexTurn): TimelineItem[] {
     if (item.type === 'error') return [{ id, kind: 'error', timestamp, text: stringField(item, 'message') || stringField(item, 'text') || item.type }];
     return [{ id, kind: 'tool', timestamp, item }];
   });
+  const summary = fileChangeSummaryItem({ ...turn, items }, timestamp);
+  return summary ? [...timelineItems, summary] : timelineItems;
 }
 
 export function trimTimelineWindow<T>(items: T[], limit: number): T[] {

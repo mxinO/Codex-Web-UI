@@ -17,6 +17,7 @@ interface ServerHello {
   appServerHealth?: AppServerHealth;
   state: {
     activeThreadId: string | null;
+    activeThreadPath: string | null;
     activeTurnId: string | null;
     activeCwd: string | null;
     theme: 'dark' | 'light';

@@ -3,6 +3,7 @@ import AuthOverlay from './components/AuthOverlay';
 import ChatTimeline from './components/ChatTimeline';
 import CwdPicker from './components/CwdPicker';
 import DetailModal from './components/DetailModal';
+import FileChangeTray, { type ActiveFileSummary } from './components/FileChangeTray';
 import FileEditorModal from './components/FileEditorModal';
 import FileExplorer from './components/FileExplorer';
 import Header from './components/Header';
@@ -119,6 +120,7 @@ function extractModifiedAtMs(result: unknown): number | null {
 }
 
 function fileChangeTurnId(item: Extract<TimelineItem, { kind: 'fileChange' }>): string | null {
+  if (item.turnId) return item.turnId;
   const marker = ':file:';
   const markerIndex = item.id.indexOf(marker);
   return markerIndex > 0 ? item.id.slice(0, markerIndex) : null;
@@ -134,6 +136,7 @@ export default function App() {
   const { theme, setTheme } = useTheme();
   const state = socket.hello?.state;
   const activeThreadId = state?.activeThreadId ?? null;
+  const activeThreadPath = state?.activeThreadPath ?? null;
   const timeline = useThreadTimeline(activeThreadId, socket.rpc);
   const { queue: queuedMessages, enqueue, remove: removeFromQueue, replace: replaceQueue } = useQueue(socket.rpc, state?.queue ?? []);
   const [threads, setThreads] = useState<CodexThread[]>([]);
@@ -144,6 +147,7 @@ export default function App() {
   const [detailItem, setDetailItem] = useState<TimelineItem | null>(null);
   const [composerDraft, setComposerDraft] = useState<string | null>(null);
   const [editor, setEditor] = useState<OpenEditor | null>(null);
+  const [activeFileSummary, setActiveFileSummary] = useState<ActiveFileSummary | null>(null);
   const [ephemeralItems, setEphemeralItems] = useState<TimelineItem[]>([]);
   const [pendingUserItems, setPendingUserItems] = useState<UserTimelineItem[]>([]);
   const [answeredApprovals, setAnsweredApprovals] = useState<Set<string>>(() => new Set());
@@ -153,6 +157,7 @@ export default function App() {
   const [sandbox, setSandboxState] = useState<string | null>(initialSandbox);
   const bangCounterRef = useRef(0);
   const pendingUserCounterRef = useRef(0);
+  const activeFileSummaryScopeRef = useRef({ threadId: activeThreadId, threadPath: activeThreadPath, turnId: state?.activeTurnId ?? null });
   const lastNotification = socket.notifications.at(-1);
   const liveStreamingItem = useMemo(
     () => liveStreamingItemFromNotifications(socket.notifications, { activeThreadId, activeTurnId: state?.activeTurnId ?? null }, Boolean(state?.activeTurnId)),
@@ -187,10 +192,51 @@ export default function App() {
   }, [replaceQueue, state?.queue]);
 
   useEffect(() => {
+    activeFileSummaryScopeRef.current = { threadId: activeThreadId, threadPath: activeThreadPath, turnId: state?.activeTurnId ?? null };
+  }, [activeThreadId, activeThreadPath, state?.activeTurnId]);
+
+  useEffect(() => {
     setEphemeralItems([]);
     setPendingUserItems([]);
     setAnsweredApprovals(new Set());
+    setActiveFileSummary(null);
   }, [activeThreadId]);
+
+  const loadActiveFileSummary = useCallback(async (turnId: string | null | undefined) => {
+    if (!turnId || !activeThreadId || socket.connectionState !== 'connected') {
+      setActiveFileSummary(null);
+      return;
+    }
+    const requestedThreadId = activeThreadId;
+    const requestedThreadPath = activeThreadPath;
+    try {
+      const result = await socket.rpc<ActiveFileSummary>('webui/fileChange/summary', { threadId: requestedThreadId, turnId, threadPath: requestedThreadPath });
+      const current = activeFileSummaryScopeRef.current;
+      if (current.threadId !== requestedThreadId || current.threadPath !== requestedThreadPath || current.turnId !== turnId) return;
+      setActiveFileSummary(result.files.length > 0 ? result : null);
+    } catch {
+      const current = activeFileSummaryScopeRef.current;
+      if (current.threadId !== requestedThreadId || current.threadPath !== requestedThreadPath || current.turnId !== turnId) return;
+      setActiveFileSummary(null);
+    }
+  }, [activeThreadId, activeThreadPath, socket.connectionState, socket.rpc]);
+
+  useEffect(() => {
+    if (!state?.activeTurnId) {
+      setActiveFileSummary(null);
+      return;
+    }
+    void loadActiveFileSummary(state.activeTurnId);
+  }, [loadActiveFileSummary, state?.activeTurnId]);
+
+  useEffect(() => {
+    if (!state?.activeTurnId || !lastNotification || typeof lastNotification !== 'object') return;
+    const record = lastNotification as Record<string, unknown>;
+    if (record.method !== 'webui/fileChange/summaryChanged') return;
+    if (notificationMatchesActiveTurn(record, { activeThreadId, activeTurnId: state.activeTurnId })) {
+      void loadActiveFileSummary(state.activeTurnId);
+    }
+  }, [activeThreadId, lastNotification, loadActiveFileSummary, state?.activeTurnId]);
 
   useEffect(() => {
     setPendingUserItems((items) =>
@@ -295,6 +341,7 @@ export default function App() {
     void socket
       .rpc<{ before: string; after: string; path?: string | null }>('webui/fileChange/diff', {
         threadId: activeThreadId,
+        threadPath: activeThreadPath,
         turnId: fileChangeTurnId(item),
         path: item.filePath,
         changes: fileChangeRawChanges(item),
@@ -306,7 +353,19 @@ export default function App() {
         const message = error instanceof Error ? error.message : String(error);
         setDetailItem((current) => (current?.id === item.id ? { ...item, diffError: message } : current));
       });
-  }, [activeThreadId, socket.rpc]);
+  }, [activeThreadId, activeThreadPath, socket.rpc]);
+
+  const openFileSummaryDiff = useCallback((turnId: string, path: string, changeCount: number) => {
+    openDetailItem({
+      id: `${turnId}:file:${path}`,
+      kind: 'fileChange',
+      timestamp: Date.now(),
+      turnId,
+      item: { type: 'fileChange', id: `summary:${path}`, changes: [{ path }], status: 'completed' },
+      filePath: path,
+      changeCount,
+    });
+  }, [openDetailItem]);
 
   const startSession = useCallback(async (cwd: string) => {
     setSessionLoading(true);
@@ -320,11 +379,11 @@ export default function App() {
     }
   }, [runOptions, socket.rpc]);
 
-  const resumeSession = useCallback(async (threadId: string) => {
+  const resumeSession = useCallback(async (threadId: string, threadPath?: string | null) => {
     setSessionLoading(true);
     setSessionError(null);
     try {
-      await socket.rpc('webui/session/resume', { threadId, options: runOptions });
+      await socket.rpc('webui/session/resume', { threadId, threadPath, options: runOptions });
       window.location.reload();
     } catch (error) {
       setSessionError(error instanceof Error ? error.message : String(error));
@@ -518,7 +577,7 @@ export default function App() {
             visible={sessionPickerOpen}
             busy={sessionLoading}
             onClose={() => setSessionPickerOpen(false)}
-            onSelect={(threadId) => void resumeSession(threadId)}
+            onSelect={(threadId, threadPath) => void resumeSession(threadId, threadPath)}
             onNew={openNewSessionPicker}
           />
         }
@@ -541,11 +600,13 @@ export default function App() {
                   onApprovalDecision={respondToApproval}
                   onQueuedEdit={(message) => void editQueued(message as ClientQueuedMessage)}
                   onQueuedRemove={(id) => void removeQueued(id)}
+                  onOpenFileSummary={openFileSummaryDiff}
                 />
               ) : (
                 <div className="empty-state">No active session loaded.</div>
               )}
             </div>
+            {activeFileSummary && <FileChangeTray summary={activeFileSummary} onOpenDiff={openFileSummaryDiff} />}
             <InputBox
               rpc={socket.rpc}
               threadId={activeThreadId}

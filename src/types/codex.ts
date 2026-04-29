@@ -4,6 +4,7 @@ export interface CodexThread {
   createdAt: number;
   updatedAt: number;
   status: { type: string };
+  path?: string | null;
   cwd: string;
   name: string | null;
   turns: CodexTurn[];

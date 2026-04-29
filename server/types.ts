@@ -19,6 +19,7 @@ export interface QueuedMessage {
 export interface HostRuntimeState {
   hostname: string;
   activeThreadId: string | null;
+  activeThreadPath: string | null;
   activeTurnId: string | null;
   activeCwd: string | null;
   authTokenHash: string | null;

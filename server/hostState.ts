@@ -23,6 +23,7 @@ function defaultState(hostname: string): HostRuntimeState {
   return {
     hostname,
     activeThreadId: null,
+    activeThreadPath: null,
     activeTurnId: null,
     activeCwd: null,
     authTokenHash: null,
@@ -95,6 +96,7 @@ function sanitizeState(
     ...base,
     ...candidate,
     hostname,
+    activeThreadPath: typeof candidate.activeThreadPath === 'string' && candidate.activeThreadPath.trim() ? candidate.activeThreadPath : null,
     queue: Array.isArray(candidate.queue)
       ? candidate.queue
           .map(sanitizeQueuedMessage)

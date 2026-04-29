@@ -5,7 +5,7 @@ interface Props {
   visible: boolean;
   busy?: boolean;
   onClose: () => void;
-  onSelect: (threadId: string) => void;
+  onSelect: (threadId: string, threadPath?: string | null) => void;
   onNew: () => void;
 }
 
@@ -21,7 +21,14 @@ export default function SessionPicker({ threads, visible, busy = false, onClose,
         <div className="empty-list">No recent sessions.</div>
       ) : (
         threads.map((thread) => (
-          <button key={thread.id} className="session-row" type="button" onClick={() => onSelect(thread.id)} title={thread.cwd} disabled={busy}>
+          <button
+            key={thread.id}
+            className="session-row"
+            type="button"
+            onClick={() => onSelect(thread.id, thread.path ?? null)}
+            title={thread.cwd}
+            disabled={busy}
+          >
             <span>{thread.name || thread.preview || thread.id}</span>
             <small>{thread.cwd}</small>
           </button>

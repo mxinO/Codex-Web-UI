@@ -60,15 +60,23 @@ describe('SessionPicker', () => {
     expect(document.querySelectorAll('button')).toHaveLength(2);
   });
 
-  it('selects a thread by id', () => {
+  it('selects a thread by id and session path', () => {
     const onSelect = vi.fn();
-    render(<SessionPicker threads={[thread({ id: 'abc', name: 'Named session' })]} visible onClose={vi.fn()} onSelect={onSelect} onNew={vi.fn()} />);
+    render(
+      <SessionPicker
+        threads={[thread({ id: 'abc', name: 'Named session', path: '/home/user/.codex/sessions/rollout-abc.jsonl' })]}
+        visible
+        onClose={vi.fn()}
+        onSelect={onSelect}
+        onNew={vi.fn()}
+      />,
+    );
 
     act(() => {
       document.querySelector<HTMLButtonElement>('.session-row')?.click();
     });
 
-    expect(onSelect).toHaveBeenCalledWith('abc');
+    expect(onSelect).toHaveBeenCalledWith('abc', '/home/user/.codex/sessions/rollout-abc.jsonl');
   });
 
   it('disables session mutation controls when busy', () => {

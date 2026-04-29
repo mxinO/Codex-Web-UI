@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -7,6 +7,7 @@ import WebSocket, { type RawData } from 'ws';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { attachBrowserSocket } from '../../server/browserSocket.js';
 import { HostStateStore } from '../../server/hostState.js';
+import { FileEditStore, sessionFileEditDbPath } from '../../server/fileEditStore.js';
 import type { CodexAppServer } from '../../server/appServer.js';
 import type { ServerConfig } from '../../server/config.js';
 
@@ -271,6 +272,54 @@ describe('attachBrowserSocket session RPCs', () => {
     });
   });
 
+  it('uses the selected session path when resume omits it', async () => {
+    const threadPath = '/home/user/.codex/sessions/2026/04/29/rollout-thread-2.jsonl';
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/list') {
+        return { data: [{ id: 'thread-2', cwd: '/work/resumed', path: threadPath }] };
+      }
+      return { thread: { id: 'thread-2', cwd: '/work/resumed', turns: [] } };
+    });
+    const { ws, stateStore } = await makeHarness(request);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 30, method: 'webui/session/list' }));
+    await nextRpcResponse(ws, 30);
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 31,
+        method: 'webui/session/resume',
+        params: {
+          threadId: 'thread-2',
+          threadPath,
+        },
+      }),
+    );
+    await nextMessage(ws);
+
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-2',
+      activeThreadPath: threadPath,
+    });
+  });
+
+  it('clears stale session paths when resume has no path', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({
+      thread: { id: 'thread-2', cwd: '/work/resumed', turns: [] },
+    });
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.update((state) => ({ ...state, activeThreadPath: '/old/session/rollout-old.jsonl' }));
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 32, method: 'webui/session/resume', params: { threadId: 'thread-2' } }));
+    await nextMessage(ws);
+
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-2',
+      activeThreadPath: null,
+    });
+  });
+
   it('forwards run options when resuming sessions', async () => {
     const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ thread: { id: 'thread-2', cwd: '/work/resumed', turns: [] } });
     const { ws } = await makeHarness(request);
@@ -496,6 +545,424 @@ describe('attachBrowserSocket app-server requests', () => {
       id: 57,
       result: { path: filePath, before: 'old\n', after: 'new\n', source: 'snapshot' },
     });
+  });
+
+  it('persists file snapshots in the session DB across browser socket restarts', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const threadPath = join(sessionDir, 'rollout-2026-04-29T00-00-00-thread-1.jsonl');
+    const filePath = join(root, 'persisted.txt');
+    writeFileSync(threadPath, '');
+    writeFileSync(filePath, 'before restart\n');
+
+    const first = await makeHarness(request);
+    first.stateStore.update((state) => ({
+      ...state,
+      activeCwd: root,
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-1',
+      activeThreadPath: threadPath,
+    }));
+
+    const approvalBroadcast = nextMessage(first.ws);
+    first.requestFromServer({
+      jsonrpc: '2.0',
+      id: 'approval-persisted-snapshot',
+      method: 'item/fileChange/requestApproval',
+      params: { path: filePath },
+    });
+    await approvalBroadcast;
+    writeFileSync(filePath, 'after restart\n');
+
+    const second = await makeHarness(request);
+    second.stateStore.update((state) => ({
+      ...state,
+      activeCwd: root,
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-1',
+      activeThreadPath: threadPath,
+    }));
+
+    second.ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 62,
+        method: 'webui/fileChange/diff',
+        params: { threadId: 'thread-1', threadPath, turnId: 'turn-1', path: filePath, changes: [{ path: filePath }] },
+      }),
+    );
+    const response = await nextRpcResponse(second.ws, 62);
+
+    expect(response).toEqual({
+      type: 'rpc/result',
+      id: 62,
+      result: { path: filePath, before: 'before restart\n', after: 'after restart\n', source: 'snapshot' },
+    });
+  });
+
+  it('finalizes per-turn file diffs on turn completion even after active preview clicks', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, requestFromServer, notify } = await makeHarness(request);
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const threadPath = join(sessionDir, 'rollout-2026-04-29T00-00-00-thread-1.jsonl');
+    const filePath = join(root, 'finalized.txt');
+    writeFileSync(threadPath, '');
+    writeFileSync(filePath, 'before completion\n');
+    stateStore.update((state) => ({
+      ...state,
+      activeCwd: root,
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-1',
+      activeThreadPath: threadPath,
+    }));
+
+    const approvalBroadcast = nextMessage(ws);
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: 'approval-finalize',
+      method: 'item/fileChange/requestApproval',
+      params: { path: filePath },
+    });
+    await approvalBroadcast;
+    writeFileSync(filePath, 'middle preview\n');
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 620,
+        method: 'webui/fileChange/diff',
+        params: { threadId: 'thread-1', threadPath, turnId: 'turn-1', path: filePath, changes: [{ path: filePath }] },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 620)).toEqual({
+      type: 'rpc/result',
+      id: 620,
+      result: { path: filePath, before: 'before completion\n', after: 'middle preview\n', source: 'snapshot' },
+    });
+
+    writeFileSync(filePath, 'after completion\n');
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-1' });
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      ws.send(
+        JSON.stringify({
+          type: 'rpc',
+          id: 6300 + attempt,
+          method: 'webui/fileChange/diff',
+          params: { threadId: 'thread-1', threadPath, turnId: 'turn-1', path: filePath, changes: [{ path: filePath }] },
+        }),
+      );
+      const response = await nextRpcResponse(ws, 6300 + attempt);
+      const result = response.result as { source?: string; after?: string } | undefined;
+      if (result?.source === 'stored' && result.after === 'after completion\n') break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    writeFileSync(filePath, 'changed after turn\n');
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 63,
+        method: 'webui/fileChange/diff',
+        params: { threadId: 'thread-1', threadPath, turnId: 'turn-1', path: filePath, changes: [{ path: filePath }] },
+      }),
+    );
+    const response = await nextRpcResponse(ws, 63);
+
+    expect(response).toEqual({
+      type: 'rpc/result',
+      id: 63,
+      result: { path: filePath, before: 'before completion\n', after: 'after completion\n', source: 'stored' },
+    });
+  });
+
+  it('finalizes a completed turn using its captured session path after switching sessions', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, requestFromServer, notify } = await makeHarness(request);
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const oldThreadPath = join(sessionDir, 'rollout-2026-04-29T00-00-00-thread-old.jsonl');
+    const newThreadPath = join(sessionDir, 'rollout-2026-04-29T00-00-00-thread-new.jsonl');
+    const filePath = join(root, 'finalized-after-switch.txt');
+    writeFileSync(oldThreadPath, '');
+    writeFileSync(newThreadPath, '');
+    writeFileSync(filePath, 'before switch\n');
+    stateStore.update((state) => ({
+      ...state,
+      activeCwd: root,
+      activeThreadId: 'thread-old',
+      activeTurnId: 'turn-old',
+      activeThreadPath: oldThreadPath,
+    }));
+
+    const approvalBroadcast = nextMessage(ws);
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: 'approval-before-switch',
+      method: 'item/fileChange/requestApproval',
+      params: { path: filePath },
+    });
+    await approvalBroadcast;
+    writeFileSync(filePath, 'after switch completion\n');
+    stateStore.update((state) => ({
+      ...state,
+      activeThreadId: 'thread-new',
+      activeTurnId: 'turn-new',
+      activeThreadPath: newThreadPath,
+    }));
+
+    notify('turn/completed', { threadId: 'thread-old', turnId: 'turn-old' });
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      ws.send(
+        JSON.stringify({
+          type: 'rpc',
+          id: 6600 + attempt,
+          method: 'webui/fileChange/diff',
+          params: {
+            threadId: 'thread-old',
+            threadPath: oldThreadPath,
+            turnId: 'turn-old',
+            path: filePath,
+            changes: [{ path: filePath }],
+          },
+        }),
+      );
+      const response = await nextRpcResponse(ws, 6600 + attempt);
+      const result = response.result as { source?: string; after?: string } | undefined;
+      if (result?.source === 'stored' && result.after === 'after switch completion\n') break;
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+
+    writeFileSync(filePath, 'changed after old completion\n');
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 66,
+        method: 'webui/fileChange/diff',
+        params: {
+          threadId: 'thread-old',
+          threadPath: oldThreadPath,
+          turnId: 'turn-old',
+          path: filePath,
+          changes: [{ path: filePath }],
+        },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 66)).toEqual({
+      type: 'rpc/result',
+      id: 66,
+      result: { path: filePath, before: 'before switch\n', after: 'after switch completion\n', source: 'stored' },
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-new', activeTurnId: 'turn-new', activeThreadPath: newThreadPath });
+  });
+
+  it('uses the requested session DB path for stored file diffs', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request);
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const oldThreadPath = join(sessionDir, 'rollout-2026-04-29T00-00-00-thread-old.jsonl');
+    const requestedThreadPath = join(sessionDir, 'rollout-2026-04-29T00-00-00-thread-2.jsonl');
+    const filePath = join(root, 'stored-from-requested-db.txt');
+    writeFileSync(oldThreadPath, '');
+    writeFileSync(requestedThreadPath, '');
+    writeFileSync(filePath, 'current file content should not win\n');
+    request.mockImplementation(async (method) => {
+      if (method === 'thread/list') {
+        return { data: [{ id: 'thread-2', cwd: '/work/requested', path: requestedThreadPath }] };
+      }
+      return { thread: { id: 'thread-2', cwd: '/work/requested', turns: [] } };
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 639, method: 'webui/session/list' }));
+    await nextRpcResponse(ws, 639);
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 641,
+        method: 'webui/session/resume',
+        params: { threadId: 'thread-2', threadPath: requestedThreadPath },
+      }),
+    );
+    await nextRpcResponse(ws, 641);
+
+    stateStore.update((state) => ({
+      ...state,
+      activeCwd: root,
+      activeThreadId: 'thread-old',
+      activeTurnId: null,
+      activeThreadPath: oldThreadPath,
+    }));
+
+    const oldStore = new FileEditStore(sessionFileEditDbPath(oldThreadPath));
+    oldStore.recordSnapshot({ turnId: 'turn-2', itemId: 'edit-old', path: filePath, before: 'wrong active before\n' });
+    oldStore.finalizeFile({ turnId: 'turn-2', path: filePath, after: 'wrong active after\n' });
+    oldStore.close();
+
+    const store = new FileEditStore(sessionFileEditDbPath(requestedThreadPath));
+    store.recordSnapshot({ turnId: 'turn-2', itemId: 'edit-1', path: filePath, before: 'before from requested db\n' });
+    store.finalizeFile({ turnId: 'turn-2', path: filePath, after: 'after from requested db\n' });
+    store.close();
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 640,
+        method: 'webui/fileChange/diff',
+        params: {
+          threadId: 'thread-2',
+          turnId: 'turn-2',
+          path: filePath,
+          changes: [{ path: filePath }],
+        },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 640)).toEqual({
+      type: 'rpc/result',
+      id: 640,
+      result: { path: filePath, before: '', after: '', source: 'current' },
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 64,
+        method: 'webui/fileChange/diff',
+        params: {
+          threadId: 'thread-2',
+          threadPath: requestedThreadPath,
+          turnId: 'turn-2',
+          path: filePath,
+          changes: [{ path: filePath }],
+        },
+      }),
+    );
+    const response = await nextRpcResponse(ws, 64);
+
+    expect(response).toEqual({
+      type: 'rpc/result',
+      id: 64,
+      result: { path: filePath, before: 'before from requested db\n', after: 'after from requested db\n', source: 'stored' },
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 650,
+        method: 'webui/fileChange/summary',
+        params: { turnId: 'turn-2' },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 650)).toEqual({
+      type: 'rpc/result',
+      id: 650,
+      result: { turnId: 'turn-2', files: [] },
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 65,
+        method: 'webui/fileChange/summary',
+        params: { threadId: 'thread-2', threadPath: requestedThreadPath, turnId: 'turn-2' },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 65)).toMatchObject({
+      type: 'rpc/result',
+      id: 65,
+      result: { turnId: 'turn-2', files: [{ path: filePath, editCount: 1, hasDiff: true }] },
+    });
+  });
+
+  it('rejects diff file reads outside the active workspace even when cwd is supplied', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request);
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    const outside = mkdtempSync(join(tmpdir(), 'codex-webui-outside-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(outside, { recursive: true, force: true }));
+    const outsidePath = join(outside, 'secret.txt');
+    writeFileSync(outsidePath, 'outside secret\n');
+    stateStore.update((state) => ({ ...state, activeCwd: root, activeThreadId: 'thread-1', activeTurnId: 'turn-1' }));
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 67,
+        method: 'webui/fileChange/diff',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          cwd: outside,
+          path: outsidePath,
+          changes: [{ path: outsidePath }],
+        },
+      }),
+    );
+    const response = await nextRpcResponse(ws, 67);
+
+    expect(response).toEqual({ type: 'rpc/error', id: 67, error: 'path is outside active workspace' });
+  });
+
+  it('does not create stores for unvalidated read-only session paths', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request);
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    const outside = mkdtempSync(join(tmpdir(), 'codex-webui-outside-'));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(outside, { recursive: true, force: true }));
+    const unvalidatedThreadPath = join(outside, 'fake-session', 'rollout-thread.jsonl');
+    const dbPath = sessionFileEditDbPath(unvalidatedThreadPath);
+    const filePath = join(root, 'inside.txt');
+    writeFileSync(filePath, 'inside\n');
+    stateStore.update((state) => ({ ...state, activeCwd: root, activeThreadId: 'thread-1', activeTurnId: 'turn-1' }));
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 68,
+        method: 'webui/fileChange/summary',
+        params: { threadId: 'thread-outside', threadPath: unvalidatedThreadPath, turnId: 'turn-outside' },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 68)).toEqual({
+      type: 'rpc/result',
+      id: 68,
+      result: { turnId: 'turn-outside', files: [] },
+    });
+    expect(existsSync(dbPath)).toBe(false);
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 69,
+        method: 'webui/fileChange/diff',
+        params: {
+          threadId: 'thread-outside',
+          threadPath: unvalidatedThreadPath,
+          turnId: 'turn-outside',
+          path: filePath,
+          changes: [{ path: filePath }],
+        },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 69)).toEqual({
+      type: 'rpc/result',
+      id: 69,
+      result: { path: filePath, before: '', after: '', source: 'current' },
+    });
+    expect(existsSync(dbPath)).toBe(false);
   });
 
   it('does not snapshot symlink targets outside the active workspace', async () => {
@@ -1322,6 +1789,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     stateStore.write({ ...stateStore.read(), activeThreadId: null, activeTurnId: 'turn-old', queue: queued });
 
     notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    await flushPromises();
 
     expect(request).not.toHaveBeenCalled();
     expect(stateStore.read()).toMatchObject({ activeTurnId: null, queue: queued });

@@ -166,7 +166,7 @@ describe('useCodexSocket', () => {
           data: JSON.stringify({
             type: 'server/hello',
             hostname: 'host-a',
-            state: { activeThreadId: 'thread-1', activeTurnId: null, activeCwd: '/repo', theme: 'dark', queue: [] },
+            state: { activeThreadId: 'thread-1', activeThreadPath: '/sessions/thread-1.jsonl', activeTurnId: null, activeCwd: '/repo', theme: 'dark', queue: [] },
             requests: [pending],
           }),
         }),

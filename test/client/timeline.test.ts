@@ -28,7 +28,7 @@ describe('timeline', () => {
     expect(turnToTimelineItems(turn).map((item) => item.kind)).toEqual(['user', 'assistant', 'command']);
   });
 
-  it('groups file changes by file within a turn', () => {
+  it('keeps chronological file edit cards and appends a per-turn file summary', () => {
     const turn: CodexTurn = {
       id: 'turn-file',
       status: 'completed',
@@ -45,15 +45,25 @@ describe('timeline', () => {
 
     const items = turnToTimelineItems(turn);
     const fileChanges = items.filter((item): item is Extract<TimelineItem, { kind: 'fileChange' }> => item.kind === 'fileChange');
+    const fileSummaries = items.filter((item): item is Extract<TimelineItem, { kind: 'fileChangeSummary' }> => item.kind === 'fileChangeSummary');
 
-    expect(items.map((item) => item.kind)).toEqual(['assistant', 'fileChange', 'command', 'fileChange']);
-    expect(fileChanges).toHaveLength(2);
-    expect(fileChanges[0]).toMatchObject({ id: 'turn-file:file:/repo/a.txt', filePath: '/repo/a.txt', changeCount: 2 });
-    expect((fileChanges[0].item as { changes: unknown[] }).changes).toEqual([
-      { path: '/repo/a.txt', diff: '@@ -1 +1 @@\n-old\n+new\n' },
-      { path: '/repo/a.txt', diff: '@@ -2 +2 @@\n-two\n+three\n' },
+    expect(items.map((item) => item.kind)).toEqual(['assistant', 'fileChange', 'command', 'fileChange', 'fileChange', 'fileChangeSummary']);
+    expect(fileChanges).toHaveLength(3);
+    expect(fileChanges[0]).toMatchObject({ id: 'turn-file:f1', filePath: '/repo/a.txt', changeCount: 1 });
+    expect(fileChanges[1]).toMatchObject({ id: 'turn-file:f2', filePath: '/repo/a.txt', changeCount: 1 });
+    expect(fileChanges[2]).toMatchObject({ id: 'turn-file:f3', filePath: '/repo/b.txt', changeCount: 1 });
+    expect(fileSummaries).toEqual([
+      {
+        id: 'turn-file:file-summary',
+        kind: 'fileChangeSummary',
+        timestamp: 10000,
+        turnId: 'turn-file',
+        files: [
+          { path: '/repo/a.txt', changeCount: 2 },
+          { path: '/repo/b.txt', changeCount: 1 },
+        ],
+      },
     ]);
-    expect(fileChanges[1]).toMatchObject({ id: 'turn-file:file:/repo/b.txt', filePath: '/repo/b.txt', changeCount: 1 });
   });
 
   it('renders warning and error items as severity-specific timeline cards', () => {

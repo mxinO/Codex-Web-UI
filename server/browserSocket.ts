@@ -7,6 +7,7 @@ import { isTokenValid, parseTokenFromCookie } from './auth.js';
 import type { CodexAppServer } from './appServer.js';
 import { isInteractiveCommandBlocked, runBangCommand } from './bangCommand.js';
 import type { ServerConfig } from './config.js';
+import { FileEditStore, sessionFileEditDbPath } from './fileEditStore.js';
 import { assertPathInsideRoot, resolveExistingPathInsideRoot, resolveWritablePathInsideRoot } from './fileTransfer.js';
 import type { HostStateStore } from './hostState.js';
 import type { JsonRpcServerRequest } from './jsonRpc.js';
@@ -235,6 +236,10 @@ function extractThreadCwd(result: unknown): string | null {
   return getStringPath(result, ['thread', 'cwd']) ?? getStringPath(result, ['data', 'cwd']) ?? getStringPath(result, ['cwd']);
 }
 
+function extractThreadPath(result: unknown): string | null {
+  return getStringPath(result, ['thread', 'path']) ?? getStringPath(result, ['data', 'path']) ?? getStringPath(result, ['path']);
+}
+
 function extractTurnId(result: unknown): string | null {
   return getStringPath(result, ['turn', 'id']) ?? getStringPath(result, ['data', 'id']) ?? getStringPath(result, ['id']) ?? getStringPath(result, ['turnId']);
 }
@@ -361,6 +366,7 @@ interface FileSnapshot {
 
 interface FileDiffParams {
   threadId: string | null;
+  threadPath: string | null;
   turnId: string | null;
   path: string;
   changes: unknown[];
@@ -395,6 +401,7 @@ function fileDiffParams(params: unknown): FileDiffParams | string {
   if (!path) return 'path is required';
   return {
     threadId: stringValue(params, 'threadId') ?? stringValue(params, 'thread_id'),
+    threadPath: stringValue(params, 'threadPath') ?? stringValue(params, 'thread_path'),
     turnId: stringValue(params, 'turnId') ?? stringValue(params, 'turn_id'),
     path,
     changes: Array.isArray(params.changes) ? params.changes.filter(isRecord) : [],
@@ -448,14 +455,18 @@ async function readCurrentFileForDiff(filePath: string): Promise<string> {
   }
 }
 
-async function resolveDiffPathInsideRoot(deps: BrowserSocketDeps, filePath: string): Promise<string> {
-  const resolvedPath = await resolveWritableRpcPath(deps, filePath);
+async function resolveDiffPathInsideRoot(root: string, filePath: string): Promise<string> {
+  const resolvedPath = await resolveWritablePathInsideRoot(root, filePath);
   try {
     return await fs.realpath(resolvedPath);
   } catch (error) {
     if (typeof error === 'object' && error !== null && (error as NodeJS.ErrnoException).code === 'ENOENT') return resolvedPath;
     throw error;
   }
+}
+
+function normalizedAbsolutePath(filePath: string): string | null {
+  return nodePath.isAbsolute(filePath) ? nodePath.resolve(filePath) : null;
 }
 
 function diffText(change: unknown): string | null {
@@ -615,7 +626,79 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const pendingServerRequests = new Map<string, JsonRpcServerRequest>();
   const resumedThreadIds = new Set<string>();
   const resumeThreadPromises = new Map<string, Promise<void>>();
+  const knownThreadPaths = new Map<string, string>();
   const fileSnapshots = new Map<string, FileSnapshot>();
+  const completingTurnKeys = new Set<string>();
+  const completedTurnKeys = new Set<string>();
+  const turnThreadPaths = new Map<string, string>();
+
+  const turnKey = (threadId: string | null, turnId: string): string => `${threadId ?? ''}\0${turnId}`;
+
+  const openFileEditStore = (threadPath: string | null, options: { readonly?: boolean } = {}): FileEditStore | null => {
+    if (!threadPath || !nodePath.isAbsolute(threadPath)) return null;
+    const dbPath = sessionFileEditDbPath(threadPath);
+    if (options.readonly && !fsSync.existsSync(dbPath)) return null;
+    try {
+      return new FileEditStore(dbPath, options);
+    } catch (error) {
+      logWarn('Failed to open file edit store', error);
+      return null;
+    }
+  };
+
+  const rememberKnownThreadPath = (threadId: string | null, threadPath: string | null) => {
+    if (!threadId || !threadPath || !nodePath.isAbsolute(threadPath)) return;
+    knownThreadPaths.set(threadId, threadPath);
+    while (knownThreadPaths.size > 200) {
+      const oldest = knownThreadPaths.keys().next().value;
+      if (typeof oldest !== 'string') break;
+      knownThreadPaths.delete(oldest);
+    }
+  };
+
+  const rememberKnownThreadPathsFromList = (result: unknown) => {
+    const threads = isRecord(result) && Array.isArray(result.data) ? result.data : Array.isArray(result) ? result : [];
+    for (const thread of threads) rememberKnownThreadPath(extractThreadId(thread), extractThreadPath(thread));
+  };
+
+  const validatedThreadPath = (
+    state: HostRuntimeState,
+    threadId: string | null,
+    turnId: string | null,
+    threadPath: string | null,
+  ): string | null => {
+    if (!threadPath || !nodePath.isAbsolute(threadPath)) return null;
+    if (threadId && knownThreadPaths.get(threadId) === threadPath) return threadPath;
+    if (turnId && turnThreadPaths.get(turnKey(threadId, turnId)) === threadPath) return threadPath;
+    if ((!threadId || threadId === state.activeThreadId) && threadPath === state.activeThreadPath) return threadPath;
+    return null;
+  };
+
+  const trustedDiffRoot = (state: HostRuntimeState, threadId: string | null, threadPath: string | null): string | null => {
+    if (!state.activeCwd) return null;
+    if (threadId && threadId !== state.activeThreadId) return null;
+    if (threadPath && threadPath !== state.activeThreadPath) return null;
+    return state.activeCwd;
+  };
+
+  const rememberCompletedTurnKey = (key: string) => {
+    completedTurnKeys.add(key);
+    while (completedTurnKeys.size > 200) {
+      const oldest = completedTurnKeys.keys().next().value;
+      if (typeof oldest !== 'string') break;
+      completedTurnKeys.delete(oldest);
+    }
+  };
+
+  const rememberTurnThreadPath = (threadId: string | null, turnId: string | null, threadPath: string | null) => {
+    if (!turnId || !threadPath) return;
+    turnThreadPaths.set(turnKey(threadId, turnId), threadPath);
+    while (turnThreadPaths.size > 200) {
+      const oldest = turnThreadPaths.keys().next().value;
+      if (typeof oldest !== 'string') break;
+      turnThreadPaths.delete(oldest);
+    }
+  };
 
   const pruneFileSnapshots = () => {
     const now = Date.now();
@@ -629,22 +712,44 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
   };
 
-  const captureFileChangeSnapshots = (params: unknown) => {
+  const captureFileChangeSnapshots = (params: unknown, requestId: number | string) => {
     const state = deps.stateStore.read();
     if (!state.activeCwd) return;
     pruneFileSnapshots();
+    rememberKnownThreadPath(state.activeThreadId, state.activeThreadPath);
+    const store = state.activeTurnId ? openFileEditStore(state.activeThreadPath) : null;
+    let storedAny = false;
 
-    for (const filePath of fileChangePaths(params)) {
-      let resolvedPath: string;
-      try {
-        resolvedPath = resolveSnapshotPathInsideRoot(state.activeCwd, filePath);
-      } catch {
-        continue;
+    try {
+      for (const filePath of fileChangePaths(params)) {
+        let resolvedPath: string;
+        try {
+          resolvedPath = resolveSnapshotPathInsideRoot(state.activeCwd, filePath);
+        } catch {
+          continue;
+        }
+        const key = snapshotKey(state.activeThreadId, state.activeTurnId, resolvedPath);
+        const before = readSnapshotFile(resolvedPath);
+        if (!fileSnapshots.has(key) && fileSnapshots.size < FILE_DIFF_SNAPSHOT_MAX_ENTRIES) {
+          fileSnapshots.set(key, { before, createdAt: Date.now() });
+        }
+        if (store && state.activeTurnId) {
+          rememberTurnThreadPath(state.activeThreadId, state.activeTurnId, state.activeThreadPath);
+          store.recordSnapshot({
+            turnId: state.activeTurnId,
+            itemId: String(requestId),
+            path: resolvedPath,
+            before: before ?? '',
+          });
+          storedAny = true;
+        }
       }
-      const key = snapshotKey(state.activeThreadId, state.activeTurnId, resolvedPath);
-      if (fileSnapshots.has(key)) continue;
-      if (fileSnapshots.size >= FILE_DIFF_SNAPSHOT_MAX_ENTRIES) break;
-      fileSnapshots.set(key, { before: readSnapshotFile(resolvedPath), createdAt: Date.now() });
+    } finally {
+      store?.close();
+    }
+
+    if (storedAny && state.activeThreadId && state.activeTurnId) {
+      broadcastFileChangeSummaryChanged(state.activeThreadId, state.activeTurnId);
     }
   };
 
@@ -660,9 +765,40 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   };
 
   const buildFileChangeDiff = async (params: FileDiffParams) => {
-    const resolvedPath = await resolveDiffPathInsideRoot(deps, params.path);
-    const snapshot = findFileSnapshot(params.threadId, params.turnId, resolvedPath);
-    if (snapshot) {
+    const state = deps.stateStore.read();
+    const root = trustedDiffRoot(state, params.threadId, params.threadPath);
+    const resolvedPath = root ? await resolveDiffPathInsideRoot(root, params.path) : normalizedAbsolutePath(params.path);
+    const validatedPath = validatedThreadPath(state, params.threadId, params.turnId, params.threadPath);
+    const store = params.turnId && resolvedPath ? openFileEditStore(validatedPath, { readonly: true }) : null;
+    try {
+      if (store && params.turnId && resolvedPath) {
+        const stored = store.getDiff(params.turnId, resolvedPath);
+        if (stored) {
+          return {
+            path: stored.path,
+            before: stored.before,
+            after: stored.after,
+            source: 'stored',
+          };
+        }
+
+        const storedSnapshot = store.getSnapshot(params.turnId, resolvedPath);
+        if (storedSnapshot && root) {
+          const after = await readCurrentFileForDiff(storedSnapshot.path);
+          return {
+            path: storedSnapshot.path,
+            before: storedSnapshot.before,
+            after,
+            source: 'snapshot',
+          };
+        }
+      }
+    } finally {
+      store?.close();
+    }
+
+    const snapshot = resolvedPath ? findFileSnapshot(params.threadId, params.turnId, resolvedPath) : null;
+    if (snapshot && root && resolvedPath) {
       return {
         path: resolvedPath,
         before: snapshot.before ?? '',
@@ -673,7 +809,16 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
     const reconstructed = explicitBeforeAfterDiff(params.changes) ?? reconstructAddedFileDiff(params.changes) ?? patchSnippetDiff(params.changes);
     if (reconstructed) {
-      return { path: resolvedPath, ...reconstructed, source: 'reconstructed' };
+      return { path: resolvedPath ?? params.path, ...reconstructed, source: 'reconstructed' };
+    }
+
+    if (!root || !resolvedPath) {
+      return {
+        path: resolvedPath ?? params.path,
+        before: '',
+        after: '',
+        source: 'current',
+      };
     }
 
     return {
@@ -682,6 +827,30 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       after: await readCurrentFileForDiff(resolvedPath),
       source: 'current',
     };
+  };
+
+  const listStoredTurnFiles = (turnId: string, threadId: string | null, threadPath: string | null) => {
+    const store = openFileEditStore(validatedThreadPath(deps.stateStore.read(), threadId, turnId, threadPath), { readonly: true });
+    if (!store) return [];
+    try {
+      return store.listTurnFiles(turnId);
+    } finally {
+      store.close();
+    }
+  };
+
+  const finalizeTurnFileDiffs = async (threadPath: string | null, turnId: string) => {
+    const store = openFileEditStore(threadPath);
+    if (!store) return;
+    try {
+      const files = store.listTurnFiles(turnId);
+      for (const file of files) {
+        const after = await readCurrentFileForDiff(file.path);
+        store.finalizeFile({ turnId, path: file.path, after });
+      }
+    } finally {
+      store.close();
+    }
   };
 
   const broadcastHello = (state: HostRuntimeState = deps.stateStore.read()) => {
@@ -703,6 +872,19 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const broadcastRequestResolved = (requestId: number | string) => {
     for (const client of wss.clients) {
       send(client, { type: 'codex/requestResolved', requestId });
+    }
+  };
+
+  const broadcastFileChangeSummaryChanged = (threadId: string, turnId: string) => {
+    for (const client of wss.clients) {
+      send(client, {
+        type: 'codex/notification',
+        message: {
+          jsonrpc: '2.0',
+          method: 'webui/fileChange/summaryChanged',
+          params: { threadId, turnId },
+        },
+      });
     }
   };
 
@@ -765,14 +947,51 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   };
 
   const handleTurnCompleted = async (message: { params?: unknown }) => {
-    if (queuedStartInFlight) return;
-
     const completedThreadId = notificationThreadId(message);
     const completedTurnId = notificationTurnId(message);
     const current = deps.stateStore.read();
 
-    if (completedThreadId && current.activeThreadId && completedThreadId !== current.activeThreadId) return;
-    if (completedTurnId && current.activeTurnId && completedTurnId !== current.activeTurnId) return;
+    const turnIdToFinalize = completedTurnId ?? current.activeTurnId;
+    const threadIdToFinalize = completedThreadId ?? current.activeThreadId;
+    const completionKey = turnIdToFinalize ? turnKey(threadIdToFinalize, turnIdToFinalize) : null;
+    if (completionKey && (completingTurnKeys.has(completionKey) || completedTurnKeys.has(completionKey))) return;
+    if (completionKey) completingTurnKeys.add(completionKey);
+    let finalizedForCompletionKey = false;
+
+    if (turnIdToFinalize) {
+      try {
+        const finalizeThreadPath =
+          (completionKey ? turnThreadPaths.get(completionKey) : null) ??
+          (!threadIdToFinalize || threadIdToFinalize === current.activeThreadId ? current.activeThreadPath : null);
+        await finalizeTurnFileDiffs(finalizeThreadPath, turnIdToFinalize);
+        finalizedForCompletionKey = true;
+        if (threadIdToFinalize) broadcastFileChangeSummaryChanged(threadIdToFinalize, turnIdToFinalize);
+      } catch (error) {
+        logWarn('Failed to finalize file edit diffs', error);
+      }
+    } else {
+      finalizedForCompletionKey = true;
+    }
+
+    const activeCompletion =
+      Boolean(current.activeThreadId && current.activeTurnId) &&
+      (!completedThreadId || completedThreadId === current.activeThreadId) &&
+      (!completedTurnId || completedTurnId === current.activeTurnId);
+
+    if (!activeCompletion || queuedStartInFlight) {
+      if (!current.activeThreadId && current.activeTurnId) {
+        const cleared = deps.stateStore.update((state) => ({ ...state, activeTurnId: null }));
+        broadcastHello(cleared);
+      }
+      if (completionKey) {
+        completingTurnKeys.delete(completionKey);
+        if (finalizedForCompletionKey) {
+          rememberCompletedTurnKey(completionKey);
+          turnThreadPaths.delete(completionKey);
+        }
+      }
+      return;
+    }
 
     const claim: { threadId?: string; queuedMessage?: QueuedMessage } = {};
 
@@ -794,17 +1013,33 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
     const { threadId, queuedMessage } = claim;
     if (!threadId || !queuedMessage) {
+      if (completionKey) {
+        completingTurnKeys.delete(completionKey);
+        if (finalizedForCompletionKey) {
+          rememberCompletedTurnKey(completionKey);
+          turnThreadPaths.delete(completionKey);
+        }
+      }
       return;
     }
 
     queuedStartInFlight = { threadId, queuedMessage };
+    if (completionKey) {
+      completingTurnKeys.delete(completionKey);
+      if (finalizedForCompletionKey) {
+        rememberCompletedTurnKey(completionKey);
+        turnThreadPaths.delete(completionKey);
+      }
+    }
 
     try {
       const result = await startTurn({ threadId, text: queuedMessage.text, options: queuedMessage.options });
+      const nextTurnId = extractTurnId(result);
       const next = deps.stateStore.update((current) => ({
         ...current,
-        activeTurnId: current.activeThreadId === threadId ? extractTurnId(result) : current.activeTurnId,
+        activeTurnId: current.activeThreadId === threadId ? nextTurnId : current.activeTurnId,
       }));
+      if (next.activeThreadId === threadId) rememberTurnThreadPath(threadId, nextTurnId, next.activeThreadPath);
       broadcastHello(next);
     } catch (error) {
       logWarn('Failed to start queued turn', error);
@@ -832,7 +1067,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
   const unsubscribeServerRequest = deps.codex.onServerRequest((message) => {
     if (message.method === 'item/fileChange/requestApproval') {
-      captureFileChangeSnapshots(message.params);
+      captureFileChangeSnapshots(message.params, message.id);
     }
     pendingServerRequests.set(requestKey(message.id), message);
     for (const client of wss.clients) send(client, { type: 'codex/request', message });
@@ -903,6 +1138,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             sortDirection: 'desc',
             sortKey: 'updated_at',
           });
+          rememberKnownThreadPathsFromList(result);
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
@@ -922,10 +1158,13 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           const result = await requestCodex('thread/start', params);
           const activeCwd = extractThreadCwd(result) ?? cwd;
           const activeThreadId = extractThreadId(result);
+          const activeThreadPath = extractThreadPath(result);
+          rememberKnownThreadPath(activeThreadId, activeThreadPath);
           if (activeThreadId) resumedThreadIds.add(activeThreadId);
           const state = deps.stateStore.update((state) => ({
             ...state,
             activeThreadId,
+            activeThreadPath,
             activeTurnId: null,
             activeCwd,
             recentCwds: rememberCwd(state.recentCwds, activeCwd),
@@ -941,6 +1180,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
             return;
           }
+          const requestedThreadPath = getOptionalString(request.params, 'threadPath');
 
           const params = applyThreadRunOptions<SessionResumeParams & { persistExtendedHistory: boolean; [key: string]: unknown }>({
             threadId,
@@ -949,9 +1189,14 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           const result = await requestCodex('thread/resume', params);
           resumedThreadIds.add(threadId);
           const activeCwd = extractThreadCwd(result) ?? deps.stateStore.read().activeCwd;
+          const resultThreadPath = extractThreadPath(result);
+          const activeThreadPath =
+            resultThreadPath ?? (requestedThreadPath && knownThreadPaths.get(threadId) === requestedThreadPath ? requestedThreadPath : null);
+          rememberKnownThreadPath(threadId, activeThreadPath);
           const state = deps.stateStore.update((state) => ({
             ...state,
             activeThreadId: threadId,
+            activeThreadPath,
             activeTurnId: null,
             activeCwd,
             recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
@@ -1130,6 +1375,19 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           return;
         }
 
+        if (request.method === 'webui/fileChange/summary') {
+          const turnId = getRequiredString(request.params, 'turnId') ?? deps.stateStore.read().activeTurnId;
+          if (!turnId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'turnId is required' });
+            return;
+          }
+          const threadId = getOptionalString(request.params, 'threadId');
+          const threadPath = getOptionalString(request.params, 'threadPath');
+
+          send(ws, { type: 'rpc/result', id: request.id, result: { turnId, files: listStoredTurnFiles(turnId, threadId, threadPath) } });
+          return;
+        }
+
         if (request.method === 'thread/turns/list') {
           const params = turnListParams(request.params);
           if (typeof params === 'string') {
@@ -1193,10 +1451,12 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
 
           const result = await startTurn({ threadId, text, options: runOptionsFromParams(request.params) });
+          const nextTurnId = extractTurnId(result);
           const state = deps.stateStore.update((current) => ({
             ...current,
-            activeTurnId: current.activeThreadId === threadId ? extractTurnId(result) : current.activeTurnId,
+            activeTurnId: current.activeThreadId === threadId ? nextTurnId : current.activeTurnId,
           }));
+          if (state.activeThreadId === threadId) rememberTurnThreadPath(threadId, nextTurnId, state.activeThreadPath);
           send(ws, { type: 'rpc/result', id: request.id, result });
           broadcastHello(state);
           return;

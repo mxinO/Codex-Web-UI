@@ -13,6 +13,7 @@ interface ChatTimelineProps {
   onApprovalDecision: (item: Extract<TimelineItem, { kind: 'approval' }>, decision: unknown) => Promise<void>;
   onQueuedEdit?: (message: Extract<TimelineItem, { kind: 'queued' }>['message']) => void;
   onQueuedRemove?: (id: string) => void;
+  onOpenFileSummary?: (turnId: string, path: string, changeCount: number) => void;
 }
 
 const BOTTOM_STICKY_THRESHOLD_PX = 80;
@@ -32,6 +33,7 @@ export default function ChatTimeline({
   onApprovalDecision,
   onQueuedEdit,
   onQueuedRemove,
+  onOpenFileSummary,
 }: ChatTimelineProps) {
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const columnRef = useRef<HTMLDivElement | null>(null);
@@ -95,6 +97,7 @@ export default function ChatTimeline({
             onApprovalDecision={onApprovalDecision}
             onQueuedEdit={onQueuedEdit}
             onQueuedRemove={onQueuedRemove}
+            onOpenFileSummary={onOpenFileSummary}
           />
         ))}
         {items.length === 0 && <div className="chat-empty">{loading ? 'Loading messages...' : 'No messages loaded.'}</div>}

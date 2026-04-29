@@ -161,6 +161,37 @@ describe('ChatItem details', () => {
     expect(onOpenDetail).toHaveBeenNthCalledWith(2, toolItem);
   });
 
+  it('renders file summary cards with per-file diff actions', () => {
+    const onOpenFileSummary = vi.fn();
+    const item: TimelineItem = {
+      id: 'turn-1:file-summary',
+      kind: 'fileChangeSummary',
+      timestamp: 1,
+      turnId: 'turn-1',
+      files: [
+        { path: '/repo/a.txt', changeCount: 2 },
+        { path: '/repo/b.txt', changeCount: 1 },
+      ],
+    };
+
+    render(
+      <ChatItem
+        item={item}
+        onOpenDetail={vi.fn()}
+        onApprovalDecision={onApprovalDecision}
+        onOpenFileSummary={onOpenFileSummary}
+      />,
+    );
+
+    expect(document.querySelector('.file-summary-card')?.textContent).toContain('Files changed');
+    expect(document.querySelector('.file-summary-card')?.textContent).toContain('a.txt');
+    act(() => {
+      document.querySelector<HTMLButtonElement>('.file-summary-card button[title="See diff"]')?.click();
+    });
+
+    expect(onOpenFileSummary).toHaveBeenCalledWith('turn-1', '/repo/a.txt', 2);
+  });
+
   it('renders MCP and web-search tool cards with specific labels', () => {
     render(
       <>

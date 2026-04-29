@@ -1,4 +1,5 @@
 import { lazy, Suspense } from 'react';
+import { FileDiff } from 'lucide-react';
 import type { TimelineItem } from '../lib/timeline';
 import ApprovalCard from './ApprovalCard';
 import QueueCard from './QueueCard';
@@ -12,6 +13,7 @@ interface ChatItemProps {
   onApprovalDecision: (item: Extract<TimelineItem, { kind: 'approval' }>, decision: unknown) => Promise<void>;
   onQueuedEdit?: (message: Extract<TimelineItem, { kind: 'queued' }>['message']) => void;
   onQueuedRemove?: (id: string) => void;
+  onOpenFileSummary?: (turnId: string, path: string, changeCount: number) => void;
 }
 
 function itemString(value: unknown, key: string, fallback: string): string {
@@ -41,7 +43,7 @@ function toolLabel(item: TimelineItem): string {
   return `Tool: ${type}`;
 }
 
-export default function ChatItem({ item, onOpenDetail, onApprovalDecision, onQueuedEdit, onQueuedRemove }: ChatItemProps) {
+export default function ChatItem({ item, onOpenDetail, onApprovalDecision, onQueuedEdit, onQueuedRemove, onOpenFileSummary }: ChatItemProps) {
   if (item.kind === 'user') {
     return (
       <div className="chat-row chat-row--user">
@@ -127,6 +129,37 @@ export default function ChatItem({ item, onOpenDetail, onApprovalDecision, onQue
     return (
       <div className="chat-row chat-row--system">
         <div className={`chat-notice chat-notice--${item.kind}`}>{item.text || item.kind}</div>
+      </div>
+    );
+  }
+
+  if (item.kind === 'fileChangeSummary') {
+    const totalEdits = item.files.reduce((sum, file) => sum + file.changeCount, 0);
+    return (
+      <div className="chat-row chat-row--system">
+        <article className="file-summary-card">
+          <div className="file-summary-card__header">
+            <span>Files changed</span>
+            <small>{item.files.length} files - {totalEdits} edits</small>
+          </div>
+          <div className="file-summary-card__list">
+            {item.files.map((file) => (
+              <div className="file-summary-card__row" key={file.path} title={file.path}>
+                <span>{basename(file.path)}</span>
+                <small>{file.changeCount > 1 ? `${file.changeCount} edits` : '1 edit'}</small>
+                <button
+                  className="file-summary-card__diff"
+                  type="button"
+                  title="See diff"
+                  aria-label={`See diff for ${file.path}`}
+                  onClick={() => onOpenFileSummary?.(item.turnId, file.path, file.changeCount)}
+                >
+                  <FileDiff size={15} aria-hidden="true" />
+                </button>
+              </div>
+            ))}
+          </div>
+        </article>
       </div>
     );
   }
