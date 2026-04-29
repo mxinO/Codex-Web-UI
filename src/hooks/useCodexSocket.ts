@@ -80,6 +80,7 @@ export function useCodexSocket() {
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
   const [hello, setHello] = useState<ServerHello | null>(null);
   const [notifications, setNotifications] = useState<unknown[]>([]);
+  const [notificationCount, setNotificationCount] = useState(0);
   const [requests, setRequests] = useState<unknown[]>([]);
   const [reconnectEpoch, setReconnectEpoch] = useState(0);
   const [authRetryEpoch, setAuthRetryEpoch] = useState(0);
@@ -191,6 +192,7 @@ export function useCodexSocket() {
           rejectPending(new Error('authentication failed'));
           ws.close();
         } else if (message.type === 'codex/notification') {
+          setNotificationCount((count) => count + 1);
           setNotifications((items) => [...items.slice(-199), message.message]);
         } else if (message.type === 'codex/request') {
           setRequests((items) => [...items.slice(-49), message.message]);
@@ -254,5 +256,5 @@ export function useCodexSocket() {
     });
   }, []);
 
-  return { connectionState, hello, notifications, requests, reconnectEpoch, rpc, submitToken };
+  return { connectionState, hello, notifications, notificationCount, requests, reconnectEpoch, rpc, submitToken };
 }

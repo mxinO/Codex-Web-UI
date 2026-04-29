@@ -3,6 +3,8 @@ import {
   approvalItemsFromRequests,
   liveStreamingItemFromNotifications,
   mergeTimelineItemsByTimestamp,
+  notificationsSinceCount,
+  notificationIsTurnComplete,
   notificationMatchesActiveTurn,
   requestKey,
   turnToTimelineItems,
@@ -141,11 +143,71 @@ describe('timeline', () => {
     expect(item).toMatchObject({ id: 'live:streaming-assistant', kind: 'streaming', text: 'Hello', active: true });
   });
 
+  it('derives a live assistant item from Codex event messages', () => {
+    const item = liveStreamingItemFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', message: 'Starting edit', phase: 'commentary' } },
+        { method: 'event_msg', params: { type: 'patch_apply_end', turn_id: 'turn-1' } },
+        { method: 'event_msg', params: { type: 'agent_message', message: 'Edit applied', phase: 'commentary' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+    );
+
+    expect(item).toMatchObject({ id: 'live:streaming-assistant', kind: 'streaming', text: 'Starting edit\n\nEdit applied', active: true });
+  });
+
+  it('does not keep unscoped Codex event messages after the turn is no longer active', () => {
+    const item = liveStreamingItemFromNotifications(
+      [{ method: 'event_msg', params: { type: 'agent_message', message: 'Old live text', phase: 'final_answer' } }],
+      { activeThreadId: 'thread-1', activeTurnId: null },
+      false,
+    );
+
+    expect(item).toBeNull();
+  });
+
+  it('does not replay unscoped Codex event messages from a previous queued turn', () => {
+    const notifications = [
+      { method: 'event_msg', params: { type: 'agent_message', message: 'Previous turn text' } },
+      { method: 'event_msg', params: { type: 'task_complete', thread_id: 'thread-1', turn_id: 'turn-old' } },
+      { method: 'event_msg', params: { type: 'agent_message', message: 'Next turn text' } },
+    ];
+    const currentTurnNotifications = notificationsSinceCount(notifications, 3, 2);
+    const item = liveStreamingItemFromNotifications(
+      currentTurnNotifications,
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-next' },
+      true,
+    );
+
+    expect(item).toMatchObject({ id: 'live:streaming-assistant', kind: 'streaming', text: 'Next turn text', active: true });
+  });
+
+  it('keeps current-turn notification windows stable after the retained buffer is capped', () => {
+    const notifications = ['n-201', 'n-202', 'n-203'];
+
+    expect(notificationsSinceCount(notifications, 203, 200)).toEqual(['n-201', 'n-202', 'n-203']);
+    expect(notificationsSinceCount(notifications, 203, 202)).toEqual(['n-203']);
+  });
+
   it('clears streaming text after turn completion unless a turn is still active', () => {
     const item = liveStreamingItemFromNotifications(
       [
         { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'Hello' } },
         { method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-1' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+    );
+
+    expect(item).toBeNull();
+  });
+
+  it('clears Codex event message streaming text on task completion', () => {
+    const item = liveStreamingItemFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', message: 'Working', phase: 'commentary' } },
+        { method: 'event_msg', params: { type: 'task_complete', turn_id: 'turn-1' } },
       ],
       { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
       false,
@@ -190,6 +252,15 @@ describe('timeline', () => {
         { activeThreadId: 'thread-active', activeTurnId: 'turn-active' },
       ),
     ).toBe(false);
+  });
+
+  it('recognizes Codex task_complete event messages as turn completion signals', () => {
+    expect(
+      notificationIsTurnComplete(
+        { method: 'event_msg', params: { type: 'task_complete', turn_id: 'turn-active' } },
+        { activeThreadId: 'thread-active', activeTurnId: 'turn-active' },
+      ),
+    ).toBe(true);
   });
 
   it('keeps numeric and string approval request ids distinct', () => {

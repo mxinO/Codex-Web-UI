@@ -1985,6 +1985,27 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-next', queue: [] });
   });
 
+  it('treats Codex task_complete event messages as turn completion', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ turn: { id: 'turn-next' } });
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-old',
+      queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }],
+    });
+
+    notify('event_msg', { payload: { type: 'task_complete', thread_id: 'thread-1', turn_id: 'turn-old' } });
+    await waitForRequestCalls(request, 2);
+
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', persistExtendedHistory: true });
+    expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'next', text_elements: [] }],
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-next', queue: [] });
+  });
+
   it('auto-starts queued messages with captured run options', async () => {
     const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ turn: { id: 'turn-next' } });
     const { stateStore, notify } = await makeHarness(request);

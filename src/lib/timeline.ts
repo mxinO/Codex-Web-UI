@@ -59,8 +59,18 @@ function notificationParams(notification: unknown): unknown {
   return isRecord(notification) ? notification.params : null;
 }
 
+function notificationPayload(notification: unknown): unknown {
+  if (!isRecord(notification)) return null;
+  const params = notification.params;
+  if (isRecord(params) && isRecord(params.payload)) return params.payload;
+  if (isRecord(params)) return params;
+  const payload = notification.payload;
+  return isRecord(payload) ? payload : null;
+}
+
 export function notificationThreadId(notification: unknown): string | null {
   const params = notificationParams(notification);
+  const payload = notificationPayload(notification);
   return (
     stringAtPath(params, ['threadId']) ??
     stringAtPath(params, ['thread_id']) ??
@@ -69,13 +79,26 @@ export function notificationThreadId(notification: unknown): string | null {
     stringAtPath(params, ['thread', 'thread_id']) ??
     stringAtPath(params, ['turn', 'threadId']) ??
     stringAtPath(params, ['turn', 'thread_id']) ??
-    stringAtPath(params, ['turn', 'thread', 'id'])
+    stringAtPath(params, ['turn', 'thread', 'id']) ??
+    stringAtPath(payload, ['threadId']) ??
+    stringAtPath(payload, ['thread_id']) ??
+    stringAtPath(payload, ['thread', 'id']) ??
+    stringAtPath(payload, ['turn', 'threadId']) ??
+    stringAtPath(payload, ['turn', 'thread_id'])
   );
 }
 
 export function notificationTurnId(notification: unknown): string | null {
   const params = notificationParams(notification);
-  return stringAtPath(params, ['turnId']) ?? stringAtPath(params, ['turn_id']) ?? stringAtPath(params, ['turn', 'id']);
+  const payload = notificationPayload(notification);
+  return (
+    stringAtPath(params, ['turnId']) ??
+    stringAtPath(params, ['turn_id']) ??
+    stringAtPath(params, ['turn', 'id']) ??
+    stringAtPath(payload, ['turnId']) ??
+    stringAtPath(payload, ['turn_id']) ??
+    stringAtPath(payload, ['turn', 'id'])
+  );
 }
 
 export function notificationMatchesActiveTurn(notification: unknown, scope: TimelineNotificationScope): boolean {
@@ -88,6 +111,21 @@ export function notificationMatchesActiveTurn(notification: unknown, scope: Time
   if (turnId && scope.activeTurnId && turnId === scope.activeTurnId) return true;
   if (!scope.activeThreadId && !scope.activeTurnId) return true;
   return false;
+}
+
+export function notificationIsTurnComplete(notification: unknown, scope: TimelineNotificationScope): boolean {
+  if (!isRecord(notification) || typeof notification.method !== 'string') return false;
+  const payload = notificationPayload(notification);
+  const isComplete =
+    notification.method === 'turn/completed' ||
+    (notification.method === 'event_msg' && isRecord(payload) && payload.type === 'task_complete');
+  if (!isComplete) return false;
+
+  const threadId = notificationThreadId(notification);
+  const turnId = notificationTurnId(notification);
+  if (threadId && scope.activeThreadId && threadId !== scope.activeThreadId) return false;
+  if (turnId && scope.activeTurnId && turnId !== scope.activeTurnId) return false;
+  return true;
 }
 
 function stringField(value: unknown, key: string, fallback = ''): string {
@@ -283,6 +321,12 @@ export function mergeTimelineItemsByTimestamp(items: TimelineItem[]): TimelineIt
     .map(({ item }) => item);
 }
 
+export function notificationsSinceCount<T>(notifications: T[], totalCount: number, startCount: number): T[] {
+  const retainedAfterStart = Math.max(0, totalCount - startCount);
+  const firstRetainedAfterStart = Math.max(0, notifications.length - retainedAfterStart);
+  return notifications.slice(firstRetainedAfterStart);
+}
+
 export function liveStreamingItemFromNotifications(
   notifications: unknown[],
   scope: TimelineNotificationScope,
@@ -299,10 +343,26 @@ export function liveStreamingItemFromNotifications(
       continue;
     }
 
-    if (notification.method !== 'item/agentMessage/delta' || !isRecord(notification.params)) continue;
-    if (!notificationMatchesActiveTurn(notification, scope)) continue;
-    const delta = notification.params.delta;
-    if (typeof delta === 'string') text += delta;
+    if (notification.method === 'item/agentMessage/delta' && isRecord(notification.params)) {
+      if (!notificationMatchesActiveTurn(notification, scope)) continue;
+      const delta = notification.params.delta;
+      if (typeof delta === 'string') text += delta;
+      continue;
+    }
+
+    if (notification.method !== 'event_msg') continue;
+    const payload = notificationPayload(notification);
+    if (!isRecord(payload)) continue;
+    if (payload.type === 'task_complete') {
+      if (notificationIsTurnComplete(notification, scope)) text = '';
+      continue;
+    }
+    if (payload.type !== 'agent_message') continue;
+    const hasScopeId = Boolean(notificationThreadId(notification) || notificationTurnId(notification));
+    if (hasScopeId && !notificationMatchesActiveTurn(notification, scope)) continue;
+    if (!hasScopeId && !active) continue;
+    const message = payload.message;
+    if (typeof message === 'string' && message.trim()) text = text ? `${text}\n\n${message}` : message;
   }
 
   if (!text && !active) return null;

@@ -210,7 +210,14 @@ function getStringPath(value: unknown, path: string[]): string | null {
   return typeof current === 'string' && current.trim() ? current.trim() : null;
 }
 
-function notificationThreadId(message: { params?: unknown }): string | null {
+function notificationPayload(message: { params?: unknown; payload?: unknown }): unknown {
+  if (isRecord(message.params) && isRecord(message.params.payload)) return message.params.payload;
+  if (isRecord(message.params)) return message.params;
+  return isRecord(message.payload) ? message.payload : null;
+}
+
+function notificationThreadId(message: { params?: unknown; payload?: unknown }): string | null {
+  const payload = notificationPayload(message);
   return (
     getStringPath(message.params, ['threadId']) ??
     getStringPath(message.params, ['thread_id']) ??
@@ -219,12 +226,31 @@ function notificationThreadId(message: { params?: unknown }): string | null {
     getStringPath(message.params, ['thread', 'thread_id']) ??
     getStringPath(message.params, ['turn', 'threadId']) ??
     getStringPath(message.params, ['turn', 'thread_id']) ??
-    getStringPath(message.params, ['turn', 'thread', 'id'])
+    getStringPath(message.params, ['turn', 'thread', 'id']) ??
+    getStringPath(payload, ['threadId']) ??
+    getStringPath(payload, ['thread_id']) ??
+    getStringPath(payload, ['thread', 'id']) ??
+    getStringPath(payload, ['turn', 'threadId']) ??
+    getStringPath(payload, ['turn', 'thread_id'])
   );
 }
 
-function notificationTurnId(message: { params?: unknown }): string | null {
-  return getStringPath(message.params, ['turnId']) ?? getStringPath(message.params, ['turn_id']) ?? getStringPath(message.params, ['turn', 'id']);
+function notificationTurnId(message: { params?: unknown; payload?: unknown }): string | null {
+  const payload = notificationPayload(message);
+  return (
+    getStringPath(message.params, ['turnId']) ??
+    getStringPath(message.params, ['turn_id']) ??
+    getStringPath(message.params, ['turn', 'id']) ??
+    getStringPath(payload, ['turnId']) ??
+    getStringPath(payload, ['turn_id']) ??
+    getStringPath(payload, ['turn', 'id'])
+  );
+}
+
+function isTaskCompleteEvent(message: { method?: unknown; params?: unknown; payload?: unknown }): boolean {
+  if (message.method !== 'event_msg') return false;
+  const payload = notificationPayload(message);
+  return getStringPath(payload, ['type']) === 'task_complete';
 }
 
 function extractThreadId(result: unknown): string | null {
@@ -1393,7 +1419,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     if (resolvedRequestId !== null && pendingServerRequests.delete(requestKey(resolvedRequestId))) {
       broadcastRequestResolved(resolvedRequestId);
     }
-    if (message.method === 'event_msg') enqueuePatchApplyEnd(message);
+    if (message.method === 'event_msg') {
+      enqueuePatchApplyEnd(message);
+      if (isTaskCompleteEvent(message)) void handleTurnCompleted(message);
+    }
     if (message.method === 'turn/completed') void handleTurnCompleted(message);
   });
 

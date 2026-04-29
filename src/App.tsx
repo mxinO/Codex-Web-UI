@@ -30,6 +30,8 @@ import {
   approvalItemsFromRequests,
   liveStreamingItemFromNotifications,
   mergeTimelineItemsByTimestamp,
+  notificationsSinceCount,
+  notificationIsTurnComplete,
   notificationMatchesActiveTurn,
   requestKey,
   type TimelineItem,
@@ -158,10 +160,20 @@ export default function App() {
   const bangCounterRef = useRef(0);
   const pendingUserCounterRef = useRef(0);
   const activeFileSummaryScopeRef = useRef({ threadId: activeThreadId, threadPath: activeThreadPath, turnId: state?.activeTurnId ?? null });
+  const liveTurnKey = `${activeThreadId ?? ''}\0${state?.activeTurnId ?? ''}`;
+  const liveNotificationWindowRef = useRef({ key: liveTurnKey, startCount: socket.notificationCount });
+  if (liveNotificationWindowRef.current.key !== liveTurnKey) {
+    liveNotificationWindowRef.current = { key: liveTurnKey, startCount: socket.notificationCount };
+  }
+  const liveNotificationStartCount = liveNotificationWindowRef.current.startCount;
   const lastNotification = socket.notifications.at(-1);
+  const liveNotifications = useMemo(
+    () => notificationsSinceCount(socket.notifications, socket.notificationCount, liveNotificationStartCount),
+    [liveNotificationStartCount, socket.notificationCount, socket.notifications],
+  );
   const liveStreamingItem = useMemo(
-    () => liveStreamingItemFromNotifications(socket.notifications, { activeThreadId, activeTurnId: state?.activeTurnId ?? null }, Boolean(state?.activeTurnId)),
-    [activeThreadId, socket.notifications, state?.activeTurnId],
+    () => liveStreamingItemFromNotifications(liveNotifications, { activeThreadId, activeTurnId: state?.activeTurnId ?? null }, Boolean(state?.activeTurnId)),
+    [activeThreadId, liveNotifications, state?.activeTurnId],
   );
   const approvalItems = useMemo(() => approvalItemsFromRequests(socket.requests, answeredApprovals), [answeredApprovals, socket.requests]);
   const queuedTimelineItems = useMemo<TimelineItem[]>(
@@ -254,8 +266,7 @@ export default function App() {
       !activeThreadId ||
       typeof lastNotification !== 'object' ||
       lastNotification === null ||
-      (lastNotification as Record<string, unknown>).method !== 'turn/completed' ||
-      !notificationMatchesActiveTurn(lastNotification, { activeThreadId, activeTurnId: state?.activeTurnId ?? null })
+      !notificationIsTurnComplete(lastNotification, { activeThreadId, activeTurnId: state?.activeTurnId ?? null })
     ) {
       return;
     }
