@@ -218,7 +218,7 @@ describe('ChatTimeline', () => {
     expect(blocks[1].textContent).toContain('$ npm test -- retry');
   });
 
-  it('keeps file summary diff actions working inside activity blocks', () => {
+  it('renders file summaries as standalone summary cards instead of activity blocks', () => {
     const onOpenFileSummary = vi.fn();
     const item: TimelineItem = {
       id: 'turn-1:file-summary',
@@ -230,9 +230,10 @@ describe('ChatTimeline', () => {
 
     render(<ChatTimeline {...baseProps} items={[item]} onOpenFileSummary={onOpenFileSummary} />);
 
-    expect(document.querySelector('.activity-block')?.textContent).toContain('Files changed');
+    expect(document.querySelector('.activity-block')).toBeNull();
+    expect(document.querySelector('.file-summary-card')?.textContent).toContain('Files changed');
     act(() => {
-      document.querySelector<HTMLButtonElement>('.activity-file__diff')?.click();
+      document.querySelector<HTMLButtonElement>('.file-summary-card button[title="See diff"]')?.click();
     });
 
     expect(onOpenFileSummary).toHaveBeenCalledWith('turn-1', '/repo/a.txt', 2);

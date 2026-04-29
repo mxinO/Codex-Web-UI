@@ -24,7 +24,6 @@ function isActivityItem(item: TimelineItem): boolean {
     item.kind === 'command' ||
     item.kind === 'tool' ||
     item.kind === 'fileChange' ||
-    item.kind === 'fileChangeSummary' ||
     item.kind === 'notice' ||
     item.kind === 'warning' ||
     item.kind === 'error'
@@ -128,7 +127,6 @@ export default function ChatTimeline({
               key={`activity:${entry.map((item) => item.id).join('|')}`}
               items={entry}
               onOpenDetail={onOpenDetail}
-              onOpenFileSummary={onOpenFileSummary}
             />
           ) : (
             <ChatItem
