@@ -251,6 +251,54 @@ describe('timeline', () => {
     expect(shouldShowLiveStreamingItem(staleHistory, null)).toBe(false);
   });
 
+  it('does not hide completed live output when only file edit history for that turn has arrived', () => {
+    const liveItem: Extract<TimelineItem, { kind: 'streaming' }> = {
+      id: 'live:streaming-assistant',
+      kind: 'streaming',
+      timestamp: 100,
+      text: 'Created the file.',
+      active: false,
+      turnId: 'turn-1',
+    };
+    const fileOnlyHistory: TimelineItem[] = [
+      {
+        id: 'turn-1:file-1',
+        kind: 'fileChange',
+        timestamp: 100,
+        turnId: 'turn-1',
+        item: { type: 'fileChange', id: 'file-1', changes: [{ path: '/repo/a.txt' }], status: 'completed' },
+        filePath: '/repo/a.txt',
+        changeCount: 1,
+      },
+      {
+        id: 'turn-1:file-summary',
+        kind: 'fileChangeSummary',
+        timestamp: 100,
+        turnId: 'turn-1',
+        files: [{ path: '/repo/a.txt', changeCount: 1 }],
+      },
+    ];
+
+    expect(shouldShowLiveStreamingItem(fileOnlyHistory, liveItem)).toBe(true);
+  });
+
+  it('does not hide completed live output for same-turn non-assistant history', () => {
+    const liveItem: Extract<TimelineItem, { kind: 'streaming' }> = {
+      id: 'live:streaming-assistant',
+      kind: 'streaming',
+      timestamp: 100,
+      text: 'Still responding.',
+      active: false,
+      turnId: 'turn-1',
+    };
+    const nonAssistantHistory: TimelineItem[] = [
+      { id: 'turn-1:c1', kind: 'command', timestamp: 100, command: 'pwd', cwd: '/repo', output: '/repo\n', status: 'completed', exitCode: 0 },
+      { id: 'turn-1:t1', kind: 'tool', timestamp: 100, item: { type: 'customTool', id: 't1' } },
+    ];
+
+    expect(shouldShowLiveStreamingItem(nonAssistantHistory, liveItem)).toBe(true);
+  });
+
   it('ignores live deltas from a different thread', () => {
     const item = liveStreamingItemFromNotifications(
       [

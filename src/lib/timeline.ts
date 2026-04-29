@@ -335,7 +335,7 @@ export function timelineItemTurnId(item: TimelineItem): string | null {
 
 export function shouldShowLiveStreamingItem(items: TimelineItem[], liveItem: Extract<TimelineItem, { kind: 'streaming' }> | null): boolean {
   if (!liveItem) return false;
-  return !liveItem.turnId || !items.some((item) => timelineItemTurnId(item) === liveItem.turnId);
+  return !liveItem.turnId || !items.some((item) => item.kind === 'assistant' && timelineItemTurnId(item) === liveItem.turnId);
 }
 
 export function notificationsSinceCount<T>(notifications: T[], totalCount: number, startCount: number): T[] {
