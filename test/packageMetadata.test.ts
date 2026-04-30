@@ -9,6 +9,8 @@ const packageJson = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 
   files?: string[];
   scripts?: Record<string, string>;
 };
+const sourceIndexHtml = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
+const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
 
 describe('package metadata', () => {
   it('keeps browser bundle libraries out of runtime dependencies', () => {
@@ -19,5 +21,13 @@ describe('package metadata', () => {
     expect(packageJson.files).toContain('dist');
     expect(packageJson.scripts?.prepare).toBeUndefined();
     expect(fs.existsSync(path.join(root, 'dist', 'index.html'))).toBe(true);
+  });
+
+  it('ships and references the project icon', () => {
+    expect(sourceIndexHtml).toContain('rel="icon"');
+    expect(sourceIndexHtml).toContain('/icon.svg');
+    expect(readme).toContain('dist/icon.svg');
+    expect(fs.existsSync(path.join(root, 'public', 'icon.svg'))).toBe(true);
+    expect(fs.existsSync(path.join(root, 'dist', 'icon.svg'))).toBe(true);
   });
 });

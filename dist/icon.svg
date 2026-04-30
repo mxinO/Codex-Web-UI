@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Codex Web UI">
+  <rect width="64" height="64" rx="14" fill="#111827"/>
+  <rect x="9" y="14" width="46" height="36" rx="7" fill="#182236" stroke="#5eead4" stroke-width="2.5"/>
+  <circle cx="17" cy="22" r="2.4" fill="#fb7185"/>
+  <circle cx="25" cy="22" r="2.4" fill="#fbbf24"/>
+  <circle cx="33" cy="22" r="2.4" fill="#34d399"/>
+  <path d="M19 34l7 5-7 5" fill="none" stroke="#5eead4" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M32 44h14" fill="none" stroke="#93c5fd" stroke-width="4" stroke-linecap="round"/>
+  <path d="M45 31l2.2 4.8 4.8 2.2-4.8 2.2L45 46l-2.2-4.8L38 39l4.8-2.2L45 31z" fill="#a78bfa"/>
+</svg>

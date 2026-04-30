@@ -1,4 +1,7 @@
-# Codex Web UI
+<h1>
+  <img src="dist/icon.svg" width="32" height="32" alt="Codex Web UI icon" align="center">
+  Codex Web UI
+</h1>
 
 A lightweight browser interface for Codex CLI using `codex app-server`.
 
