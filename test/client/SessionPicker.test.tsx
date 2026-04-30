@@ -29,6 +29,7 @@ afterEach(() => {
   container?.remove();
   root = null;
   container = null;
+  vi.useRealTimers();
 });
 
 function thread(overrides: Partial<CodexThread>): CodexThread {
@@ -49,6 +50,13 @@ type CwdPickerRpc = React.ComponentProps<typeof CwdPicker>['rpc'];
 
 function asCwdRpc(mock: unknown): CwdPickerRpc {
   return mock as CwdPickerRpc;
+}
+
+function changeInputValue(input: HTMLInputElement | null, value: string) {
+  if (!input) throw new Error('missing input');
+  const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+  setter?.call(input, value);
+  input.dispatchEvent(new Event('input', { bubbles: true }));
 }
 
 describe('SessionPicker', () => {
@@ -162,5 +170,85 @@ describe('CwdPicker', () => {
     });
 
     expect(onConfirm).toHaveBeenCalledWith('/work/project');
+  });
+
+  it('updates folder suggestions from the manually edited path', async () => {
+    vi.useFakeTimers();
+    const rpc = vi.fn((method: string, params?: unknown) => {
+      const path = (params as { path?: string } | undefined)?.path;
+      if (method === 'webui/fs/browseDirectory' && path === '/work') {
+        return Promise.resolve({
+          path: '/work',
+          entries: [
+            { name: 'project', path: '/work/project', isDirectory: true },
+            { name: 'scratch', path: '/work/scratch', isDirectory: true },
+          ],
+        });
+      }
+      if (method === 'webui/fs/browseDirectory' && path === '/work/project') {
+        return Promise.resolve({ path: '/work/project', entries: [] });
+      }
+      return Promise.reject(new Error(`unexpected ${method} ${path}`));
+    });
+
+    render(<CwdPicker initialCwd="/work" rpc={asCwdRpc(rpc)} onCancel={vi.fn()} onConfirm={vi.fn()} />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const input = document.querySelector<HTMLInputElement>('.text-input');
+    act(() => {
+      changeInputValue(input, '/work/pr');
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(rpc).toHaveBeenCalledWith('webui/fs/browseDirectory', { path: '/work' });
+    expect(document.querySelector<HTMLButtonElement>('[aria-label="Open folder project"]')).toBeInstanceOf(HTMLButtonElement);
+    expect(document.querySelector<HTMLButtonElement>('[aria-label="Open folder scratch"]')).toBeNull();
+
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="Open folder project"]')?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(input?.value).toBe('/work/project');
+    expect(rpc).toHaveBeenCalledWith('webui/fs/browseDirectory', { path: '/work/project' });
+  });
+
+  it('browses the typed directory when the edited path ends with a slash', async () => {
+    vi.useFakeTimers();
+    const rpc = vi.fn((method: string, params?: unknown) => {
+      const path = (params as { path?: string } | undefined)?.path;
+      if (method === 'webui/fs/browseDirectory' && path === '/work') return Promise.resolve({ path: '/work', entries: [] });
+      if (method === 'webui/fs/browseDirectory' && path === '/work/project') {
+        return Promise.resolve({ path: '/work/project', entries: [{ name: 'src', path: '/work/project/src', isDirectory: true }] });
+      }
+      return Promise.reject(new Error(`unexpected ${method} ${path}`));
+    });
+
+    render(<CwdPicker initialCwd="/work" rpc={asCwdRpc(rpc)} onCancel={vi.fn()} onConfirm={vi.fn()} />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const input = document.querySelector<HTMLInputElement>('.text-input');
+    act(() => {
+      changeInputValue(input, '/work/project/');
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(300);
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(rpc).toHaveBeenCalledWith('webui/fs/browseDirectory', { path: '/work/project' });
+    expect(document.querySelector<HTMLButtonElement>('[aria-label="Open folder src"]')).toBeInstanceOf(HTMLButtonElement);
   });
 });

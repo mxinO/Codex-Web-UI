@@ -22,6 +22,16 @@ interface DirectoryEntry {
   path: string;
 }
 
+interface LoadDirectoryOptions {
+  filterPrefix?: string;
+  syncInput?: boolean;
+}
+
+interface TypedBrowseRequest {
+  path: string;
+  filterPrefix: string;
+}
+
 interface BrowseResult {
   path?: unknown;
   parent?: unknown;
@@ -30,11 +40,29 @@ interface BrowseResult {
   truncated?: unknown;
 }
 
+const TYPED_BROWSE_DEBOUNCE_MS = 250;
+
 function parentPath(filePath: string): string {
   const trimmed = filePath.trim().replace(/\/+$/, '');
   if (!trimmed || trimmed === '/') return '/';
   const index = trimmed.lastIndexOf('/');
   return index <= 0 ? '/' : trimmed.slice(0, index);
+}
+
+function stripTrailingSlashes(filePath: string): string {
+  const stripped = filePath.trim().replace(/\/+$/, '');
+  return stripped || '/';
+}
+
+function typedBrowseRequest(filePath: string): TypedBrowseRequest | null {
+  const trimmed = filePath.trim();
+  if (!trimmed) return null;
+  if (trimmed.endsWith('/')) return { path: stripTrailingSlashes(trimmed), filterPrefix: '' };
+
+  const slashIndex = trimmed.lastIndexOf('/');
+  if (slashIndex < 0) return { path: '.', filterPrefix: trimmed };
+  if (slashIndex === 0) return { path: '/', filterPrefix: trimmed.slice(1) };
+  return { path: trimmed.slice(0, slashIndex), filterPrefix: trimmed.slice(slashIndex + 1) };
 }
 
 function rawEntries(result: BrowseResult): RawDirectoryEntry[] {
@@ -57,8 +85,15 @@ function normalizeEntries(result: BrowseResult): DirectoryEntry[] {
     .sort((a, b) => a.name.localeCompare(b.name));
 }
 
+function filterEntries(entries: DirectoryEntry[], filterPrefix: string): DirectoryEntry[] {
+  const normalizedPrefix = filterPrefix.trim().toLowerCase();
+  if (!normalizedPrefix) return entries;
+  return entries.filter((entry) => entry.name.toLowerCase().startsWith(normalizedPrefix));
+}
+
 export default function CwdPicker({ initialCwd, rpc, busy = false, onCancel, onConfirm }: Props) {
   const [cwd, setCwd] = useState(initialCwd);
+  const [typedCwd, setTypedCwd] = useState<string | null>(null);
   const [browsePath, setBrowsePath] = useState(initialCwd.trim() || '/');
   const [parent, setParent] = useState(parentPath(initialCwd.trim() || '/'));
   const [entries, setEntries] = useState<DirectoryEntry[]>([]);
@@ -67,11 +102,13 @@ export default function CwdPicker({ initialCwd, rpc, busy = false, onCancel, onC
   const [browseTruncated, setBrowseTruncated] = useState(false);
   const titleId = useId();
   const browseSeqRef = useRef(0);
+  const skipBrowsePathEffectForRef = useRef<string | null>(null);
   const trimmedCwd = cwd.trim();
 
   const loadDirectory = useCallback(
-    async (path: string) => {
+    async (path: string, options: LoadDirectoryOptions = {}) => {
       if (!rpc || !path.trim()) return;
+      const { filterPrefix = '', syncInput = true } = options;
       const sequence = (browseSeqRef.current += 1);
       setBrowseLoading(true);
       setBrowseError(null);
@@ -80,10 +117,11 @@ export default function CwdPicker({ initialCwd, rpc, busy = false, onCancel, onC
         if (sequence !== browseSeqRef.current) return;
         const resolvedPath = typeof result.path === 'string' && result.path.length > 0 ? result.path : path;
         const resolvedParent = typeof result.parent === 'string' && result.parent.length > 0 ? result.parent : parentPath(resolvedPath);
+        if (!syncInput) skipBrowsePathEffectForRef.current = resolvedPath;
         setBrowsePath(resolvedPath);
-        setCwd(resolvedPath);
+        if (syncInput) setCwd(resolvedPath);
         setParent(resolvedParent);
-        setEntries(normalizeEntries(result));
+        setEntries(filterEntries(normalizeEntries(result), filterPrefix));
         setBrowseTruncated(result.truncated === true);
       } catch (caught) {
         if (sequence !== browseSeqRef.current) return;
@@ -99,16 +137,41 @@ export default function CwdPicker({ initialCwd, rpc, busy = false, onCancel, onC
 
   useEffect(() => {
     if (!rpc) return;
+    if (skipBrowsePathEffectForRef.current !== null) {
+      const skippedPath = skipBrowsePathEffectForRef.current;
+      skipBrowsePathEffectForRef.current = null;
+      if (skippedPath === browsePath) return;
+    }
     void loadDirectory(browsePath);
   }, [browsePath, loadDirectory, rpc]);
 
+  useEffect(() => {
+    if (!rpc || typedCwd === null) return;
+    const request = typedBrowseRequest(typedCwd);
+    if (!request) return;
+
+    const timer = window.setTimeout(() => {
+      void loadDirectory(request.path, { filterPrefix: request.filterPrefix, syncInput: false });
+    }, TYPED_BROWSE_DEBOUNCE_MS);
+    return () => window.clearTimeout(timer);
+  }, [loadDirectory, rpc, typedCwd]);
+
   const chooseFolder = (path: string) => {
+    setTypedCwd(null);
     setCwd(path);
     setBrowsePath(path);
   };
 
   const browseTypedPath = () => {
-    if (trimmedCwd) setBrowsePath(trimmedCwd);
+    if (trimmedCwd) {
+      setTypedCwd(null);
+      setBrowsePath(trimmedCwd);
+    }
+  };
+
+  const handleInputChange = (value: string) => {
+    setCwd(value);
+    setTypedCwd(value);
   };
 
   return (
@@ -126,7 +189,7 @@ export default function CwdPicker({ initialCwd, rpc, busy = false, onCancel, onC
         <h2 id={titleId}>New Session</h2>
         <label className="field-label">
           Working directory
-          <input className="text-input" value={cwd} onChange={(event) => setCwd(event.target.value)} autoFocus />
+          <input className="text-input" value={cwd} onChange={(event) => handleInputChange(event.target.value)} autoFocus />
         </label>
         {rpc && (
           <div className="cwd-browser" aria-label="Folder picker">
