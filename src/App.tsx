@@ -33,14 +33,13 @@ import {
   approvalItemsFromRequests,
   fileChangeHasInlineDiff,
   latestCompletionNotificationCount,
-  liveStreamingItemForTimeline,
-  liveStreamingItemFromNotifications,
-  liveTimelineItemsFromNotifications,
+  liveTurnItemsFromNotifications,
   mergeTimelineItemsByTimestamp,
   nextLiveNotificationWindow,
   notificationsSinceCount,
   notificationMatchesActiveTurn,
   requestKey,
+  visibleLiveTurnItemsForTimeline,
   type TimelineItem,
 } from './lib/timeline';
 import type { CodexThread } from './types/codex';
@@ -182,13 +181,30 @@ export default function App() {
   const liveNotificationActiveTurnId = liveNotificationWindowRef.current.activeTurnId;
   const liveNotificationStartCount = liveNotificationWindowRef.current.startCount;
   const lastNotification = socket.notifications.at(-1);
-  const liveNotifications = useMemo(
-    () => notificationsSinceCount(socket.notifications, socket.notificationCount, liveNotificationStartCount),
-    [liveNotificationStartCount, socket.notificationCount, socket.notifications],
-  );
-  const liveStreamingItem = useMemo(
+  const liveNotificationWindowKey = `${activeThreadId ?? ''}\0${liveNotificationActiveTurnId ?? ''}\0${liveNotificationStartCount}`;
+  const liveNotificationAccumulatorRef = useRef({ key: liveNotificationWindowKey, processedCount: liveNotificationStartCount });
+  const [liveNotifications, setLiveNotifications] = useState<unknown[]>([]);
+  useEffect(() => {
+    const accumulator = liveNotificationAccumulatorRef.current;
+    if (
+      accumulator.key !== liveNotificationWindowKey ||
+      accumulator.processedCount < liveNotificationStartCount ||
+      accumulator.processedCount > socket.notificationCount
+    ) {
+      const retained = notificationsSinceCount(socket.notifications, socket.notificationCount, liveNotificationStartCount);
+      liveNotificationAccumulatorRef.current = { key: liveNotificationWindowKey, processedCount: socket.notificationCount };
+      setLiveNotifications(retained);
+      return;
+    }
+
+    const additions = notificationsSinceCount(socket.notifications, socket.notificationCount, accumulator.processedCount);
+    if (additions.length === 0) return;
+    accumulator.processedCount = socket.notificationCount;
+    setLiveNotifications((current) => [...current, ...additions]);
+  }, [liveNotificationStartCount, liveNotificationWindowKey, socket.notificationCount, socket.notifications]);
+  const liveTurnItems = useMemo(
     () =>
-      liveStreamingItemFromNotifications(
+      liveTurnItemsFromNotifications(
         liveNotifications,
         { activeThreadId, activeTurnId: liveNotificationActiveTurnId },
         Boolean(state?.activeTurnId),
@@ -205,15 +221,7 @@ export default function App() {
       }),
     [activeThreadId, liveNotificationActiveTurnId, liveNotifications, socket.notificationCount],
   );
-  const liveTimelineItems = useMemo(
-    () => liveTimelineItemsFromNotifications(liveNotifications, { activeThreadId, activeTurnId: liveNotificationActiveTurnId }),
-    [activeThreadId, liveNotificationActiveTurnId, liveNotifications],
-  );
-  const visibleLiveTimelineItems = useMemo(() => {
-    const persistedIds = new Set(timeline.items.map((item) => item.id));
-    return liveTimelineItems.filter((item) => !persistedIds.has(item.id));
-  }, [liveTimelineItems, timeline.items]);
-  const visibleLiveStreamingItem = useMemo(() => liveStreamingItemForTimeline(timeline.items, liveStreamingItem), [liveStreamingItem, timeline.items]);
+  const visibleLiveTurnItems = useMemo(() => visibleLiveTurnItemsForTimeline(timeline.items, liveTurnItems), [liveTurnItems, timeline.items]);
   const approvalItems = useMemo(() => approvalItemsFromRequests(socket.requests, answeredApprovals), [answeredApprovals, socket.requests]);
   const queuedTimelineItems = useMemo<TimelineItem[]>(
     () =>
@@ -232,11 +240,10 @@ export default function App() {
       ...pendingUserItems,
       ...queuedTimelineItems,
       ...ephemeralItems,
-      ...visibleLiveTimelineItems,
-      ...(visibleLiveStreamingItem ? [visibleLiveStreamingItem] : []),
+      ...visibleLiveTurnItems,
       ...approvalItems,
     ]);
-  }, [approvalItems, ephemeralItems, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items, visibleLiveStreamingItem, visibleLiveTimelineItems]);
+  }, [approvalItems, ephemeralItems, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items, visibleLiveTurnItems]);
   const runOptions = useMemo<CodexRunOptions>(() => ({ model, mode: effectiveMode(mode, model), effort, sandbox }), [effort, mode, model, sandbox]);
 
   useEffect(() => {

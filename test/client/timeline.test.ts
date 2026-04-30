@@ -11,10 +11,12 @@ import {
   fileChangeHasInlineDiff,
   liveStreamingItemForTimeline,
   liveTimelineItemsFromNotifications,
+  liveTurnItemsFromNotifications,
   requestKey,
   shouldShowLiveStreamingItem,
   turnToTimelineItems,
   trimTimelineWindow,
+  visibleLiveTurnItemsForTimeline,
 } from '../../src/lib/timeline';
 import type { TimelineItem } from '../../src/lib/timeline';
 import type { CodexTurn } from '../../src/types/codex';
@@ -518,6 +520,146 @@ describe('timeline', () => {
 
     expect(items.map((item) => item.kind)).toEqual(['command', 'fileChange', 'tool']);
     expect(items.map((item) => item.id)).toEqual(['turn-1:cmd-1', 'turn-1:file-1', 'turn-1:tool-1']);
+  });
+
+  it('builds ordered live turn items instead of separating all activity from messages', () => {
+    const items = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', message: 'I will inspect the file.', phase: 'commentary', turn_id: 'turn-1' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: {
+              type: 'commandExecution',
+              id: 'cmd-1',
+              command: 'sed -n 1p a.txt',
+              cwd: '/repo',
+              status: 'completed',
+              aggregatedOutput: 'old\n',
+              exitCode: 0,
+            },
+          },
+        },
+        { method: 'event_msg', params: { type: 'agent_message', message: 'Now I will patch it.', phase: 'commentary', turn_id: 'turn-1' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'fileChange', id: 'edit-1', changes: [{ path: '/repo/a.txt' }], status: 'completed' },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      100,
+    );
+
+    expect(items.map((item) => item.kind)).toEqual(['assistant', 'command', 'assistant', 'fileChange']);
+    expect(items.map((item) => (item.kind === 'assistant' ? item.text : item.id))).toEqual([
+      'I will inspect the file.',
+      'turn-1:cmd-1',
+      'Now I will patch it.',
+      'turn-1:edit-1',
+    ]);
+  });
+
+  it('treats repeated event message snapshots as replacement updates', () => {
+    const items = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', id: 'msg-1', message: 'Creat', phase: 'final_answer', turn_id: 'turn-1' } },
+        { method: 'event_msg', params: { type: 'agent_message', id: 'msg-1', message: 'Created the file.', phase: 'final_answer', turn_id: 'turn-1' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      100,
+    );
+
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: 'assistant', text: 'Created the file.', phase: 'final_answer' });
+  });
+
+  it('does not collapse distinct prefix-sharing assistant messages without a shared source id', () => {
+    const items = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', message: 'Done', phase: 'commentary', turn_id: 'turn-1' } },
+        { method: 'event_msg', params: { type: 'agent_message', message: 'Done, now testing.', phase: 'commentary', turn_id: 'turn-1' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      100,
+    );
+
+    expect(items.map((item) => (item.kind === 'assistant' ? item.text : item.id))).toEqual(['Done', 'Done, now testing.']);
+  });
+
+  it('does not overwrite multiple live activity notifications that have no item id', () => {
+    const items = liveTurnItemsFromNotifications(
+      [
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'commandExecution', command: 'pwd', cwd: '/repo', status: 'completed', aggregatedOutput: '/repo\n', exitCode: 0 },
+          },
+        },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'commandExecution', command: 'git status', cwd: '/repo', status: 'completed', aggregatedOutput: 'clean\n', exitCode: 0 },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      100,
+    );
+
+    expect(items).toHaveLength(2);
+    expect(items.map((item) => (item.kind === 'command' ? item.command : item.id))).toEqual(['pwd', 'git status']);
+    expect(new Set(items.map((item) => item.id)).size).toBe(2);
+  });
+
+  it('keeps live items until matching persisted history replaces them', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', message: 'I will inspect the file.', phase: 'commentary', turn_id: 'turn-1' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: {
+              type: 'commandExecution',
+              id: 'cmd-1',
+              command: 'pwd',
+              cwd: '/repo',
+              status: 'completed',
+              aggregatedOutput: '/repo\n',
+              exitCode: 0,
+            },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      100,
+    );
+    const partialHistory: TimelineItem[] = [
+      { id: 'turn-1:a1', kind: 'assistant', timestamp: 100, text: 'I will inspect the file.', phase: 'commentary', turnId: 'turn-1' },
+    ];
+    const caughtUpHistory: TimelineItem[] = [
+      ...partialHistory,
+      { id: 'turn-1:cmd-1', kind: 'command', timestamp: 100, command: 'pwd', cwd: '/repo', output: '/repo\n', status: 'completed', exitCode: 0 },
+    ];
+
+    expect(visibleLiveTurnItemsForTimeline(partialHistory, liveItems).map((item) => item.id)).toEqual(['turn-1:cmd-1']);
+    expect(visibleLiveTurnItemsForTimeline(caughtUpHistory, liveItems)).toEqual([]);
   });
 
   it('detects file-change cards that already carry per-edit diff data', () => {

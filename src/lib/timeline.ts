@@ -3,7 +3,7 @@ import type { CodexRunOptions } from '../types/ui';
 
 export type TimelineItem =
   | { id: string; kind: 'user'; timestamp: number; text: string }
-  | { id: string; kind: 'assistant'; timestamp: number; text: string; phase: string | null }
+  | { id: string; kind: 'assistant'; timestamp: number; text: string; phase: string | null; turnId?: string | null; sourceId?: string | null }
   | { id: string; kind: 'command'; timestamp: number; command: string; cwd: string; output: string; status: string; exitCode: number | null }
   | { id: string; kind: 'bangCommand'; timestamp: number; command: string; cwd: string; output: string; status: string; exitCode: number | null }
   | {
@@ -420,6 +420,272 @@ export function liveTimelineItemsFromNotifications(
   }
 
   return items;
+}
+
+function notificationAllowedInLiveWindow(notification: unknown, scope: TimelineNotificationScope, acceptUnscoped: boolean): boolean {
+  const hasScopeId = Boolean(notificationThreadId(notification) || notificationTurnId(notification));
+  if (hasScopeId) return notificationMatchesActiveTurn(notification, scope);
+  return acceptUnscoped;
+}
+
+function notificationMessagePhase(notification: unknown): string | null {
+  const params = notificationParams(notification);
+  const payload = notificationPayload(notification);
+  return stringAtPath(payload, ['phase']) ?? stringAtPath(params, ['phase']);
+}
+
+function notificationMessageSourceId(notification: unknown): string | null {
+  const params = notificationParams(notification);
+  const payload = notificationPayload(notification);
+  return (
+    stringAtPath(payload, ['id']) ??
+    stringAtPath(payload, ['itemId']) ??
+    stringAtPath(payload, ['item_id']) ??
+    stringAtPath(payload, ['messageId']) ??
+    stringAtPath(payload, ['message_id']) ??
+    stringAtPath(params, ['id']) ??
+    stringAtPath(params, ['itemId']) ??
+    stringAtPath(params, ['item_id']) ??
+    stringAtPath(params, ['messageId']) ??
+    stringAtPath(params, ['message_id'])
+  );
+}
+
+function notificationAgentMessage(notification: unknown): string | null {
+  const payload = notificationPayload(notification);
+  if (!isRecord(payload) || payload.type !== 'agent_message') return null;
+  const message = payload.message;
+  return typeof message === 'string' && message.trim() ? message : null;
+}
+
+function completedAgentMessage(notification: unknown): CodexItem | null {
+  if (!isRecord(notification) || notification.method !== 'item/completed') return null;
+  if (!isRecord(notification.params) || !isRecord(notification.params.item)) return null;
+  const item = notification.params.item as CodexItem;
+  return item.type === 'agentMessage' ? item : null;
+}
+
+function activityItemsFromCompletedNotification(notification: unknown, scope: TimelineNotificationScope, now: number, fallbackKey: string): TimelineItem[] {
+  if (!isRecord(notification) || notification.method !== 'item/completed') return [];
+  if (!isRecord(notification.params) || !isRecord(notification.params.item)) return [];
+
+  const rawItem = notification.params.item as CodexItem;
+  if (rawItem.type === 'agentMessage' || rawItem.type === 'userMessage') return [];
+
+  const turnId = notificationTurnId(notification) ?? scope.activeTurnId ?? 'live';
+  const converted = turnToTimelineItems({
+    id: turnId,
+    status: 'inProgress',
+    startedAt: now / 1000,
+    completedAt: null,
+    items: [rawItem],
+  }).filter(
+    (item) => item.kind === 'command' || item.kind === 'fileChange' || item.kind === 'tool' || item.kind === 'warning' || item.kind === 'error',
+  );
+  if (typeof rawItem.id === 'string' && rawItem.id.trim()) return converted;
+  return converted.map((item, index) => ({ ...item, id: `${item.id}:live:${fallbackKey}:${index}` }) as TimelineItem);
+}
+
+function shouldReplaceLiveAssistantSnapshot(
+  previous: TimelineItem,
+  text: string,
+  phase: string | null,
+  turnId: string | null,
+  sourceId: string | null,
+): boolean {
+  if (previous.kind !== 'assistant') return false;
+  if ((previous.phase ?? null) !== phase) return false;
+  if ((previous.turnId ?? null) !== turnId) return false;
+  if (sourceId || previous.sourceId) return previous.sourceId === sourceId;
+  const previousText = normalizedMessageBlock(previous.text);
+  const nextText = normalizedMessageBlock(text);
+  return nextText === previousText;
+}
+
+function assistantPersistedTextKeys(items: TimelineItem[]): Set<string> {
+  const keys = new Set<string>();
+  for (const item of items) {
+    if (item.kind !== 'assistant') continue;
+    const turnId = timelineItemTurnId(item);
+    if (!turnId) continue;
+    const text = normalizedMessageBlock(item.text);
+    if (text) keys.add(`${turnId}\0${text}`);
+  }
+  return keys;
+}
+
+function finalAssistantTurnIds(items: TimelineItem[]): Set<string> {
+  const turnIds = new Set<string>();
+  for (const item of items) {
+    if (item.kind !== 'assistant') continue;
+    if (item.phase !== null && item.phase !== 'final_answer' && item.phase !== 'final') continue;
+    const turnId = timelineItemTurnId(item);
+    if (turnId) turnIds.add(turnId);
+  }
+  return turnIds;
+}
+
+export function liveTurnItemsFromNotifications(
+  notifications: unknown[],
+  scope: TimelineNotificationScope,
+  active: boolean,
+  now = Date.now(),
+  options: { acceptUnscoped?: boolean } = {},
+): TimelineItem[] {
+  const acceptUnscoped = options.acceptUnscoped ?? active;
+  const items: TimelineItem[] = [];
+  const itemIndexes = new Map<string, number>();
+  let sequence = 0;
+  let deltaIndex: number | null = null;
+
+  const rememberItem = (item: TimelineItem) => {
+    const existingIndex = itemIndexes.get(item.id);
+    if (existingIndex !== undefined) {
+      items[existingIndex] = item;
+      return;
+    }
+    itemIndexes.set(item.id, items.length);
+    items.push(item);
+  };
+
+  const pushAssistant = (text: string, phase: string | null, turnId: string | null, sourceId: string | null = null) => {
+    const previous = items.at(-1);
+    if (previous?.kind === 'assistant' && shouldReplaceLiveAssistantSnapshot(previous, text, phase, turnId, sourceId)) {
+      items[items.length - 1] = { ...previous, text, phase, turnId, sourceId };
+      return;
+    }
+
+    sequence += 1;
+    const id = sourceId && turnId ? `${turnId}:${sourceId}` : `live:assistant:${turnId ?? 'unscoped'}:${sequence}`;
+    rememberItem({
+      id,
+      kind: 'assistant',
+      timestamp: now,
+      text,
+      phase,
+      turnId,
+      sourceId,
+    });
+  };
+
+  const appendDelta = (delta: string, turnId: string | null) => {
+    if (deltaIndex !== null && deltaIndex === items.length - 1) {
+      const previous = items[deltaIndex];
+      if (previous?.kind === 'streaming') {
+        items[deltaIndex] = { ...previous, text: `${previous.text}${delta}`, turnId: previous.turnId ?? turnId };
+        return;
+      }
+    }
+
+    sequence += 1;
+    const item: TimelineItem = {
+      id: `live:streaming:${turnId ?? 'unscoped'}:${sequence}`,
+      kind: 'streaming',
+      timestamp: now,
+      text: delta,
+      active: false,
+      turnId,
+    };
+    items.push(item);
+    deltaIndex = items.length - 1;
+  };
+
+  for (const [notificationIndex, notification] of notifications.entries()) {
+    if (!isRecord(notification) || typeof notification.method !== 'string') continue;
+
+    if (notification.method === 'turn/completed') {
+      if (notificationMatchesActiveTurn(notification, scope)) deltaIndex = null;
+      continue;
+    }
+
+    if (notification.method === 'item/agentMessage/delta' && isRecord(notification.params)) {
+      if (!notificationAllowedInLiveWindow(notification, scope, acceptUnscoped)) continue;
+      const delta = notification.params.delta;
+      if (typeof delta === 'string') appendDelta(delta, notificationTurnId(notification) ?? scope.activeTurnId);
+      continue;
+    }
+
+    if (notification.method === 'event_msg') {
+      const payload = notificationPayload(notification);
+      if (!isRecord(payload)) continue;
+      if (payload.type === 'task_complete') {
+        if (notificationIsTurnComplete(notification, scope)) deltaIndex = null;
+        continue;
+      }
+      if (payload.type !== 'agent_message') continue;
+      if (!notificationAllowedInLiveWindow(notification, scope, acceptUnscoped)) continue;
+      const message = notificationAgentMessage(notification);
+      if (message) {
+        pushAssistant(
+          message,
+          notificationMessagePhase(notification),
+          notificationTurnId(notification) ?? scope.activeTurnId,
+          notificationMessageSourceId(notification),
+        );
+      }
+      deltaIndex = null;
+      continue;
+    }
+
+    if (notification.method === 'item/completed') {
+      if (!notificationAllowedInLiveWindow(notification, scope, acceptUnscoped)) continue;
+      const agentMessage = completedAgentMessage(notification);
+      if (agentMessage) {
+        pushAssistant(
+          stringField(agentMessage, 'text'),
+          nullableStringField(agentMessage, 'phase'),
+          notificationTurnId(notification) ?? scope.activeTurnId,
+          typeof agentMessage.id === 'string' ? agentMessage.id : null,
+        );
+        deltaIndex = null;
+        continue;
+      }
+
+      for (const item of activityItemsFromCompletedNotification(notification, scope, now, String(notificationIndex))) rememberItem(item);
+      deltaIndex = null;
+    }
+  }
+
+  let lastStreamingIndex = -1;
+  for (let index = items.length - 1; index >= 0; index -= 1) {
+    if (items[index].kind === 'streaming') {
+      lastStreamingIndex = index;
+      break;
+    }
+  }
+  if (lastStreamingIndex >= 0) {
+    const item = items[lastStreamingIndex];
+    if (item.kind === 'streaming') items[lastStreamingIndex] = { ...item, active };
+  } else if (active && items.length === 0) {
+    items.push({
+      id: `live:streaming:${scope.activeTurnId ?? 'unscoped'}:waiting`,
+      kind: 'streaming',
+      timestamp: now,
+      text: '',
+      active: true,
+      turnId: scope.activeTurnId,
+    });
+  }
+
+  return items;
+}
+
+export function visibleLiveTurnItemsForTimeline(items: TimelineItem[], liveItems: TimelineItem[]): TimelineItem[] {
+  const persistedIds = new Set(items.map((item) => item.id));
+  const persistedAssistantTexts = assistantPersistedTextKeys(items);
+  const persistedFinalTurns = finalAssistantTurnIds(items);
+
+  return liveItems.filter((item) => {
+    if (persistedIds.has(item.id)) return false;
+    if (item.kind !== 'assistant' && item.kind !== 'streaming') return true;
+
+    const turnId = timelineItemTurnId(item);
+    if (!turnId) return true;
+    const text = normalizedMessageBlock(item.text);
+    if (text && persistedAssistantTexts.has(`${turnId}\0${text}`)) return false;
+    if (item.kind === 'streaming' && !item.active && persistedFinalTurns.has(turnId)) return false;
+    return true;
+  });
 }
 
 export function nextLiveNotificationWindow(

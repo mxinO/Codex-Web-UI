@@ -187,6 +187,9 @@ describe('useCodexSocket', () => {
         }),
       );
     });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(50);
+    });
     expect(currentSocket?.notifications).toHaveLength(1);
     expect(currentSocket?.reconnectEpoch).toBe(0);
 
@@ -205,6 +208,30 @@ describe('useCodexSocket', () => {
 
     expect(currentSocket?.reconnectEpoch).toBe(1);
     expect(currentSocket?.notifications).toEqual([]);
+  });
+
+  it('batches app-server notifications before updating React state', async () => {
+    await renderHook();
+    const ws = MockWebSocket.instances[0];
+    act(() => {
+      ws.open();
+      for (let index = 0; index < 3; index += 1) {
+        ws.onmessage?.(
+          new MessageEvent('message', {
+            data: JSON.stringify({ type: 'codex/notification', message: { method: 'item/agentMessage/delta', params: { delta: String(index) } } }),
+          }),
+        );
+      }
+    });
+
+    expect(currentSocket?.notifications).toEqual([]);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(50);
+    });
+
+    expect(currentSocket?.notificationCount).toBe(3);
+    expect(currentSocket?.notifications.map((item) => (item as { params?: { delta?: string } }).params?.delta)).toEqual(['0', '1', '2']);
   });
 
   it('caps app-server request history at 50 items', async () => {

@@ -37,6 +37,8 @@ type ServerMessage =
   | { type: 'auth/error' };
 
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
+const MAX_RETAINED_NOTIFICATIONS = 5000;
+const NOTIFICATION_FLUSH_DELAY_MS = 50;
 
 interface PendingRpc {
   resolve: (v: unknown) => void;
@@ -88,6 +90,8 @@ export function useCodexSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const nextIdRef = useRef(1);
   const pendingRef = useRef(new Map<number, PendingRpc>());
+  const notificationBufferRef = useRef<unknown[]>([]);
+  const notificationFlushTimerRef = useRef<number | null>(null);
   const connectionStateRef = useRef<ConnectionState>('connecting');
   const reconnectTimerRef = useRef<number | null>(null);
   const hasConnectedRef = useRef(false);
@@ -104,6 +108,32 @@ export function useCodexSocket() {
     }
     pendingRef.current.clear();
   }, []);
+
+  const flushNotifications = useCallback(() => {
+    notificationFlushTimerRef.current = null;
+    const buffered = notificationBufferRef.current;
+    if (buffered.length === 0) return;
+    notificationBufferRef.current = [];
+    setNotificationCount((count) => count + buffered.length);
+    setNotifications((items) => [...items, ...buffered].slice(-MAX_RETAINED_NOTIFICATIONS));
+  }, []);
+
+  const clearNotificationBuffer = useCallback(() => {
+    notificationBufferRef.current = [];
+    if (notificationFlushTimerRef.current !== null) {
+      window.clearTimeout(notificationFlushTimerRef.current);
+      notificationFlushTimerRef.current = null;
+    }
+  }, []);
+
+  const queueNotification = useCallback(
+    (message: unknown) => {
+      notificationBufferRef.current.push(message);
+      if (notificationFlushTimerRef.current !== null) return;
+      notificationFlushTimerRef.current = window.setTimeout(flushNotifications, NOTIFICATION_FLUSH_DELAY_MS);
+    },
+    [flushNotifications],
+  );
 
   const submitToken = useCallback(
     async (token: string) => {
@@ -172,6 +202,7 @@ export function useCodexSocket() {
         if (stopped) return;
         retry = 250;
         if (hasConnectedRef.current) {
+          clearNotificationBuffer();
           setNotifications([]);
           setReconnectEpoch((value) => value + 1);
         }
@@ -193,8 +224,7 @@ export function useCodexSocket() {
           rejectPending(new Error('authentication failed'));
           ws.close();
         } else if (message.type === 'codex/notification') {
-          setNotificationCount((count) => count + 1);
-          setNotifications((items) => [...items.slice(-199), message.message]);
+          queueNotification(message.message);
         } else if (message.type === 'codex/request') {
           setRequests((items) => [...items.slice(-49), message.message]);
         } else if (message.type === 'codex/requestResolved') {
@@ -213,6 +243,7 @@ export function useCodexSocket() {
         if (wsRef.current === ws) {
           wsRef.current = null;
         }
+        clearNotificationBuffer();
         rejectPending(new Error('socket closed'));
         if (stopped || connectionStateRef.current === 'auth-error') return;
         setTrackedConnectionState('disconnected');
@@ -230,10 +261,11 @@ export function useCodexSocket() {
       stopped = true;
       clearReconnectTimer();
       rejectPending(new Error('socket closed'));
+      clearNotificationBuffer();
       wsRef.current?.close();
       wsRef.current = null;
     };
-  }, [authRetryEpoch, rejectPending, setTrackedConnectionState]);
+  }, [authRetryEpoch, clearNotificationBuffer, queueNotification, rejectPending, setTrackedConnectionState]);
 
   const rpc = useCallback(<T,>(method: string, params?: unknown, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) => {
     const ws = wsRef.current;
