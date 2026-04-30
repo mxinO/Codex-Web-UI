@@ -39,6 +39,7 @@ import {
   notificationsSinceCount,
   notificationMatchesActiveTurn,
   requestKey,
+  timelineItemsWithLiveTurnOverlay,
   visibleLiveTurnItemsForTimeline,
   type TimelineItem,
 } from './lib/timeline';
@@ -213,6 +214,10 @@ export default function App() {
       ),
     [activeThreadId, liveNotificationActiveTurnId, liveNotifications, state?.activeTurnId],
   );
+  const timelineItemsForChat = useMemo(
+    () => timelineItemsWithLiveTurnOverlay(timeline.items, liveTurnItems, state?.activeTurnId ? liveNotificationActiveTurnId : null),
+    [liveNotificationActiveTurnId, liveTurnItems, state?.activeTurnId, timeline.items],
+  );
   const latestCompletionCount = useMemo(
     () =>
       latestCompletionNotificationCount(liveNotifications, socket.notificationCount, {
@@ -221,7 +226,10 @@ export default function App() {
       }),
     [activeThreadId, liveNotificationActiveTurnId, liveNotifications, socket.notificationCount],
   );
-  const visibleLiveTurnItems = useMemo(() => visibleLiveTurnItemsForTimeline(timeline.items, liveTurnItems), [liveTurnItems, timeline.items]);
+  const visibleLiveTurnItems = useMemo(
+    () => visibleLiveTurnItemsForTimeline(timelineItemsForChat, liveTurnItems),
+    [liveTurnItems, timelineItemsForChat],
+  );
   const approvalItems = useMemo(() => approvalItemsFromRequests(socket.requests, answeredApprovals), [answeredApprovals, socket.requests]);
   const queuedTimelineItems = useMemo<TimelineItem[]>(
     () =>
@@ -236,14 +244,14 @@ export default function App() {
   const chatItems = useMemo<TimelineItem[]>(() => {
     if (!timeline.isViewingLatest) return timeline.items;
     return mergeTimelineItemsByTimestamp([
-      ...timeline.items,
+      ...timelineItemsForChat,
       ...pendingUserItems,
       ...queuedTimelineItems,
       ...ephemeralItems,
       ...visibleLiveTurnItems,
       ...approvalItems,
     ]);
-  }, [approvalItems, ephemeralItems, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items, visibleLiveTurnItems]);
+  }, [approvalItems, ephemeralItems, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items, timelineItemsForChat, visibleLiveTurnItems]);
   const runOptions = useMemo<CodexRunOptions>(() => ({ model, mode: effectiveMode(mode, model), effort, sandbox }), [effort, mode, model, sandbox]);
 
   useEffect(() => {

@@ -14,6 +14,7 @@ import {
   liveTurnItemsFromNotifications,
   requestKey,
   shouldShowLiveStreamingItem,
+  timelineItemsWithLiveTurnOverlay,
   turnToTimelineItems,
   trimTimelineWindow,
   visibleLiveTurnItemsForTimeline,
@@ -660,6 +661,51 @@ describe('timeline', () => {
 
     expect(visibleLiveTurnItemsForTimeline(partialHistory, liveItems).map((item) => item.id)).toEqual(['turn-1:cmd-1']);
     expect(visibleLiveTurnItemsForTimeline(caughtUpHistory, liveItems)).toEqual([]);
+  });
+
+  it('keeps duplicate active-turn history rows in live notification order while streaming', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', message: 'I will inspect the file.', phase: 'commentary', turn_id: 'turn-1' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: {
+              type: 'commandExecution',
+              id: 'cmd-1',
+              command: 'pwd',
+              cwd: '/repo',
+              status: 'completed',
+              aggregatedOutput: '/repo\n',
+              exitCode: 0,
+            },
+          },
+        },
+        { method: 'event_msg', params: { type: 'agent_message', message: 'Now I will patch it.', phase: 'commentary', turn_id: 'turn-1' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      3000,
+    );
+    const persistedHistory: TimelineItem[] = [
+      { id: 'turn-1:u1', kind: 'user', timestamp: 1000, text: 'go' },
+      { id: 'turn-1:a1', kind: 'assistant', timestamp: 1000, text: 'I will inspect the file.', phase: 'commentary', turnId: 'turn-1' },
+      { id: 'turn-1:cmd-1', kind: 'command', timestamp: 1000, command: 'pwd', cwd: '/repo', output: '/repo\n', status: 'completed', exitCode: 0 },
+    ];
+
+    const overlaidHistory = timelineItemsWithLiveTurnOverlay(persistedHistory, liveItems, 'turn-1');
+    const visibleLiveItems = visibleLiveTurnItemsForTimeline(overlaidHistory, liveItems);
+    const merged = mergeTimelineItemsByTimestamp([...overlaidHistory, ...visibleLiveItems]);
+
+    expect(merged.map((item) => (item.kind === 'assistant' || item.kind === 'user' ? item.text : item.id))).toEqual([
+      'go',
+      'I will inspect the file.',
+      'turn-1:cmd-1',
+      'Now I will patch it.',
+    ]);
+    expect(timelineItemsWithLiveTurnOverlay(persistedHistory, liveItems, null)).toBe(persistedHistory);
   });
 
   it('detects file-change cards that already carry per-edit diff data', () => {

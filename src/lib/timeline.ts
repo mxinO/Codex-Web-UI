@@ -688,6 +688,25 @@ export function visibleLiveTurnItemsForTimeline(items: TimelineItem[], liveItems
   });
 }
 
+export function timelineItemsWithLiveTurnOverlay(items: TimelineItem[], liveItems: TimelineItem[], activeTurnId: string | null | undefined): TimelineItem[] {
+  if (!activeTurnId || liveItems.length === 0) return items;
+
+  const liveIds = new Set(liveItems.map((item) => item.id));
+  const liveAssistantTexts = new Set(
+    liveItems
+      .filter((item): item is Extract<TimelineItem, { kind: 'assistant' }> => item.kind === 'assistant')
+      .map((item) => normalizedMessageBlock(item.text))
+      .filter(Boolean),
+  );
+
+  return items.filter((item) => {
+    if (timelineItemTurnId(item) !== activeTurnId) return true;
+    if (liveIds.has(item.id)) return false;
+    if (item.kind === 'assistant' && liveAssistantTexts.has(normalizedMessageBlock(item.text))) return false;
+    return true;
+  });
+}
+
 export function nextLiveNotificationWindow(
   current: LiveNotificationWindow,
   scope: TimelineNotificationScope,
