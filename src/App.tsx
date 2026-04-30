@@ -164,6 +164,7 @@ export default function App() {
   const [activeFileSummary, setActiveFileSummary] = useState<ActiveFileSummary | null>(null);
   const [ephemeralItems, setEphemeralItems] = useState<TimelineItem[]>([]);
   const [pendingUserItems, setPendingUserItems] = useState<UserTimelineItem[]>([]);
+  const [pendingCompactionThreadId, setPendingCompactionThreadId] = useState<string | null>(null);
   const [answeredApprovals, setAnsweredApprovals] = useState<Set<string>>(() => new Set());
   const [model, setModelState] = useState<string | null>(() => sanitizeStoredModel(localStorageValue('codex-web-ui:model')));
   const [mode, setModeState] = useState<string | null>(initialMode);
@@ -257,6 +258,7 @@ export default function App() {
     ]);
   }, [approvalItems, ephemeralItems, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items, timelineItemsForChat, visibleLiveTurnItems]);
   const runOptions = useMemo<CodexRunOptions>(() => ({ model, mode: effectiveMode(mode, model), effort, sandbox }), [effort, mode, model, sandbox]);
+  const isRunning = Boolean(state?.activeTurnId || (pendingCompactionThreadId && pendingCompactionThreadId === activeThreadId));
 
   useEffect(() => {
     if (state?.queue) replaceQueue(state.queue);
@@ -277,6 +279,11 @@ export default function App() {
   useEffect(() => {
     if (pendingTurnWindow && state?.activeTurnId) setPendingTurnWindow(null);
   }, [pendingTurnWindow, state?.activeTurnId]);
+
+  useEffect(() => {
+    if (!pendingCompactionThreadId) return;
+    if (activeThreadId !== pendingCompactionThreadId || state?.activeTurnId) setPendingCompactionThreadId(null);
+  }, [activeThreadId, pendingCompactionThreadId, state?.activeTurnId]);
 
   const loadActiveFileSummary = useCallback(async (turnId: string | null | undefined) => {
     if (!turnId || !activeThreadId || socket.connectionState !== 'connected') {
@@ -525,7 +532,22 @@ export default function App() {
         return;
       }
       if (command === '/compact') {
-        setSessionError('/compact is not supported by this Codex app-server integration yet');
+        if (!activeThreadId) {
+          setSessionError('Start or resume a session before compacting');
+          return;
+        }
+        setPendingCompactionThreadId(activeThreadId);
+        setSessionError('Starting context compaction...');
+        void socket
+          .rpc('webui/thread/compact/start', { threadId: activeThreadId })
+          .then(() => {
+            setPendingCompactionThreadId(null);
+            setSessionError('Context compaction started');
+          })
+          .catch((error) => {
+            setPendingCompactionThreadId(null);
+            setSessionError(error instanceof Error ? error.message : String(error));
+          });
         return;
       }
       if (command === '/diff') {
@@ -587,7 +609,7 @@ export default function App() {
 
     window.addEventListener('webui-slash-command', handleSlashCommand);
     return () => window.removeEventListener('webui-slash-command', handleSlashCommand);
-  }, [activeThreadId, effort, loadSessions, mode, model, resumeSession, sandbox, setEffort, setMode, setModel, setSandbox, socket.connectionState, socket.hello?.hostname, state?.activeCwd]);
+  }, [activeThreadId, effort, loadSessions, mode, model, resumeSession, sandbox, setEffort, setMode, setModel, setSandbox, socket.connectionState, socket.hello?.hostname, socket.rpc, state?.activeCwd]);
 
   const editQueued = async (message: ClientQueuedMessage) => {
     setSessionError(null);
@@ -724,7 +746,7 @@ export default function App() {
             <InputBox
               rpc={socket.rpc}
               threadId={activeThreadId}
-              isRunning={Boolean(state?.activeTurnId)}
+              isRunning={isRunning}
               activeCwd={state?.activeCwd ?? null}
               runOptions={runOptions}
               draftOverride={composerDraft}

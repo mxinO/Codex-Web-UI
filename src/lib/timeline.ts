@@ -124,6 +124,7 @@ export function notificationIsTurnComplete(notification: unknown, scope: Timelin
   const payload = notificationPayload(notification);
   const isComplete =
     notification.method === 'turn/completed' ||
+    notification.method === 'thread/compacted' ||
     (notification.method === 'event_msg' && isRecord(payload) && payload.type === 'task_complete');
   if (!isComplete) return false;
 
@@ -593,7 +594,7 @@ export function liveTurnItemsFromNotifications(
   for (const [notificationIndex, notification] of notifications.entries()) {
     if (!isRecord(notification) || typeof notification.method !== 'string') continue;
 
-    if (notification.method === 'turn/completed') {
+    if (notification.method === 'turn/completed' || notification.method === 'thread/compacted') {
       if (notificationMatchesActiveTurn(notification, scope)) deltaIndex = null;
       continue;
     }
@@ -745,7 +746,7 @@ export function liveStreamingItemFromNotifications(
   for (const notification of notifications) {
     if (!isRecord(notification) || typeof notification.method !== 'string') continue;
 
-    if (notification.method === 'turn/completed') {
+    if (notification.method === 'turn/completed' || notification.method === 'thread/compacted') {
       if (notificationMatchesActiveTurn(notification, scope)) turnId = notificationTurnId(notification) ?? turnId;
       continue;
     }

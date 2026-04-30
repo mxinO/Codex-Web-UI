@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -362,6 +362,92 @@ describe('attachBrowserSocket session RPCs', () => {
 
     expect(request).not.toHaveBeenCalled();
     expect(response).toEqual({ type: 'rpc/error', id: 4, error: 'threadId is required' });
+  });
+
+  it('starts manual thread compaction through app-server', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } };
+      if (method === 'thread/compact/start') return {};
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request, {
+      initialState: { activeThreadId: 'thread-1', activeCwd: '/work/project', activeThreadPath: '/sessions/thread-1.jsonl', activeTurnId: null },
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 41, method: 'webui/thread/compact/start', params: { threadId: 'thread-1' } }));
+    const response = await nextRpcResponse(ws, 41);
+
+    expect(request).toHaveBeenCalledWith('thread/resume', {
+      threadId: 'thread-1',
+      experimentalRawEvents: true,
+      persistExtendedHistory: true,
+    });
+    expect(request).toHaveBeenCalledWith('thread/compact/start', { threadId: 'thread-1' });
+    expect(response).toEqual({ type: 'rpc/result', id: 41, result: {} });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'compact-pending:thread-1' });
+  });
+
+  it('does not start manual compaction while the active thread is running', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({});
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: 'turn-1' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 42, method: 'webui/thread/compact/start', params: { threadId: 'thread-1' } }));
+    const response = await nextRpcResponse(ws, 42);
+
+    expect(request).not.toHaveBeenCalled();
+    expect(response).toEqual({ type: 'rpc/error', id: 42, error: 'cannot compact while Codex is working' });
+  });
+
+  it('clears active turn when app-server reports compaction completion', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({});
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-compact',
+      activeThreadPath: join(sessionDir, 'thread-1.jsonl'),
+    });
+
+    notify('thread/compacted', { threadId: 'thread-1', turnId: 'turn-compact' });
+    await flushPromises();
+
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null });
+  });
+
+  it('replaces pending manual compaction state with the app-server turn id', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } };
+      if (method === 'thread/compact/start') return {};
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request, {
+      initialState: { activeThreadId: 'thread-1', activeCwd: '/work/project', activeThreadPath: '/sessions/thread-1.jsonl', activeTurnId: null },
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 43, method: 'webui/thread/compact/start', params: { threadId: 'thread-1' } }));
+    await nextRpcResponse(ws, 43);
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-compact' });
+    await flushPromises();
+
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-compact' });
+  });
+
+  it('clears pending manual compaction state on completion even when completion has the final turn id', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({});
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'compact-pending:thread-1',
+    });
+
+    notify('thread/compacted', { threadId: 'thread-1', turnId: 'turn-compact' });
+    await flushPromises();
+
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null });
   });
 });
 
@@ -2039,24 +2125,62 @@ describe('attachBrowserSocket fs RPC wrappers', () => {
     expect(result.truncated).toBe(true);
   });
 
-  it('forwards read directory requests through the bounded webui RPC', async () => {
-    const result = { entries: [{ name: 'src', isDirectory: true }] };
-    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue(result);
+  it('reads file explorer directories locally without app-server RPCs', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
     const { ws, stateStore } = await makeHarness(request);
     const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-workspace-'));
     mkdirSync(join(workspace, 'src'));
+    writeFileSync(join(workspace, 'README.md'), 'hello');
     cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
     stateStore.write({ ...stateStore.read(), activeCwd: workspace });
 
     ws.send(JSON.stringify({ type: 'rpc', id: 30, method: 'webui/fs/readDirectory', params: { path: ` ${workspace} ` } }));
     const response = await nextMessage(ws);
 
-    expect(request).toHaveBeenCalledWith('fs/readDirectory', { path: workspace });
-    expect(response).toEqual({ type: 'rpc/result', id: 30, result });
+    expect(request).not.toHaveBeenCalled();
+    expect(response.type).toBe('rpc/result');
+    expect(response.id).toBe(30);
+    expect(response.result).toMatchObject({
+      entries: [
+        { fileName: 'src', name: 'src', isDirectory: true, isFile: false },
+        { fileName: 'README.md', name: 'README.md', isDirectory: false, isFile: true },
+      ],
+    });
   });
 
-  it('creates files by writing empty base64 data', async () => {
-    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ ok: true });
+  it('keeps file explorer paths under a symlinked active workspace root', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request);
+    const realParent = mkdtempSync(join(tmpdir(), 'codex-webui-real-workspace-'));
+    const linkParent = mkdtempSync(join(tmpdir(), 'codex-webui-linked-workspace-'));
+    const workspace = join(realParent, 'workspace');
+    const linkedWorkspace = join(linkParent, 'workspace-link');
+    mkdirSync(workspace);
+    mkdirSync(join(workspace, 'src'));
+    writeFileSync(join(workspace, 'README.md'), 'hello from symlink');
+    symlinkSync(workspace, linkedWorkspace, 'dir');
+    cleanups.push(() => rmSync(realParent, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(linkParent, { recursive: true, force: true }));
+    stateStore.write({ ...stateStore.read(), activeCwd: linkedWorkspace });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 301, method: 'webui/fs/readDirectory', params: { path: linkedWorkspace } }));
+    const listing = await nextRpcResponse(ws, 301);
+    const entries = (listing.result as { entries: Array<{ fileName: string; path: string }> }).entries;
+    const readmeEntry = entries.find((entry) => entry.fileName === 'README.md');
+
+    expect(request).not.toHaveBeenCalled();
+    expect(readmeEntry).toMatchObject({ path: join(linkedWorkspace, 'README.md') });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 302, method: 'webui/fs/readFile', params: { path: readmeEntry?.path } }));
+    expect(await nextRpcResponse(ws, 302)).toEqual({
+      type: 'rpc/result',
+      id: 302,
+      result: { dataBase64: Buffer.from('hello from symlink').toString('base64') },
+    });
+  });
+
+  it('creates files locally by writing empty base64 data', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
     const { ws, stateStore } = await makeHarness(request);
     const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-workspace-'));
     cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
@@ -2066,8 +2190,26 @@ describe('attachBrowserSocket fs RPC wrappers', () => {
     ws.send(JSON.stringify({ type: 'rpc', id: 31, method: 'webui/fs/createFile', params: { path: filePath } }));
     const response = await nextMessage(ws);
 
-    expect(request).toHaveBeenCalledWith('fs/writeFile', { path: filePath, dataBase64: '' });
-    expect(response).toEqual({ type: 'rpc/result', id: 31, result: { ok: true } });
+    expect(request).not.toHaveBeenCalled();
+    expect(readFileSync(filePath, 'utf8')).toBe('');
+    expect(response).toEqual({ type: 'rpc/result', id: 31, result: {} });
+  });
+
+  it('writes and reads files locally inside the active workspace', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request);
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-workspace-'));
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    stateStore.write({ ...stateStore.read(), activeCwd: workspace });
+    const filePath = join(workspace, 'note.txt');
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 35, method: 'webui/fs/writeFile', params: { path: filePath, dataBase64: Buffer.from('hello').toString('base64') } }));
+    expect(await nextMessage(ws)).toEqual({ type: 'rpc/result', id: 35, result: {} });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 36, method: 'webui/fs/readFile', params: { path: filePath } }));
+    expect(await nextMessage(ws)).toEqual({ type: 'rpc/result', id: 36, result: { dataBase64: Buffer.from('hello').toString('base64') } });
+
+    expect(request).not.toHaveBeenCalled();
   });
 
   it('rejects write file requests without string base64 data', async () => {
@@ -2155,6 +2297,39 @@ describe('attachBrowserSocket app-server lifecycle', () => {
     expect(await response).toEqual({ type: 'rpc/result', id: 41, result: { data: [] } });
     expect(start).toHaveBeenCalledTimes(1);
     expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'thread/turns/list']);
+  });
+
+  it('clears stale active thread state when resume reports a missing rollout', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockRejectedValue(new Error('no rollout found for thread id thread-1'));
+    const { ws, stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/tmp/missing-rollout.jsonl',
+        activeTurnId: 'turn-1',
+        activeCwd: '/tmp/workspace',
+      },
+    });
+
+    const messages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 42, method: 'thread/turns/list', params: { threadId: 'thread-1' } }));
+    const [hello, response] = await messages;
+
+    expect(hello).toMatchObject({
+      type: 'server/hello',
+      state: {
+        activeThreadId: null,
+        activeThreadPath: null,
+        activeTurnId: null,
+        activeCwd: '/tmp/workspace',
+      },
+    });
+    expect(response).toEqual({ type: 'rpc/error', id: 42, error: 'no rollout found for thread id thread-1' });
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: null,
+      activeThreadPath: null,
+      activeTurnId: null,
+      activeCwd: '/tmp/workspace',
+    });
   });
 
   it('broadcasts app-server health changes while browser clients are idle', async () => {
@@ -2277,7 +2452,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       result: { ok: false, cleared: true, error: 'thread not found' },
     });
     expect(request).toHaveBeenCalledWith('thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true });
-    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: null, activeThreadPath: null, activeTurnId: null, activeCwd: '/work/project' });
   });
 
   it('enqueues, updates, and removes queued messages', async () => {
@@ -2319,6 +2494,21 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
 
     expect(response).toEqual({ type: 'rpc/result', id: 13, result: { turn: { id: 'turn-from-thread-1' } } });
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-2', activeTurnId: 'turn-current' });
+  });
+
+  it('rejects direct turn starts while the active thread is already busy', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: 'compact-pending:thread-1' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 131, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'hello' } }));
+
+    expect(await nextRpcResponse(ws, 131)).toEqual({
+      type: 'rpc/error',
+      id: 131,
+      error: 'Codex is already working; queue the message instead',
+    });
+    expect(request).not.toHaveBeenCalled();
   });
 
   it('forwards run options when starting direct turns', async () => {

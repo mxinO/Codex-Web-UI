@@ -36,10 +36,12 @@ function toolTitle(item: Extract<TimelineItem, { kind: 'tool' }>): string {
     const query = itemString(raw, 'query', itemString(raw, 'text', 'search'));
     return `Web search: ${query}`;
   }
+  if (type === 'contextCompaction') return 'Context compaction';
   return `Tool: ${type}`;
 }
 
 function toolMeta(item: Extract<TimelineItem, { kind: 'tool' }>): string {
+  if (itemString(item.item, 'type') === 'contextCompaction') return 'Conversation history compacted';
   const status = itemString(item.item, 'status', '');
   if (status === 'completed' || status === 'success' || status === 'ok') return 'Tool result';
   if (status === 'running' || status === 'pending') return 'Tool call running';

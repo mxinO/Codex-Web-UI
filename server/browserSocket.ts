@@ -111,6 +111,7 @@ const FILE_DIFF_PATCH_MAX_PATCHES_PER_FILE = 100;
 const FILE_DIFF_PATCH_MAX_BYTES_PER_FILE = FILE_DIFF_SNAPSHOT_MAX_BYTES;
 const FILE_DIFF_PATCH_MAX_PENDING_NOTIFICATIONS = 100;
 const FILE_DIFF_PATCH_MAX_INCOMPLETE_TURNS = 200;
+const COMPACTION_PENDING_TURN_PREFIX = 'compact-pending:';
 
 function getOptionalString(params: unknown, key: string): string | null {
   if (!isRecord(params) || !hasOwn(params, key)) return null;
@@ -348,8 +349,24 @@ async function resolveReadableRpcPath(deps: BrowserSocketDeps, filePath: string)
   return resolveExistingPathInsideRoot(activeWorkspaceRoot(deps), filePath);
 }
 
+async function resolveReadableRpcPaths(deps: BrowserSocketDeps, filePath: string): Promise<{ lexicalPath: string; realPath: string }> {
+  const root = activeWorkspaceRoot(deps);
+  return {
+    lexicalPath: assertPathInsideRoot(root, filePath),
+    realPath: await resolveExistingPathInsideRoot(root, filePath),
+  };
+}
+
 async function resolveWritableRpcPath(deps: BrowserSocketDeps, filePath: string): Promise<string> {
   return resolveWritablePathInsideRoot(activeWorkspaceRoot(deps), filePath);
+}
+
+function pendingCompactionTurnId(threadId: string): string {
+  return `${COMPACTION_PENDING_TURN_PREFIX}${threadId}`;
+}
+
+function isPendingCompactionTurnForThread(turnId: string | null | undefined, threadId: string | null | undefined): boolean {
+  return Boolean(turnId && threadId && turnId === pendingCompactionTurnId(threadId));
 }
 
 function browseBasePath(deps: BrowserSocketDeps): string {
@@ -380,6 +397,72 @@ async function browseDirectory(deps: BrowserSocketDeps, requestedPath: string) {
     parent: nodePath.dirname(resolvedPath),
     truncated,
     entries: entries.sort((a, b) => a.name.localeCompare(b.name)),
+  };
+}
+
+async function readDirectory(deps: BrowserSocketDeps, requestedPath: string) {
+  const { lexicalPath, realPath } = await resolveReadableRpcPaths(deps, requestedPath);
+  const stats = await fs.stat(realPath);
+  if (!stats.isDirectory()) throw new Error('path is not a directory');
+
+  const entries: Array<{ fileName: string; name: string; path: string; isDirectory: boolean; isFile: boolean }> = [];
+  const directory = await fs.opendir(realPath);
+  let truncated = false;
+  for await (const entry of directory) {
+    const realEntryPath = nodePath.join(realPath, entry.name);
+    const lexicalEntryPath = nodePath.join(lexicalPath, entry.name);
+    let isDirectory = entry.isDirectory();
+    let isFile = entry.isFile();
+    if (entry.isSymbolicLink() || (!isDirectory && !isFile)) {
+      try {
+        const entryStats = await fs.stat(realEntryPath);
+        isDirectory = entryStats.isDirectory();
+        isFile = entryStats.isFile();
+      } catch {
+        continue;
+      }
+    }
+
+    if (entries.length >= BROWSE_DIRECTORY_LIMIT) {
+      truncated = true;
+      break;
+    }
+    entries.push({ fileName: entry.name, name: entry.name, path: lexicalEntryPath, isDirectory, isFile });
+  }
+
+  entries.sort((a, b) => Number(b.isDirectory) - Number(a.isDirectory) || a.fileName.localeCompare(b.fileName));
+  return { entries, truncated };
+}
+
+async function readFile(deps: BrowserSocketDeps, requestedPath: string) {
+  const resolvedPath = await resolveReadableRpcPath(deps, requestedPath);
+  const stats = await fs.stat(resolvedPath);
+  if (!stats.isFile()) throw new Error('path is not a file');
+  const data = await fs.readFile(resolvedPath);
+  return { dataBase64: data.toString('base64') };
+}
+
+async function writeFile(deps: BrowserSocketDeps, requestedPath: string, dataBase64: string) {
+  const resolvedPath = await resolveWritableRpcPath(deps, requestedPath);
+  await fs.writeFile(resolvedPath, Buffer.from(dataBase64, 'base64'));
+  return {};
+}
+
+async function createDirectory(deps: BrowserSocketDeps, requestedPath: string) {
+  const resolvedPath = await resolveWritableRpcPath(deps, requestedPath);
+  await fs.mkdir(resolvedPath);
+  return {};
+}
+
+async function getMetadata(deps: BrowserSocketDeps, requestedPath: string) {
+  const { lexicalPath, realPath } = await resolveReadableRpcPaths(deps, requestedPath);
+  const [stats, linkStats] = await Promise.all([fs.stat(realPath), fs.lstat(lexicalPath)]);
+  return {
+    isDirectory: stats.isDirectory(),
+    isFile: stats.isFile(),
+    isSymlink: linkStats.isSymbolicLink(),
+    createdAtMs: stats.birthtimeMs || 0,
+    modifiedAtMs: stats.mtimeMs || 0,
   };
 }
 
@@ -1347,6 +1430,35 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     return next;
   };
 
+  const isMissingThreadError = (error: unknown): boolean => {
+    const message = error instanceof Error ? error.message : String(error);
+    return /no rollout found for thread id|thread not found|thread .* not found/i.test(message);
+  };
+
+  const clearMissingActiveThread = (threadId: string, error: unknown): HostRuntimeState => {
+    resumedThreadIds.delete(threadId);
+    resumeThreadPromises.delete(threadId);
+    knownThreadPaths.delete(threadId);
+    const current = deps.stateStore.read();
+    if (current.activeThreadId !== threadId) return current;
+
+    const next = deps.stateStore.update((state) => {
+      if (state.activeThreadId !== threadId) return state;
+      return {
+        ...state,
+        activeThreadId: null,
+        activeThreadPath: null,
+        activeTurnId: null,
+      };
+    });
+    logWarn('Cleared missing active Codex thread', {
+      threadId,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    broadcastHello(next);
+    return next;
+  };
+
   clearActiveTurn({}, { broadcast: false });
 
   const broadcastRequestResolved = (requestId: number | string) => {
@@ -1416,6 +1528,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         }
         resumedThreadIds.add(threadId);
       })
+      .catch((error) => {
+        if (isMissingThreadError(error)) clearMissingActiveThread(threadId, error);
+        throw error;
+      })
       .finally(() => {
         if (resumeThreadPromises.get(threadId) === resumePromise) {
           resumeThreadPromises.delete(threadId);
@@ -1477,7 +1593,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     const activeCompletion =
       Boolean(current.activeThreadId && current.activeTurnId) &&
       (!completedThreadId || completedThreadId === current.activeThreadId) &&
-      (!completedTurnId || completedTurnId === current.activeTurnId);
+      (!completedTurnId || completedTurnId === current.activeTurnId || isPendingCompactionTurnForThread(current.activeTurnId, current.activeThreadId));
 
     if (!activeCompletion || queuedStartInFlight) {
       if (!current.activeThreadId && current.activeTurnId) {
@@ -1577,7 +1693,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     rememberLivePatchTurn(threadId, turnId);
 
     if (!threadId || current.activeThreadId !== threadId || current.activeTurnId === turnId) return;
-    if (current.activeTurnId && current.activeTurnId !== turnId) return;
+    if (current.activeTurnId && current.activeTurnId !== turnId && !isPendingCompactionTurnForThread(current.activeTurnId, threadId)) return;
 
     const next = deps.stateStore.update((state) => ({
       ...state,
@@ -1602,6 +1718,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     if (message.method === 'turn/started') handleTaskStarted(message);
     if (message.method === 'item/completed') enqueueStructuredFileChange(message);
     if (message.method === 'turn/completed') void handleTurnCompleted(message);
+    if (message.method === 'thread/compacted') void handleTurnCompleted(message);
   });
 
   const unsubscribeServerRequest = deps.codex.onServerRequest((message) => {
@@ -1732,7 +1849,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             experimentalRawEvents: true,
             persistExtendedHistory: true,
           }, runOptionsFromParams(request.params));
-          const result = await requestCodex('thread/resume', params);
+          const result = await requestCodex('thread/resume', params).catch((error) => {
+            if (isMissingThreadError(error)) clearMissingActiveThread(threadId, error);
+            throw error;
+          });
           resumedThreadIds.add(threadId);
           const activeCwd = extractThreadCwd(result) ?? deps.stateStore.read().activeCwd;
           const resultThreadPath = extractThreadPath(result);
@@ -1799,6 +1919,36 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           return;
         }
 
+        if (request.method === 'webui/thread/compact/start') {
+          const state = deps.stateStore.read();
+          const threadId = getRequiredString(request.params, 'threadId') ?? state.activeThreadId;
+          if (!threadId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
+            return;
+          }
+          if (state.activeTurnId && state.activeThreadId === threadId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'cannot compact while Codex is working' });
+            return;
+          }
+
+          const pendingTurnId = pendingCompactionTurnId(threadId);
+          const markedState = deps.stateStore.update((current) =>
+            current.activeThreadId === threadId && !current.activeTurnId ? { ...current, activeTurnId: pendingTurnId } : current,
+          );
+          if (markedState.activeThreadId === threadId && markedState.activeTurnId === pendingTurnId) broadcastHello(markedState);
+
+          try {
+            await ensureThreadResumed(threadId);
+            const result = await requestCodex('thread/compact/start', { threadId });
+            send(ws, { type: 'rpc/result', id: request.id, result });
+          } catch (error) {
+            const cleared = clearActiveTurn({ threadId, turnId: pendingTurnId }, { broadcast: false });
+            broadcastHello(cleared);
+            throw error;
+          }
+          return;
+        }
+
         if (request.method === 'webui/approval/respond') {
           const params = approvalRespondParams(request.params);
           if (typeof params === 'string') {
@@ -1833,8 +1983,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
-          const resolvedPath = await resolveReadableRpcPath(deps, filePath);
-          const result = await requestCodex('fs/readDirectory', { path: resolvedPath });
+          const result = await readDirectory(deps, filePath);
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
@@ -1846,8 +1995,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
-          const resolvedPath = await resolveReadableRpcPath(deps, filePath);
-          const result = await requestCodex('fs/readFile', { path: resolvedPath });
+          const result = await readFile(deps, filePath);
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
@@ -1864,8 +2012,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
-          const resolvedPath = await resolveWritableRpcPath(deps, filePath);
-          const result = await requestCodex('fs/writeFile', { path: resolvedPath, dataBase64 });
+          const result = await writeFile(deps, filePath, dataBase64);
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
@@ -1877,8 +2024,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
-          const resolvedPath = await resolveWritableRpcPath(deps, filePath);
-          const result = await requestCodex('fs/createDirectory', { path: resolvedPath });
+          const result = await createDirectory(deps, filePath);
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
@@ -1890,8 +2036,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
-          const resolvedPath = await resolveWritableRpcPath(deps, filePath);
-          const result = await requestCodex('fs/writeFile', { path: resolvedPath, dataBase64: '' });
+          const result = await writeFile(deps, filePath, '');
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
@@ -1903,8 +2048,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
-          const resolvedPath = await resolveReadableRpcPath(deps, filePath);
-          const result = await requestCodex('fs/getMetadata', { path: resolvedPath });
+          const result = await getMetadata(deps, filePath);
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
@@ -1941,8 +2085,14 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
-          await ensureThreadResumed(params.threadId);
-          const result = await requestCodex('thread/turns/list', params);
+          let result: unknown;
+          try {
+            await ensureThreadResumed(params.threadId);
+            result = await requestCodex('thread/turns/list', params);
+          } catch (error) {
+            if (isMissingThreadError(error)) clearMissingActiveThread(params.threadId, error);
+            throw error;
+          }
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
@@ -1993,6 +2143,11 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
           if (!text) {
             send(ws, { type: 'rpc/error', id: request.id, error: 'text is required' });
+            return;
+          }
+          const currentState = deps.stateStore.read();
+          if (currentState.activeThreadId === threadId && currentState.activeTurnId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'Codex is already working; queue the message instead' });
             return;
           }
 

@@ -475,6 +475,15 @@ describe('timeline', () => {
     expect(latestCompletionNotificationCount(notifications, 42, { activeThreadId: 'thread-1', activeTurnId: 'turn-1' })).toBe(41);
   });
 
+  it('treats thread compacted notifications as turn completion', () => {
+    const notifications = [
+      { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-compact', delta: 'Compacting' } },
+      { method: 'thread/compacted', params: { threadId: 'thread-1', turnId: 'turn-compact' } },
+    ];
+
+    expect(latestCompletionNotificationCount(notifications, 12, { activeThreadId: 'thread-1', activeTurnId: 'turn-compact' })).toBe(12);
+  });
+
   it('derives live command, file, and tool cards from completed item notifications', () => {
     const items = liveTimelineItemsFromNotifications(
       [
