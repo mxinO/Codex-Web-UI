@@ -8,6 +8,7 @@ import {
   type JsonRpcServerRequest,
   type JsonRpcServerRequestHandler,
 } from './jsonRpc.js';
+import { logError, logInfo, logWarn } from './logger.js';
 import type { CodexInitializeResponse } from './types.js';
 
 export interface CodexAppServerOptions {
@@ -142,6 +143,7 @@ export class CodexAppServer {
     openingSocket?.close();
 
     if (child && !child.killed) {
+      logInfo('Stopping Codex app-server child', { pid: child.pid });
       child.kill();
     }
   }
@@ -149,26 +151,25 @@ export class CodexAppServer {
   private startReal(): Promise<CodexInitializeResponse> {
     return new Promise<CodexInitializeResponse>((resolve, reject) => {
       const lifecycleId = ++this.lifecycleId;
+      logInfo('Starting Codex app-server child', { cwd: this.options.cwd });
       const child = spawn('codex', ['app-server', '--listen', 'ws://127.0.0.1:0'], {
         cwd: this.options.cwd,
         stdio: ['ignore', 'pipe', 'pipe'],
       });
 
       this.child = child;
+      logInfo('Codex app-server child spawned', { pid: child.pid });
 
       let settled = false;
       let connecting = false;
-      const stdoutBuffer = new StartupOutputBuffer((line) => handleOutputLine(line));
-      const stderrBuffer = new StartupOutputBuffer((line) => handleOutputLine(line));
+      const stdoutBuffer = new StartupOutputBuffer((line) => handleOutputLine('stdout', line));
+      const stderrBuffer = new StartupOutputBuffer((line) => handleOutputLine('stderr', line));
       const startupTimeout = setTimeout(() => {
         fail(new Error('Timed out waiting for Codex app-server startup'));
       }, 15000);
 
       const cleanupStartup = () => {
         clearTimeout(startupTimeout);
-        child.stdout.off('data', onStdoutOutput);
-        child.stderr.off('data', onStderrOutput);
-        child.off('error', onError);
         child.off('exit', onStartupExit);
       };
 
@@ -177,6 +178,7 @@ export class CodexAppServer {
         settled = true;
         const current = this.isCurrentLifecycle(lifecycleId, child);
         cleanupStartup();
+        logError('Codex app-server startup failed', { pid: child.pid, error });
         if (current) {
           this.closeSockets();
         }
@@ -196,19 +198,34 @@ export class CodexAppServer {
         cleanupStartup();
         if (this.isCurrentLifecycle(lifecycleId, child)) {
           this.initialized = true;
+          logInfo('Codex app-server initialized', { pid: child.pid, url: this.url, readyzUrl: this.readyzUrl });
           this.emitHealthChange();
         }
         resolve(response);
       };
 
-      const onError = (error: Error) => fail(error);
+      const onError = (error: Error) => {
+        if (!settled) {
+          fail(error);
+          return;
+        }
+        if (this.isCurrentLifecycle(lifecycleId, child)) {
+          logError('Codex app-server child error', { pid: child.pid, error });
+        }
+      };
 
       const onStartupExit = (code: number | null, signal: NodeJS.Signals | null) => {
         fail(new Error(`Codex app-server exited during startup: ${this.formatExit(code, signal)}`));
       };
 
-      const handleOutputLine = (line: string) => {
+      const handleOutputLine = (stream: 'stdout' | 'stderr', line: string) => {
+        if (!this.isCurrentLifecycle(lifecycleId, child)) return;
         this.captureReadyz(line);
+        if (line.trim()) {
+          const meta = { pid: child.pid, line };
+          if (stream === 'stderr') logWarn('Codex app-server stderr', meta);
+          else logInfo('Codex app-server stdout', meta);
+        }
 
         const url = this.captureListeningUrl(line);
         if (!url || connecting) return;
@@ -222,13 +239,14 @@ export class CodexAppServer {
 
       child.stdout.on('data', onStdoutOutput);
       child.stderr.on('data', onStderrOutput);
-      child.once('error', onError);
+      child.on('error', onError);
       child.once('exit', onStartupExit);
 
       child.once('exit', (code, signal) => {
         if (!this.isCurrentLifecycle(lifecycleId, child)) return;
 
         const error = new Error(`Codex app-server exited: ${this.formatExit(code, signal)}`);
+        logError('Codex app-server child exited', { pid: child.pid, code, signal, error });
         this.deadError = error;
         this.peer = null;
         this.socket = null;
@@ -332,6 +350,7 @@ export class CodexAppServer {
     if (this.socket !== socket) return;
 
     const child = this.child;
+    logError('Codex app-server WebSocket failed', { pid: child?.pid ?? null, error });
     this.deadError = error;
     this.peer = null;
     this.socket = null;

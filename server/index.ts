@@ -10,12 +10,25 @@ import { readConfig } from './config.js';
 import { createFilePreviewHandler } from './filePreview.js';
 import { resolveExistingPathInsideRoot, resolveWritablePathInsideRoot } from './fileTransfer.js';
 import { HostStateStore } from './hostState.js';
-import { logError, logInfo } from './logger.js';
+import { configureLogger, logError, logInfo, logWarn } from './logger.js';
 import { resolvePackageRoot, resolveStartCwd } from './paths.js';
 
 const config = readConfig();
 const packageRoot = resolvePackageRoot();
 const startCwd = resolveStartCwd();
+const safeHostname = config.hostname.replace(/[^A-Za-z0-9_.-]/g, '_');
+const logFilePath = path.join(config.stateDir, `${safeHostname}.log`);
+configureLogger({ filePath: logFilePath });
+logInfo('Starting Codex Web UI server', {
+  pid: process.pid,
+  hostname: config.hostname,
+  host: config.host,
+  port: config.port,
+  stateDir: config.stateDir,
+  startCwd,
+  logFilePath,
+});
+
 const app = express();
 const server = http.createServer(app);
 const stateStore = new HostStateStore(config.stateDir, config.hostname);
@@ -25,7 +38,12 @@ const tokenHash = hashToken(token);
 stateStore.update((state) => ({ ...state, authTokenHash: tokenHash }));
 
 const codex = new CodexAppServer({ cwd: startCwd, mock: config.mock });
-await codex.start();
+try {
+  await codex.start();
+} catch (error) {
+  logError('Failed to start initial Codex app-server', error);
+  throw error;
+}
 stateStore.update((state) => ({
   ...state,
   appServerUrl: codex.getUrl(),
@@ -125,17 +143,35 @@ server.listen(config.port, config.host, () => {
   const host = config.host.includes(':') && !config.host.startsWith('[') ? `[${config.host}]` : config.host;
   const url = `http://${host}:${port}${config.noAuth ? '' : `?token=${token}`}`;
   logInfo(`Open in browser: ${url}`);
+  logInfo('Codex Web UI server listening', { host: config.host, port, logFilePath });
 });
 
 let shuttingDown = false;
 function shutdown(signal: NodeJS.Signals) {
   if (shuttingDown) return;
   shuttingDown = true;
+  logWarn('Received shutdown signal', { signal, pid: process.pid });
   browserSockets.close();
   codex.stop();
-  server.close(() => process.exit(0));
-  setTimeout(() => process.exit(signal === 'SIGTERM' ? 143 : 130), 5000).unref();
+  server.close(() => {
+    logInfo('Browser server closed', { signal });
+    process.exit(0);
+  });
+  setTimeout(() => {
+    logWarn('Shutdown timed out', { signal });
+    process.exit(signal === 'SIGTERM' ? 143 : 130);
+  }, 5000).unref();
 }
 
+process.on('uncaughtException', (error) => {
+  logError('Uncaught exception', error);
+  process.exit(1);
+});
+process.on('unhandledRejection', (reason) => {
+  logError('Unhandled rejection', reason);
+});
+process.on('exit', (code) => {
+  logInfo('Codex Web UI process exiting', { code, pid: process.pid });
+});
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));
