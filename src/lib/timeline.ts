@@ -711,12 +711,19 @@ export function nextLiveNotificationWindow(
   current: LiveNotificationWindow,
   scope: TimelineNotificationScope,
   notificationCount: number,
+  options: { pendingStartCount?: number | null } = {},
 ): LiveNotificationWindow {
+  const pendingStartCount = typeof options.pendingStartCount === 'number' ? options.pendingStartCount : null;
+  const newWindowStartCount = pendingStartCount ?? notificationCount;
+
   if (current.activeThreadId !== scope.activeThreadId) {
-    return { ...scope, startCount: notificationCount };
+    return { ...scope, startCount: newWindowStartCount };
+  }
+  if (pendingStartCount !== null && !scope.activeTurnId) {
+    return { ...scope, startCount: pendingStartCount };
   }
   if (scope.activeTurnId && current.activeTurnId !== scope.activeTurnId) {
-    return { ...scope, startCount: notificationCount };
+    return { ...scope, startCount: current.activeTurnId === null ? current.startCount : newWindowStartCount };
   }
   if (!current.activeTurnId && !scope.activeTurnId) {
     return { ...scope, startCount: notificationCount };

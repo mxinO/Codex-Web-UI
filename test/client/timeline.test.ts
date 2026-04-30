@@ -341,6 +341,26 @@ describe('timeline', () => {
     expect(shouldShowLiveStreamingItem(staleHistory, null)).toBe(false);
   });
 
+  it('preserves the pending submit notification window until the real turn id appears', () => {
+    const idleWindow = { activeThreadId: 'thread-1', activeTurnId: null, startCount: 10 };
+
+    const pendingWindow = nextLiveNotificationWindow(
+      idleWindow,
+      { activeThreadId: 'thread-1', activeTurnId: null },
+      15,
+      { pendingStartCount: 10 },
+    );
+    expect(pendingWindow).toEqual({ activeThreadId: 'thread-1', activeTurnId: null, startCount: 10 });
+
+    expect(
+      nextLiveNotificationWindow(pendingWindow, { activeThreadId: 'thread-1', activeTurnId: 'turn-1' }, 18),
+    ).toEqual({
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-1',
+      startCount: 10,
+    });
+  });
+
   it('does not hide completed live output when only file edit history for that turn has arrived', () => {
     const liveItem: Extract<TimelineItem, { kind: 'streaming' }> = {
       id: 'live:streaming-assistant',

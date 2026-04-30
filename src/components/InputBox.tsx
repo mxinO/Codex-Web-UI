@@ -14,6 +14,7 @@ interface InputBoxProps {
   onDraftConsumed: () => void;
   onEnqueue: (text: string, options?: CodexRunOptions) => Promise<void>;
   onDirectSubmit?: (text: string) => void | (() => void);
+  onDirectSubmitError?: (text: string, error: string) => void;
 }
 
 interface FileSuggestion {
@@ -81,6 +82,7 @@ export default function InputBox({
   onDraftConsumed,
   onEnqueue,
   onDirectSubmit,
+  onDirectSubmitError,
 }: InputBoxProps) {
   const [draft, setDraft] = useState('');
   const [busy, setBusy] = useState(false);
@@ -230,6 +232,7 @@ export default function InputBox({
         await rpc('webui/turn/start', { threadId, text, options: runOptions });
       } catch (caught) {
         if (typeof rollbackOptimistic === 'function') rollbackOptimistic();
+        onDirectSubmitError?.(text, caught instanceof Error ? caught.message : String(caught));
         setDraft(previousDraft);
         throw caught;
       }

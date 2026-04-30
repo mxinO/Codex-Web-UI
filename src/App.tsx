@@ -171,13 +171,17 @@ export default function App() {
   const [sandbox, setSandboxState] = useState<string | null>(initialSandbox);
   const bangCounterRef = useRef(0);
   const pendingUserCounterRef = useRef(0);
+  const ephemeralCounterRef = useRef(0);
+  const [pendingTurnWindow, setPendingTurnWindow] = useState<{ id: string; threadId: string | null; startCount: number } | null>(null);
   const activeFileSummaryScopeRef = useRef({ threadId: activeThreadId, threadPath: activeThreadPath, turnId: state?.activeTurnId ?? null });
   const liveNotificationWindowRef = useRef({ activeThreadId, activeTurnId: state?.activeTurnId ?? null, startCount: socket.notificationCount });
   const lastHandledCompletionCountRef = useRef<number | null>(null);
+  const pendingTurnStartCount = pendingTurnWindow?.threadId === activeThreadId ? pendingTurnWindow.startCount : null;
   liveNotificationWindowRef.current = nextLiveNotificationWindow(
     liveNotificationWindowRef.current,
     { activeThreadId, activeTurnId: state?.activeTurnId ?? null },
     socket.notificationCount,
+    { pendingStartCount: pendingTurnStartCount },
   );
   const liveNotificationActiveTurnId = liveNotificationWindowRef.current.activeTurnId;
   const liveNotificationStartCount = liveNotificationWindowRef.current.startCount;
@@ -267,7 +271,12 @@ export default function App() {
     setPendingUserItems([]);
     setAnsweredApprovals(new Set());
     setActiveFileSummary(null);
+    setPendingTurnWindow(null);
   }, [activeThreadId]);
+
+  useEffect(() => {
+    if (pendingTurnWindow && state?.activeTurnId) setPendingTurnWindow(null);
+  }, [pendingTurnWindow, state?.activeTurnId]);
 
   const loadActiveFileSummary = useCallback(async (turnId: string | null | undefined) => {
     if (!turnId || !activeThreadId || socket.connectionState !== 'connected') {
@@ -395,9 +404,28 @@ export default function App() {
   }, []);
 
   const addPendingUserMessage = useCallback((text: string) => {
-    const id = `pending:user:${Date.now()}:${(pendingUserCounterRef.current += 1)}`;
-    setPendingUserItems((items) => [...items, { id, kind: 'user', timestamp: Date.now(), text }]);
-    return () => setPendingUserItems((items) => items.filter((item) => item.id !== id));
+    const now = Date.now();
+    const id = `pending:user:${now}:${(pendingUserCounterRef.current += 1)}`;
+    const pendingWindow = { id, threadId: activeThreadId, startCount: socket.notificationCount };
+    setPendingTurnWindow(pendingWindow);
+    setPendingUserItems((items) => [...items, { id, kind: 'user', timestamp: now, text }]);
+    return () => {
+      setPendingUserItems((items) => items.filter((item) => item.id !== id));
+      setPendingTurnWindow((current) => (current?.id === pendingWindow.id ? null : current));
+    };
+  }, [activeThreadId, socket.notificationCount]);
+
+  const addDirectSubmitError = useCallback((_: string, error: string) => {
+    const id = `direct-submit-error:${Date.now()}:${(ephemeralCounterRef.current += 1)}`;
+    setEphemeralItems((items) => [
+      ...items,
+      {
+        id,
+        kind: 'error',
+        timestamp: Date.now(),
+        text: `Message was not sent: ${error}`,
+      },
+    ]);
   }, []);
 
   const openDetailItem = useCallback((item: TimelineItem) => {
@@ -702,6 +730,7 @@ export default function App() {
               onDraftConsumed={() => setComposerDraft(null)}
               onEnqueue={enqueue}
               onDirectSubmit={addPendingUserMessage}
+              onDirectSubmitError={addDirectSubmitError}
             />
           </section>
         </div>
