@@ -577,17 +577,6 @@ function assistantPersistedTextKeys(items: TimelineItem[]): Set<string> {
   return keys;
 }
 
-function finalAssistantTurnIds(items: TimelineItem[]): Set<string> {
-  const turnIds = new Set<string>();
-  for (const item of items) {
-    if (item.kind !== 'assistant') continue;
-    if (item.phase !== null && item.phase !== 'final_answer' && item.phase !== 'final') continue;
-    const turnId = timelineItemTurnId(item);
-    if (turnId) turnIds.add(turnId);
-  }
-  return turnIds;
-}
-
 export function liveTurnItemsFromNotifications(
   notifications: unknown[],
   scope: TimelineNotificationScope,
@@ -751,7 +740,6 @@ export function liveTurnItemsFromNotifications(
 export function visibleLiveTurnItemsForTimeline(items: TimelineItem[], liveItems: TimelineItem[]): TimelineItem[] {
   const persistedIds = new Set(items.map((item) => item.id));
   const persistedAssistantTexts = assistantPersistedTextKeys(items);
-  const persistedFinalTurns = finalAssistantTurnIds(items);
 
   return liveItems.filter((item) => {
     if (persistedIds.has(item.id)) return false;
@@ -761,9 +749,39 @@ export function visibleLiveTurnItemsForTimeline(items: TimelineItem[], liveItems
     if (!turnId) return true;
     const text = normalizedMessageBlock(item.text);
     if (text && persistedAssistantTexts.has(`${turnId}\0${text}`)) return false;
-    if (item.kind === 'streaming' && !item.active && persistedFinalTurns.has(turnId)) return false;
     return true;
   });
+}
+
+function liveRetentionKey(item: TimelineItem): string {
+  const turnId = timelineItemTurnId(item) ?? 'unscoped';
+  if (item.kind === 'assistant') return `assistant:${turnId}:${item.phase ?? ''}:${normalizedMessageBlock(item.text)}`;
+  if (item.kind === 'streaming') return `streaming:${turnId}:${normalizedMessageBlock(item.text)}`;
+  return `${item.kind}:${item.id}`;
+}
+
+export function mergeRetainedLiveTurnItems(
+  historyItems: TimelineItem[],
+  retainedItems: TimelineItem[],
+  additions: TimelineItem[],
+  limit = 200,
+): TimelineItem[] {
+  const retained = visibleLiveTurnItemsForTimeline(historyItems, retainedItems);
+  const visibleAdditions = visibleLiveTurnItemsForTimeline(historyItems, additions).filter(
+    (item) => !(item.kind === 'streaming' && item.active),
+  );
+  if (retained.length === 0 && visibleAdditions.length === 0) return [];
+
+  const keys = new Set(retained.map(liveRetentionKey));
+  const merged = [...retained];
+  for (const item of visibleAdditions) {
+    const key = liveRetentionKey(item);
+    if (keys.has(key)) continue;
+    keys.add(key);
+    merged.push(item);
+  }
+
+  return trimTimelineWindow(merged, limit);
 }
 
 export function timelineItemsWithLiveTurnOverlay(items: TimelineItem[], liveItems: TimelineItem[], activeTurnId: string | null | undefined): TimelineItem[] {

@@ -240,6 +240,91 @@ describe('useThreadTimeline', () => {
     expect(currentTimeline?.items.map(itemText)).toEqual(['turn-1', 'turn-2 refreshed', 'turn-3']);
   });
 
+  it('reload merges a partial same-turn response without deleting already rendered items', async () => {
+    const latest = deferred<RpcResult>();
+    const partialReload = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(latest.promise).mockReturnValueOnce(partialReload.promise);
+    const fullTurn: CodexTurn = {
+      id: 'turn-1',
+      status: 'completed',
+      startedAt: 1,
+      completedAt: 2,
+      items: [
+        { type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'question' }] },
+        { type: 'agentMessage', id: 'a1', text: 'complete answer', phase: null },
+      ],
+    };
+    const partialTurn: CodexTurn = {
+      id: 'turn-1',
+      status: 'inProgress',
+      startedAt: 1,
+      completedAt: null,
+      items: [
+        { type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'question' }] },
+        { type: 'agentMessage', id: 'a1', text: 'partial', phase: null },
+      ],
+    };
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      latest.resolve({ data: [fullTurn], nextCursor: null });
+      await latest.promise;
+    });
+    expect(currentTimeline?.items.map(itemText)).toEqual(['question', 'complete answer']);
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      partialReload.resolve({ data: [partialTurn], nextCursor: null });
+      await partialReload.promise;
+    });
+
+    expect(currentTimeline?.items.map(itemText)).toEqual(['question', 'complete answer']);
+  });
+
+  it('reload does not regress a terminal failed turn to a partial in-progress response', async () => {
+    const latest = deferred<RpcResult>();
+    const partialReload = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(latest.promise).mockReturnValueOnce(partialReload.promise);
+    const failedTurn: CodexTurn = {
+      id: 'turn-1',
+      status: 'failed',
+      startedAt: 1,
+      completedAt: 2,
+      items: [
+        { type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'question' }] },
+        { type: 'agentMessage', id: 'a1', text: 'error context', phase: null },
+      ],
+    };
+    const partialTurn: CodexTurn = {
+      id: 'turn-1',
+      status: 'inProgress',
+      startedAt: 1,
+      completedAt: null,
+      items: [
+        { type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'question' }] },
+        { type: 'agentMessage', id: 'a1', text: 'partial', phase: null },
+      ],
+    };
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      latest.resolve({ data: [failedTurn], nextCursor: null });
+      await latest.promise;
+    });
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      partialReload.resolve({ data: [partialTurn], nextCursor: null });
+      await partialReload.promise;
+    });
+
+    expect(currentTimeline?.items.map(itemText)).toEqual(['question', 'error context']);
+  });
+
   it('reload after older pagination preserves the older-page cursor', async () => {
     const latest = deferred<RpcResult>();
     const older = deferred<RpcResult>();

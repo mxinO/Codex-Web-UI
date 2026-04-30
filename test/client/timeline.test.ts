@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   approvalItemsFromRequests,
   liveStreamingItemFromNotifications,
+  mergeRetainedLiveTurnItems,
   mergeTimelineItemsByTimestamp,
   nextLiveNotificationWindow,
   notificationsSinceCount,
@@ -343,6 +344,19 @@ describe('timeline', () => {
     });
   });
 
+  it('starts a pending submit window without attributing new unscoped output to the previous turn', () => {
+    const completedWindow = { activeThreadId: 'thread-1', activeTurnId: 'turn-previous', startCount: 10 };
+
+    expect(
+      nextLiveNotificationWindow(
+        completedWindow,
+        { activeThreadId: 'thread-1', activeTurnId: null },
+        25,
+        { pendingStartCount: 25 },
+      ),
+    ).toEqual({ activeThreadId: 'thread-1', activeTurnId: null, startCount: 25 });
+  });
+
   it('keeps completed live output visible only until persisted history contains that turn', () => {
     const liveItem: Extract<TimelineItem, { kind: 'streaming' }> = {
       id: 'live:streaming-assistant',
@@ -358,6 +372,54 @@ describe('timeline', () => {
     expect(shouldShowLiveStreamingItem(staleHistory, liveItem)).toBe(true);
     expect(shouldShowLiveStreamingItem(caughtUpHistory, liveItem)).toBe(false);
     expect(shouldShowLiveStreamingItem(staleHistory, null)).toBe(false);
+  });
+
+  it('does not hide completed streaming output behind a different same-turn final answer', () => {
+    const liveItem: TimelineItem = {
+      id: 'live:streaming:turn-1:1',
+      kind: 'streaming',
+      timestamp: 200,
+      text: 'The complete live answer.',
+      active: false,
+      turnId: 'turn-1',
+    };
+    const partialFinalHistory: TimelineItem[] = [
+      { id: 'turn-1:a1', kind: 'assistant', timestamp: 100, text: 'A partial final answer.', phase: 'final_answer', turnId: 'turn-1' },
+    ];
+
+    expect(visibleLiveTurnItemsForTimeline(partialFinalHistory, [liveItem])).toEqual([liveItem]);
+  });
+
+  it('retains completed live items across a pending next user message until history catches up', () => {
+    const completedLiveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', message: 'Previous answer.', phase: 'final_answer', turn_id: 'turn-1' } },
+        { method: 'event_msg', params: { type: 'task_complete', thread_id: 'thread-1', turn_id: 'turn-1' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      1000,
+    );
+    const staleHistory: TimelineItem[] = [
+      { id: 'turn-0:a1', kind: 'assistant', timestamp: 500, text: 'Older persisted answer.', phase: null, turnId: 'turn-0' },
+    ];
+    const pendingUser: TimelineItem = { id: 'pending:user:1', kind: 'user', timestamp: 2000, text: 'Next question' };
+
+    const retained = mergeRetainedLiveTurnItems(staleHistory, [], completedLiveItems);
+    const visible = visibleLiveTurnItemsForTimeline([...staleHistory, pendingUser], retained);
+    const merged = mergeTimelineItemsByTimestamp([...staleHistory, ...visible, pendingUser]);
+
+    expect(merged.map((item) => (item.kind === 'assistant' || item.kind === 'streaming' || item.kind === 'user' ? item.text : item.id))).toEqual([
+      'Older persisted answer.',
+      'Previous answer.',
+      'Next question',
+    ]);
+
+    const caughtUpHistory: TimelineItem[] = [
+      ...staleHistory,
+      { id: 'turn-1:a1', kind: 'assistant', timestamp: 1000, text: 'Previous answer.', phase: 'final_answer', turnId: 'turn-1' },
+    ];
+    expect(mergeRetainedLiveTurnItems(caughtUpHistory, retained, [])).toEqual([]);
   });
 
   it('preserves the pending submit notification window until the real turn id appears', () => {

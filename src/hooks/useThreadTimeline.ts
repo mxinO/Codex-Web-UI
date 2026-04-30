@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { turnToTimelineItems, type TimelineItem } from '../lib/timeline';
-import type { CodexTurn } from '../types/codex';
+import type { CodexItem, CodexTurn } from '../types/codex';
 
 const PAGE_SIZE = 50;
 const WINDOW_TURN_LIMIT = 200;
@@ -29,6 +29,45 @@ function trimOldestTurnWindow(turns: CodexTurn[], limit: number): CodexTurn[] {
   return turns.length <= limit ? turns : turns.slice(0, limit);
 }
 
+function itemMergeKey(item: CodexItem, index: number): string {
+  return typeof item.id === 'string' && item.id.trim() ? `id:${item.id}` : `index:${index}`;
+}
+
+function mergeTurnItems(current: CodexItem[], latest: CodexItem[], options: { replaceExisting: boolean }): CodexItem[] {
+  if (current.length === 0) return latest;
+  if (latest.length === 0) return current;
+
+  const indexes = new Map<string, number>();
+  const merged = [...current];
+  merged.forEach((item, index) => indexes.set(itemMergeKey(item, index), index));
+
+  latest.forEach((item, index) => {
+    const key = itemMergeKey(item, index);
+    const existingIndex = indexes.get(key);
+    if (existingIndex === undefined) {
+      indexes.set(key, merged.length);
+      merged.push(item);
+      return;
+    }
+    if (options.replaceExisting) merged[existingIndex] = item;
+  });
+
+  return merged;
+}
+
+function mergeTurn(current: CodexTurn, latest: CodexTurn): CodexTurn {
+  const currentIsTerminal = current.status === 'completed' || current.status === 'failed' || current.status === 'interrupted';
+  const latestRegressedFromTerminal = currentIsTerminal && latest.status === 'inProgress';
+  return {
+    ...current,
+    ...latest,
+    status: latestRegressedFromTerminal ? current.status : latest.status,
+    startedAt: latest.startedAt ?? current.startedAt,
+    completedAt: latest.completedAt ?? current.completedAt,
+    items: mergeTurnItems(current.items, latest.items, { replaceExisting: !latestRegressedFromTerminal }),
+  };
+}
+
 function resultTurns(result: TurnListResult): CodexTurn[] {
   if (Array.isArray(result.data)) return result.data;
   if (Array.isArray(result.turns)) return result.turns;
@@ -50,7 +89,7 @@ function mergeLatestTurns(current: CodexTurn[], latest: CodexTurn[], limit: numb
       indexes.set(turn.id, next.length);
       next.push(turn);
     } else {
-      next[existingIndex] = turn;
+      next[existingIndex] = mergeTurn(next[existingIndex], turn);
     }
   }
 
