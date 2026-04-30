@@ -10,6 +10,7 @@ import { HostStateStore } from '../../server/hostState.js';
 import { FileEditStore, sessionFileEditDbPath } from '../../server/fileEditStore.js';
 import type { CodexAppServer } from '../../server/appServer.js';
 import type { ServerConfig } from '../../server/config.js';
+import type { HostRuntimeState } from '../../server/types.js';
 
 interface RpcMessage {
   type: string;
@@ -40,10 +41,11 @@ function makeConfig(): ServerConfig {
 
 type TestRequest = (method: string, params?: unknown, timeoutMs?: number) => Promise<unknown>;
 
-async function makeHarness(request: TestRequest, options: { startCwd?: string } = {}) {
+async function makeHarness(request: TestRequest, options: { startCwd?: string; initialState?: Partial<HostRuntimeState> } = {}) {
   const server = http.createServer();
   const stateDir = mkdtempSync(join(tmpdir(), 'codex-webui-browser-socket-'));
   const stateStore = new HostStateStore(stateDir, 'test-host');
+  if (options.initialState) stateStore.write({ ...stateStore.read(), ...options.initialState });
   let notificationHandler: NotificationHandler | null = null;
   let serverRequestHandler: ServerRequestHandler | null = null;
   let healthHandler: (() => void) | null = null;
@@ -85,7 +87,7 @@ async function makeHarness(request: TestRequest, options: { startCwd?: string } 
   await new Promise<void>((resolve) => ws.once('open', resolve));
   cleanups.push(() => ws.close());
 
-  await hello;
+  const initialHello = await hello;
   const notify = (method: string, params?: unknown) => {
     notificationHandler?.({ jsonrpc: '2.0', method, params });
   };
@@ -99,7 +101,7 @@ async function makeHarness(request: TestRequest, options: { startCwd?: string } 
     healthHandler?.();
   };
 
-  return { ws, stateStore, notify, notifyRaw, requestFromServer, emitHealthChange, respond, start, health, port };
+  return { ws, stateStore, notify, notifyRaw, requestFromServer, emitHealthChange, respond, start, health, port, initialHello };
 }
 
 function nextMessage(ws: WebSocket): Promise<RpcMessage> {
@@ -2196,6 +2198,88 @@ describe('attachBrowserSocket app-server lifecycle', () => {
 });
 
 describe('attachBrowserSocket queue and turn RPCs', () => {
+  it('clears a persisted active turn when a fresh browser server attaches', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { initialHello, stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+        activeTurnId: 'turn-stale',
+        activeCwd: '/work/project',
+        queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }],
+      },
+    });
+
+    expect(initialHello).toMatchObject({
+      type: 'server/hello',
+      state: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+        activeTurnId: null,
+        activeCwd: '/work/project',
+        queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }],
+      },
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null });
+  });
+
+  it('clears the active turn when the Codex app-server dies', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, emitHealthChange, health, requestFromServer } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: 'turn-1', activeCwd: '/work/project' });
+    const pendingRequest = nextMessage(ws);
+    requestFromServer({ jsonrpc: '2.0', id: 99, method: 'item/tool/call', params: {} });
+    expect(await pendingRequest).toMatchObject({ type: 'codex/request' });
+    health.mockReturnValue({ connected: false, dead: true, error: 'Codex app-server exited', readyzUrl: null, url: null });
+
+    const hello = nextMessage(ws);
+    emitHealthChange();
+
+    expect(await hello).toMatchObject({
+      type: 'server/hello',
+      state: { activeThreadId: 'thread-1', activeTurnId: null },
+      appServerHealth: { connected: false, dead: true },
+      requests: [],
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null });
+  });
+
+  it('lets stop clear a stale active turn without starting a dead app-server', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, start, health } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: 'turn-stale', activeCwd: '/work/project' });
+    health.mockReturnValue({ connected: false, dead: true, error: 'Codex app-server exited', readyzUrl: null, url: null });
+
+    const response = nextRpcResponse(ws, 16);
+    ws.send(JSON.stringify({ type: 'rpc', id: 16, method: 'webui/turn/interrupt' }));
+
+    expect(await response).toEqual({
+      type: 'rpc/result',
+      id: 16,
+      result: { ok: false, cleared: true, error: 'Codex app-server exited' },
+    });
+    expect(start).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null });
+  });
+
+  it('lets stop clear an active turn when the resumed thread is no longer known to Codex', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockRejectedValue(new Error('thread not found'));
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: 'turn-stale', activeCwd: '/work/project' });
+
+    const response = nextRpcResponse(ws, 17);
+    ws.send(JSON.stringify({ type: 'rpc', id: 17, method: 'webui/turn/interrupt' }));
+
+    expect(await response).toEqual({
+      type: 'rpc/result',
+      id: 17,
+      result: { ok: false, cleared: true, error: 'thread not found' },
+    });
+    expect(request).toHaveBeenCalledWith('thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null });
+  });
+
   it('enqueues, updates, and removes queued messages', async () => {
     const request = vi.fn<CodexAppServer['request']>();
     const { ws, stateStore } = await makeHarness(request);

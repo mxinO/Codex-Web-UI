@@ -753,6 +753,11 @@ function extractResolvedRequestId(message: { method: string; params?: unknown })
   return typeof requestId === 'string' || typeof requestId === 'number' ? requestId : null;
 }
 
+function shouldClearActiveTurnAfterInterruptFailure(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /not connected|closed|exited|not found|no active|unknown.*turn|turn.*unknown|thread.*unknown/i.test(message);
+}
+
 function patchApplyPayload(message: { params?: unknown; payload?: unknown }): Record<string, unknown> | null {
   const payload = notificationPayload(message);
   return isRecord(payload) && getStringPath(payload, ['type']) === 'patch_apply_end' ? payload : null;
@@ -1323,6 +1328,27 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     });
   };
 
+  const clearActiveTurn = (
+    expected: { threadId?: string | null; turnId?: string | null } = {},
+    options: { broadcast?: boolean } = {},
+  ): HostRuntimeState => {
+    const current = deps.stateStore.read();
+    if (!current.activeTurnId) return current;
+    if ('threadId' in expected && current.activeThreadId !== expected.threadId) return current;
+    if ('turnId' in expected && current.activeTurnId !== expected.turnId) return current;
+
+    const next = deps.stateStore.update((state) => {
+      if (!state.activeTurnId) return state;
+      if ('threadId' in expected && state.activeThreadId !== expected.threadId) return state;
+      if ('turnId' in expected && state.activeTurnId !== expected.turnId) return state;
+      return { ...state, activeTurnId: null };
+    });
+    if (options.broadcast !== false) broadcastHello(next);
+    return next;
+  };
+
+  clearActiveTurn({}, { broadcast: false });
+
   const broadcastRequestResolved = (requestId: number | string) => {
     for (const client of wss.clients) {
       send(client, { type: 'codex/requestResolved', requestId });
@@ -1591,6 +1617,12 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     if (!health.connected || health.dead) {
       resumedThreadIds.clear();
       resumeThreadPromises.clear();
+      pendingServerRequests.clear();
+      const current = deps.stateStore.read();
+      if (current.activeTurnId) {
+        clearActiveTurn({}, { broadcast: true });
+        return;
+      }
     }
     broadcastHello();
   });
@@ -1982,18 +2014,49 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
         if (request.method === 'webui/turn/interrupt') {
           const state = deps.stateStore.read();
-          if (!state.activeThreadId || !state.activeTurnId) {
+          if (!state.activeTurnId) {
             throw new Error('no active turn to interrupt');
           }
+          if (!state.activeThreadId) {
+            const next = clearActiveTurn({ turnId: state.activeTurnId }, { broadcast: false });
+            send(ws, { type: 'rpc/result', id: request.id, result: { ok: false, cleared: true, error: 'active turn has no thread' } });
+            broadcastHello(next);
+            return;
+          }
 
-          await ensureThreadResumed(state.activeThreadId);
-          const result = await requestCodex('turn/interrupt', {
-            threadId: state.activeThreadId,
-            turnId: state.activeTurnId,
-          });
-          const next = deps.stateStore.update((current) => ({ ...current, activeTurnId: null }));
-          send(ws, { type: 'rpc/result', id: request.id, result });
-          broadcastHello(next);
+          const activeThreadId = state.activeThreadId;
+          const activeTurnId = state.activeTurnId;
+          const health = deps.codex.health();
+          if (!health.connected || health.dead) {
+            const next = clearActiveTurn({ threadId: activeThreadId, turnId: activeTurnId }, { broadcast: false });
+            send(ws, {
+              type: 'rpc/result',
+              id: request.id,
+              result: { ok: false, cleared: true, error: health.error ?? 'Codex app-server is not connected' },
+            });
+            broadcastHello(next);
+            return;
+          }
+
+          try {
+            await ensureThreadResumed(activeThreadId);
+            const result = await requestCodex('turn/interrupt', {
+              threadId: activeThreadId,
+              turnId: activeTurnId,
+            });
+            const next = clearActiveTurn({ threadId: activeThreadId, turnId: activeTurnId }, { broadcast: false });
+            send(ws, { type: 'rpc/result', id: request.id, result });
+            broadcastHello(next);
+          } catch (error) {
+            if (!shouldClearActiveTurnAfterInterruptFailure(error)) throw error;
+            const next = clearActiveTurn({ threadId: activeThreadId, turnId: activeTurnId }, { broadcast: false });
+            send(ws, {
+              type: 'rpc/result',
+              id: request.id,
+              result: { ok: false, cleared: true, error: error instanceof Error ? error.message : String(error) },
+            });
+            broadcastHello(next);
+          }
           return;
         }
 
