@@ -21,6 +21,7 @@ interface BrowserSocketDeps {
   codex: CodexAppServer;
   stateStore: HostStateStore;
   token: string;
+  startCwd?: string;
 }
 
 interface BrowserRequest {
@@ -352,7 +353,7 @@ async function resolveWritableRpcPath(deps: BrowserSocketDeps, filePath: string)
 }
 
 function browseBasePath(deps: BrowserSocketDeps): string {
-  return deps.stateStore.read().activeCwd ?? process.env.HOME ?? process.cwd();
+  return deps.stateStore.read().activeCwd ?? deps.startCwd ?? process.env.HOME ?? process.cwd();
 }
 
 async function browseDirectory(deps: BrowserSocketDeps, requestedPath: string) {
@@ -1315,6 +1316,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     send(client, {
       type: 'server/hello',
       hostname: deps.config.hostname,
+      startCwd: deps.startCwd ?? null,
       state,
       appServerHealth: deps.codex.health(),
       requests: Array.from(pendingServerRequests.values()),

@@ -27,6 +27,7 @@ import {
   sanitizeStoredModel,
   sanitizeStoredSandbox,
 } from './lib/runOptions';
+import { newSessionInitialCwd } from './lib/sessionDefaults';
 import { parseSlashCommand } from './lib/slashCommands';
 import {
   approvalItemsFromRequests,
@@ -708,7 +709,7 @@ export default function App() {
       )}
       {cwdPickerOpen && (
         <CwdPicker
-          initialCwd={state?.activeCwd ?? '/'}
+          initialCwd={newSessionInitialCwd(state?.activeCwd, socket.hello?.startCwd)}
           rpc={socket.rpc}
           busy={sessionLoading}
           onCancel={() => setCwdPickerOpen(false)}

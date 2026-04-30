@@ -14,6 +14,7 @@ export interface AppServerHealth {
 interface ServerHello {
   type: 'server/hello';
   hostname: string;
+  startCwd: string | null;
   appServerHealth?: AppServerHealth;
   state: {
     activeThreadId: string | null;

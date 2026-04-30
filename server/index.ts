@@ -110,7 +110,7 @@ app.get('*', (_req, res) => {
   return res.sendFile(indexHtml);
 });
 
-const browserSockets = attachBrowserSocket(server, { config, codex, stateStore, token });
+const browserSockets = attachBrowserSocket(server, { config, codex, stateStore, token, startCwd });
 
 server.on('error', (err) => {
   logError('Browser server failed', err);

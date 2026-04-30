@@ -40,7 +40,7 @@ function makeConfig(): ServerConfig {
 
 type TestRequest = (method: string, params?: unknown, timeoutMs?: number) => Promise<unknown>;
 
-async function makeHarness(request: TestRequest) {
+async function makeHarness(request: TestRequest, options: { startCwd?: string } = {}) {
   const server = http.createServer();
   const stateDir = mkdtempSync(join(tmpdir(), 'codex-webui-browser-socket-'));
   const stateStore = new HostStateStore(stateDir, 'test-host');
@@ -70,7 +70,7 @@ async function makeHarness(request: TestRequest) {
       return () => undefined;
     }),
   } as unknown as CodexAppServer;
-  const cleanup = attachBrowserSocket(server, { config: makeConfig(), codex, stateStore, token: 'token' });
+  const cleanup = attachBrowserSocket(server, { config: makeConfig(), codex, stateStore, token: 'token', startCwd: options.startCwd });
 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   cleanups.push(() => {
@@ -1947,6 +1947,23 @@ describe('attachBrowserSocket bang command RPCs', () => {
 });
 
 describe('attachBrowserSocket fs RPC wrappers', () => {
+  it('announces the server start cwd for new sessions when no session is active', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const startCwd = mkdtempSync(join(tmpdir(), 'codex-webui-start-cwd-'));
+    cleanups.push(() => rmSync(startCwd, { recursive: true, force: true }));
+    const { port } = await makeHarness(request, { startCwd });
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const hello = nextMessage(ws);
+    await new Promise<void>((resolve) => ws.once('open', resolve));
+    cleanups.push(() => ws.close());
+
+    expect(await hello).toMatchObject({
+      type: 'server/hello',
+      startCwd,
+      state: { activeCwd: null },
+    });
+  });
+
   it('browses directories for new session cwd selection without requiring an active cwd', async () => {
     const request = vi.fn<CodexAppServer['request']>();
     const { ws } = await makeHarness(request);
