@@ -58,13 +58,13 @@ describe('ChatItem details', () => {
     expect(document.querySelector('.markdown-body li')?.textContent).toBe('item');
   });
 
-  it('opens assistant file mentions without linking code spans or existing markdown links', async () => {
+  it('opens assistant file mentions and markdown file links without linking code spans or external links', async () => {
     const onOpenMentionedFile = vi.fn();
     const item: TimelineItem = {
       id: 'a1',
       kind: 'assistant',
       timestamp: 1,
-      text: 'Open src/App.tsx:42, keep `src/ignored.ts`, and see [guide](docs/guide.md).',
+      text: 'Open src/App.tsx:42, keep `src/ignored.ts`, see [guide](docs/guide.md), and visit [site](https://example.com/docs/guide.md).',
       phase: null,
     };
 
@@ -83,16 +83,19 @@ describe('ChatItem details', () => {
     await flushLazy();
 
     const fileLinks = Array.from(document.querySelectorAll<HTMLButtonElement>('.markdown-file-link'));
-    expect(fileLinks).toHaveLength(1);
+    expect(fileLinks).toHaveLength(2);
     expect(fileLinks[0].textContent).toBe('src/App.tsx:42');
+    expect(fileLinks[1].textContent).toBe('guide');
     expect(document.querySelector('code')?.textContent).toBe('src/ignored.ts');
-    expect(document.querySelector<HTMLAnchorElement>('a[href="docs/guide.md"]')?.textContent).toBe('guide');
+    expect(document.querySelector<HTMLAnchorElement>('a[href="https://example.com/docs/guide.md"]')?.textContent).toBe('site');
 
     act(() => {
       fileLinks[0].click();
+      fileLinks[1].click();
     });
 
-    expect(onOpenMentionedFile).toHaveBeenCalledWith('src/App.tsx');
+    expect(onOpenMentionedFile).toHaveBeenNthCalledWith(1, 'src/App.tsx');
+    expect(onOpenMentionedFile).toHaveBeenNthCalledWith(2, 'docs/guide.md');
   });
 
   it('opens streaming file mentions through the same viewer callback', async () => {

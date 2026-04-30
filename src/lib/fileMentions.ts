@@ -128,6 +128,35 @@ export function decodeFileMentionHref(href: string): string | null {
   }
 }
 
+function stripHrefSuffix(value: string): string {
+  const hashIndex = value.indexOf('#');
+  const queryIndex = value.indexOf('?');
+  const indexes = [hashIndex, queryIndex].filter((index) => index >= 0);
+  const firstSuffix = indexes.length > 0 ? Math.min(...indexes) : -1;
+  return firstSuffix >= 0 ? value.slice(0, firstSuffix) : value;
+}
+
+function decodeHrefPath(value: string): string {
+  try {
+    return decodeURI(value);
+  } catch {
+    return value;
+  }
+}
+
+export function markdownFileHrefPath(href: string): string | null {
+  const trimmed = href.trim();
+  if (!trimmed || trimmed.startsWith('#') || trimmed.startsWith('//')) return null;
+  if (/^[A-Za-z][A-Za-z0-9+.-]*:/.test(trimmed)) return null;
+
+  const pathOnly = stripHrefSuffix(trimmed);
+  if (!pathOnly) return null;
+
+  const decoded = decodeHrefPath(pathOnly);
+  const normalized = normalizeMentionedFilePath(decoded);
+  return isLikelyFileMention(normalized) ? normalized : null;
+}
+
 export function splitFileMentions(text: string): FileMentionPart[] {
   const parts: FileMentionPart[] = [];
   let lastIndex = 0;

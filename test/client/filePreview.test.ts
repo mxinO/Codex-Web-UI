@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { filePreviewUrl, isImagePath, normalizeMentionedFilePath } from '../../src/lib/filePreview';
-import { splitFileMentions } from '../../src/lib/fileMentions';
+import { markdownFileHrefPath, splitFileMentions } from '../../src/lib/fileMentions';
 
 describe('file preview helpers', () => {
   it('detects common image paths after line suffixes are removed', () => {
@@ -34,5 +34,19 @@ describe('splitFileMentions', () => {
     expect(splitFileMentions('Node.js, dev@example.com, 1.2.3, React.memo, and example.com/path are not files.')).toEqual([
       { type: 'text', value: 'Node.js, dev@example.com, 1.2.3, React.memo, and example.com/path are not files.' },
     ]);
+  });
+});
+
+describe('markdownFileHrefPath', () => {
+  it('recognizes local markdown hrefs as file paths', () => {
+    expect(markdownFileHrefPath('docs/guide.md')).toBe('docs/guide.md');
+    expect(markdownFileHrefPath('/repo/src/App.tsx#L42')).toBe('/repo/src/App.tsx');
+    expect(markdownFileHrefPath('plots/output%20image.png?raw=1')).toBe('plots/output image.png');
+  });
+
+  it('leaves external and in-page markdown hrefs alone', () => {
+    expect(markdownFileHrefPath('https://example.com/docs/guide.md')).toBeNull();
+    expect(markdownFileHrefPath('//example.com/docs/guide.md')).toBeNull();
+    expect(markdownFileHrefPath('#section')).toBeNull();
   });
 });
