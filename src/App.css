@@ -615,6 +615,13 @@ input:focus-visible {
   overflow-wrap: anywhere;
 }
 
+.streaming-card--active {
+  border-color: color-mix(in srgb, var(--green) 42%, var(--border));
+  box-shadow:
+    0 10px 24px color-mix(in srgb, var(--green) 8%, transparent),
+    var(--shadow-subtle);
+}
+
 .streaming-card__header,
 .approval-card__header {
   display: flex;
@@ -636,10 +643,82 @@ input:focus-visible {
   background: var(--green);
 }
 
+.streaming-card--active .streaming-card__dot {
+  animation: streaming-dot-pulse 1.4s ease-in-out infinite;
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 34%, transparent);
+}
+
+.streaming-card__pulse {
+  display: inline-grid;
+  grid-template-columns: repeat(3, 4px);
+  gap: 3px;
+  align-items: center;
+  width: 18px;
+  height: 10px;
+  color: var(--green);
+}
+
+.streaming-card__pulse span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.35;
+  animation: streaming-pulse-dot 1.05s ease-in-out infinite;
+}
+
+.streaming-card__pulse span:nth-child(2) {
+  animation-delay: 0.14s;
+}
+
+.streaming-card__pulse span:nth-child(3) {
+  animation-delay: 0.28s;
+}
+
 .streaming-card__empty,
 .approval-card__empty {
   color: var(--text-secondary);
   font-size: 13px;
+}
+
+@keyframes streaming-dot-pulse {
+  0%,
+  100% {
+    opacity: 0.62;
+    transform: scale(0.86);
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 30%, transparent);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1);
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--green) 0%, transparent);
+  }
+}
+
+@keyframes streaming-pulse-dot {
+  0%,
+  80%,
+  100% {
+    opacity: 0.28;
+    transform: translateY(0);
+  }
+
+  40% {
+    opacity: 1;
+    transform: translateY(-3px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .streaming-card--active .streaming-card__dot,
+  .streaming-card__pulse span {
+    animation: none;
+  }
+
+  .streaming-card__pulse span {
+    opacity: 0.55;
+  }
 }
 
 .approval-card__header code {
