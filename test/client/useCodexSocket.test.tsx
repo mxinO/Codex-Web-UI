@@ -4,6 +4,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useCodexSocket } from '../../src/hooks/useCodexSocket';
+import { timelineNotificationMeta } from '../../src/lib/timeline';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -68,6 +69,7 @@ beforeEach(() => {
   MockWebSocket.instances = [];
   currentSocket = null;
   window.history.replaceState(null, '', '/app?token=secret&mode=test#pane');
+  window.localStorage.clear();
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{}', { status: 200 })));
   vi.stubGlobal('WebSocket', MockWebSocket);
 });
@@ -97,6 +99,7 @@ describe('useCodexSocket', () => {
     });
 
     expect(currentSocket?.connectionState).toBe('connected');
+    expect(ws.sent[0]).toBe(JSON.stringify({ type: 'client/hello', params: { lastNotificationStreamId: null, lastNotificationSeq: null } }));
     const result = currentSocket?.rpc('slow.method', { value: 1 }, 50);
     const rejection = expect(result).rejects.toThrow('RPC request timed out: slow.method');
 
@@ -176,7 +179,7 @@ describe('useCodexSocket', () => {
     expect(currentSocket?.requests).toEqual([pending]);
   });
 
-  it('increments reconnect epoch and clears stale notifications after reconnect', async () => {
+  it('increments reconnect epoch and preserves retained notifications after reconnect', async () => {
     await renderHook();
     const first = MockWebSocket.instances[0];
     act(() => {
@@ -207,7 +210,24 @@ describe('useCodexSocket', () => {
     });
 
     expect(currentSocket?.reconnectEpoch).toBe(1);
-    expect(currentSocket?.notifications).toEqual([]);
+    expect(currentSocket?.notifications).toHaveLength(1);
+  });
+
+  it('flushes buffered notifications before a socket close reconnects', async () => {
+    await renderHook();
+    const first = MockWebSocket.instances[0];
+    act(() => {
+      first.open();
+      first.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'codex/notification', message: { method: 'item/agentMessage/delta', params: { delta: 'before-close' } } }),
+        }),
+      );
+      first.close();
+    });
+
+    expect(currentSocket?.notificationCount).toBe(1);
+    expect(currentSocket?.notifications.map((item) => (item as { params?: { delta?: string } }).params?.delta)).toEqual(['before-close']);
   });
 
   it('batches app-server notifications before updating React state', async () => {
@@ -232,6 +252,83 @@ describe('useCodexSocket', () => {
 
     expect(currentSocket?.notificationCount).toBe(3);
     expect(currentSocket?.notifications.map((item) => (item as { params?: { delta?: string } }).params?.delta)).toEqual(['0', '1', '2']);
+  });
+
+  it('sends the last notification sequence on reconnect and ignores replay duplicates', async () => {
+    await renderHook();
+    const first = MockWebSocket.instances[0];
+    act(() => {
+      first.open();
+      first.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'codex/notification', streamId: 'stream-1', seq: 7, message: { method: 'item/agentMessage/delta', params: { delta: 'kept' } } }),
+        }),
+      );
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(50);
+    });
+
+    act(() => {
+      first.close();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+      await Promise.resolve();
+    });
+
+    const second = MockWebSocket.instances[1];
+    act(() => {
+      second.open();
+      second.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'codex/notification', streamId: 'stream-1', seq: 7, message: { method: 'item/agentMessage/delta', params: { delta: 'duplicate' } } }),
+        }),
+      );
+      second.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'codex/notification', streamId: 'stream-1', seq: 8, message: { method: 'item/agentMessage/delta', params: { delta: 'missed' } } }),
+        }),
+      );
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(50);
+    });
+
+    expect(second.sent[0]).toBe(JSON.stringify({ type: 'client/hello', params: { lastNotificationStreamId: 'stream-1', lastNotificationSeq: 7 } }));
+    expect(currentSocket?.notifications.map((item) => (item as { params?: { delta?: string } }).params?.delta)).toEqual(['kept', 'missed']);
+    expect(timelineNotificationMeta(currentSocket?.notifications[1])).toMatchObject({ order: 2, streamId: 'stream-1', seq: 8 });
+    expect(window.localStorage.getItem(`codex-web-ui:notificationReplay:${window.location.host}`)).toBe(JSON.stringify({ streamId: 'stream-1', seq: 8 }));
+  });
+
+  it('does not drop low sequence notifications from a restarted server stream', async () => {
+    window.localStorage.setItem(
+      `codex-web-ui:notificationReplay:${window.location.host}`,
+      JSON.stringify({ streamId: 'old-stream', seq: 100 }),
+    );
+
+    await renderHook();
+    const ws = MockWebSocket.instances[0];
+    act(() => {
+      ws.open();
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'server/hello', notificationStreamId: 'new-stream', hostname: 'host-a', state: { activeThreadId: null, activeThreadPath: null, activeTurnId: null, activeCwd: null, theme: 'dark', queue: [] } }),
+        }),
+      );
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'codex/notification', streamId: 'new-stream', seq: 1, message: { method: 'item/agentMessage/delta', params: { delta: 'after-restart' } } }),
+        }),
+      );
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(50);
+    });
+
+    expect(ws.sent[0]).toBe(JSON.stringify({ type: 'client/hello', params: { lastNotificationStreamId: 'old-stream', lastNotificationSeq: 100 } }));
+    expect(currentSocket?.notifications.map((item) => (item as { params?: { delta?: string } }).params?.delta)).toEqual(['after-restart']);
+    expect(window.localStorage.getItem(`codex-web-ui:notificationReplay:${window.location.host}`)).toBe(JSON.stringify({ streamId: 'new-stream', seq: 1 }));
   });
 
   it('caps app-server request history at 50 items', async () => {

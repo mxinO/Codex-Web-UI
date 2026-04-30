@@ -142,7 +142,8 @@ server.listen(config.port, config.host, () => {
   const port = typeof address === 'object' && address !== null ? (address as AddressInfo).port : config.port;
   const host = config.host.includes(':') && !config.host.startsWith('[') ? `[${config.host}]` : config.host;
   const url = `http://${host}:${port}${config.noAuth ? '' : `?token=${token}`}`;
-  logInfo(`Open in browser: ${url}`);
+  console.log(`[info] Open in browser: ${url}`);
+  logInfo('Open in browser URL printed to stdout', { host: config.host, port, auth: config.noAuth ? 'disabled' : 'token-required' });
   logInfo('Codex Web UI server listening', { host: config.host, port, logFilePath });
 });
 

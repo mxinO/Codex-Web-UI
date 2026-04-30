@@ -40,6 +40,7 @@ function makeConfig(): ServerConfig {
 }
 
 type TestRequest = (method: string, params?: unknown, timeoutMs?: number) => Promise<unknown>;
+const TURN_START_RPC_TIMEOUT_MS = 10 * 60 * 1000;
 
 async function makeHarness(request: TestRequest, options: { startCwd?: string; initialState?: Partial<HostRuntimeState> } = {}) {
   const server = http.createServer();
@@ -495,6 +496,89 @@ describe('attachBrowserSocket app-server requests', () => {
       type: 'server/hello',
       requests: [pending],
     });
+  });
+
+  it('broadcasts active turn state before forwarding turn started notifications', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: null });
+
+    const messages = nextMessages(ws, 2);
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-1' });
+
+    expect(await messages).toEqual([
+      expect.objectContaining({
+        type: 'server/hello',
+        state: expect.objectContaining({ activeThreadId: 'thread-1', activeTurnId: 'turn-1' }),
+      }),
+      {
+        type: 'codex/notification',
+        streamId: expect.any(String),
+        seq: 1,
+        message: { jsonrpc: '2.0', method: 'turn/started', params: { threadId: 'thread-1', turnId: 'turn-1' } },
+      },
+    ]);
+  });
+
+  it('replays bounded missed notifications after the browser reconnects', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { port, notify } = await makeHarness(request);
+
+    notify('item/agentMessage/delta', { threadId: 'thread-1', turnId: 'turn-1', delta: 'first' });
+    notify('item/agentMessage/delta', { threadId: 'thread-1', turnId: 'turn-1', delta: 'second' });
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const initialHello = nextMessage(ws);
+    await new Promise<void>((resolve) => ws.once('open', resolve));
+    const helloMessage = await initialHello;
+    cleanups.push(() => ws.close());
+
+    const replay = nextMessages(ws, 2);
+    const streamId = (helloMessage as { notificationStreamId?: string }).notificationStreamId;
+    ws.send(JSON.stringify({ type: 'client/hello', params: { lastNotificationStreamId: streamId, lastNotificationSeq: 1 } }));
+
+    expect(await replay).toEqual([
+      expect.objectContaining({ type: 'server/hello' }),
+      {
+        type: 'codex/notification',
+        streamId: expect.any(String),
+        seq: 2,
+        message: { jsonrpc: '2.0', method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'second' } },
+      },
+    ]);
+  });
+
+  it('replays current-process notifications when the browser has an old stream id', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { port, notify } = await makeHarness(request);
+
+    notify('item/agentMessage/delta', { threadId: 'thread-1', turnId: 'turn-1', delta: 'first-after-restart' });
+    notify('item/agentMessage/delta', { threadId: 'thread-1', turnId: 'turn-1', delta: 'second-after-restart' });
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const initialHello = nextMessage(ws);
+    await new Promise<void>((resolve) => ws.once('open', resolve));
+    await initialHello;
+    cleanups.push(() => ws.close());
+
+    const replay = nextMessages(ws, 3);
+    ws.send(JSON.stringify({ type: 'client/hello', params: { lastNotificationStreamId: 'old-stream', lastNotificationSeq: 100 } }));
+
+    expect(await replay).toEqual([
+      expect.objectContaining({ type: 'server/hello' }),
+      {
+        type: 'codex/notification',
+        streamId: expect.any(String),
+        seq: 1,
+        message: { jsonrpc: '2.0', method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'first-after-restart' } },
+      },
+      {
+        type: 'codex/notification',
+        streamId: expect.any(String),
+        seq: 2,
+        message: { jsonrpc: '2.0', method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'second-after-restart' } },
+      },
+    ]);
   });
 
   it('maps command approval decisions into app-server responses', async () => {
@@ -2489,7 +2573,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     stateStore.update((state) => ({ ...state, activeThreadId: 'thread-2', activeTurnId: 'turn-current' }));
     resolveStart({ turn: { id: 'turn-from-thread-1' } });
 
-    const response = await nextMessage(ws);
+    const response = await nextRpcResponse(ws, 13);
     await flushPromises();
 
     expect(response).toEqual({ type: 'rpc/result', id: 13, result: { turn: { id: 'turn-from-thread-1' } } });
@@ -2509,6 +2593,108 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       error: 'Codex is already working; queue the message instead',
     });
     expect(request).not.toHaveBeenCalled();
+  });
+
+  it('marks direct turn starts pending before the app-server responds', async () => {
+    let resolveStart: (value: unknown) => void = () => undefined;
+    const startPromise = new Promise<unknown>((resolve) => {
+      resolveStart = resolve;
+    });
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: '/work/project' } } as T);
+      if (method === 'turn/start') return startPromise as Promise<T>;
+      return Promise.reject(new Error(`unexpected method ${method}`));
+    });
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: null, activeCwd: '/work/project' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 132, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'hello' } }));
+    await waitForRequestCalls(request, 2);
+
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-start-pending:thread-1' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 133, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'second' } }));
+    expect(await nextRpcResponse(ws, 133)).toEqual({
+      type: 'rpc/error',
+      id: 133,
+      error: 'Codex is already working; queue the message instead',
+    });
+    expect(request).toHaveBeenCalledTimes(2);
+
+    resolveStart({ turn: { id: 'turn-1' } });
+    expect(await nextRpcResponse(ws, 132)).toEqual({ type: 'rpc/result', id: 132, result: { turn: { id: 'turn-1' } } });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-1' });
+  });
+
+  it('keeps direct turn starts pending when app-server turn/start times out after send', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: '/work/project' } } as T);
+      if (method === 'turn/start') return Promise.reject(new Error('JSON-RPC request timed out: turn/start'));
+      return Promise.reject(new Error(`unexpected method ${method}`));
+    });
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: null, activeCwd: '/work/project' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 134, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'hello' } }));
+
+    expect(await nextRpcResponse(ws, 134)).toEqual({
+      type: 'rpc/error',
+      id: 134,
+      error: 'JSON-RPC request timed out: turn/start',
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-start-pending:thread-1' });
+  });
+
+  it('does not resurrect a direct turn that completes before turn/start returns', async () => {
+    let resolveStart: (value: unknown) => void = () => undefined;
+    const startPromise = new Promise<unknown>((resolve) => {
+      resolveStart = resolve;
+    });
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: '/work/project' } } as T);
+      if (method === 'turn/start') return startPromise as Promise<T>;
+      return Promise.reject(new Error(`unexpected method ${method}`));
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: null, activeCwd: '/work/project' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 135, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'hello' } }));
+    await waitForRequestCalls(request, 2);
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-fast' });
+    await flushPromises();
+
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-start-pending:thread-1' });
+
+    resolveStart({ turn: { id: 'turn-fast' } });
+    expect(await nextRpcResponse(ws, 135)).toEqual({ type: 'rpc/result', id: 135, result: { turn: { id: 'turn-fast' } } });
+    await flushPromises();
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null });
+  });
+
+  it('does not let a stale same-thread completion clear a pending direct start', async () => {
+    let resolveStart: (value: unknown) => void = () => undefined;
+    const startPromise = new Promise<unknown>((resolve) => {
+      resolveStart = resolve;
+    });
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: '/work/project' } } as T);
+      if (method === 'turn/start') return startPromise as Promise<T>;
+      return Promise.reject(new Error(`unexpected method ${method}`));
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: null, activeCwd: '/work/project' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 136, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'hello' } }));
+    await waitForRequestCalls(request, 2);
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    await flushPromises();
+
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-start-pending:thread-1' });
+
+    resolveStart({ turn: { id: 'turn-new' } });
+    expect(await nextRpcResponse(ws, 136)).toEqual({ type: 'rpc/result', id: 136, result: { turn: { id: 'turn-new' } } });
+    await flushPromises();
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-new' });
   });
 
   it('forwards run options when starting direct turns', async () => {
@@ -2536,7 +2722,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       model: 'gpt-5.5',
       effort: 'high',
       sandboxPolicy: { type: 'dangerFullAccess' },
-    });
+    }, TURN_START_RPC_TIMEOUT_MS);
   });
 
   it('forwards collaboration mode when starting direct turns', async () => {
@@ -2567,7 +2753,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
         mode: 'plan',
         settings: { model: 'gpt-5.5', reasoning_effort: 'high', developer_instructions: null },
       },
-    });
+    }, TURN_START_RPC_TIMEOUT_MS);
   });
 
   it('auto-starts exactly one queued message when duplicate completion notifications arrive', async () => {
@@ -2596,12 +2782,41 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'next', text_elements: [] }],
-    });
-    expect(stateStore.read()).toMatchObject({ activeTurnId: null, queue: [] });
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeTurnId: 'turn-start-pending:thread-1', queue: [] });
 
     resolveStart({ turn: { id: 'turn-next' } });
     await flushPromises();
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-next', queue: [] });
+  });
+
+  it('does not resurrect a queued turn that completes before turn/start returns', async () => {
+    let resolveStart: (value: unknown) => void = () => undefined;
+    const startPromise = new Promise<unknown>((resolve) => {
+      resolveStart = resolve;
+    });
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) =>
+      method === 'thread/resume' ? Promise.resolve({} as T) : (startPromise as Promise<T>),
+    );
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-old',
+      queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    await waitForRequestCalls(request, 2);
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-next' });
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-next' });
+    await flushPromises();
+
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-next', queue: [] });
+
+    resolveStart({ turn: { id: 'turn-next' } });
+    await flushPromises();
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [] });
   });
 
   it('treats Codex task_complete event messages as turn completion', async () => {
@@ -2621,7 +2836,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'next', text_elements: [] }],
-    });
+    }, TURN_START_RPC_TIMEOUT_MS);
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-next', queue: [] });
   });
 
@@ -2659,7 +2874,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
         excludeTmpdirEnvVar: false,
         excludeSlashTmp: false,
       },
-    });
+    }, TURN_START_RPC_TIMEOUT_MS);
   });
 
   it('drops queued collaboration mode without model during auto-start', async () => {
@@ -2686,7 +2901,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'next', text_elements: [] }],
       effort: 'high',
-    });
+    }, TURN_START_RPC_TIMEOUT_MS);
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-next', queue: [] });
   });
 
@@ -2720,8 +2935,8 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'first', text_elements: [] }],
-    });
-    expect(stateStore.read()).toMatchObject({ activeTurnId: null, queue: [secondQueued] });
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeTurnId: 'turn-start-pending:thread-1', queue: [secondQueued] });
 
     resolveStart({ turn: { id: 'turn-next' } });
     await flushPromises();
@@ -2751,6 +2966,57 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       activeTurnId: null,
       queue: [claimed, secondQueued],
     });
+  });
+
+  it('restores a claimed queued message when queued turn start times out before a task starts', async () => {
+    const claimed = { id: 'queued-1', text: 'first', createdAt: 1 };
+    const secondQueued = { id: 'queued-2', text: 'second', createdAt: 2 };
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) =>
+      method === 'thread/resume' ? Promise.resolve({} as T) : Promise.reject(new Error('JSON-RPC request timed out: turn/start')),
+    );
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-old',
+      queue: [claimed, secondQueued],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    await waitForRequestCalls(request, 2);
+
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: null,
+      queue: [claimed, secondQueued],
+    });
+  });
+
+  it('removes a restored queued message if its timed-out turn starts late', async () => {
+    const claimed = { id: 'queued-1', text: 'first', createdAt: 1 };
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) =>
+      method === 'thread/resume' ? Promise.resolve({} as T) : Promise.reject(new Error('JSON-RPC request timed out: turn/start')),
+    );
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-old',
+      queue: [claimed],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    await waitForRequestCalls(request, 2);
+    expect(stateStore.read()).toMatchObject({ activeTurnId: null, queue: [claimed] });
+
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-late' });
+    await flushPromises();
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-late', queue: [] });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-late' });
+    await flushPromises();
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [] });
   });
 
   it('preserves queued messages on completion when no thread is active', async () => {
@@ -2785,7 +3051,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     resolveStart({ turn: { id: 'turn-from-thread-1' } });
     await flushPromises();
 
-    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-2', activeTurnId: null, queue: [] });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-2', activeTurnId: null, queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }] });
   });
 
   it('ignores stale completion notifications from a different active session', async () => {

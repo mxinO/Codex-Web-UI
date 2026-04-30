@@ -3,6 +3,8 @@ import { BANG_COMMAND_RPC_TIMEOUT_MS, parseBangCommand } from '../lib/bangComman
 import { classifySlashCommand, SLASH_ARGUMENT_SUGGESTIONS, SLASH_COMMANDS } from '../lib/slashCommands';
 import type { CodexRunOptions } from '../types/ui';
 
+const TURN_START_RPC_TIMEOUT_MS = 10 * 60 * 1000;
+
 interface InputBoxProps {
   rpc: <T>(method: string, params?: unknown, timeoutMs?: number) => Promise<T>;
   threadId: string | null;
@@ -72,7 +74,11 @@ function getInsertText(event: Event): string | null {
 }
 
 function shouldRollbackDirectSubmitFailure(message: string): boolean {
-  return /not connected|socket closed|authentication failed|failed to send rpc request|json-rpc socket is closed/i.test(message);
+  return /not connected|authentication failed|failed to send rpc request|json-rpc socket is closed/i.test(message);
+}
+
+function isUncertainDirectSubmitFailure(message: string): boolean {
+  return /socket closed|rpc request timed out:\s*webui\/turn\/start|(?:json-rpc\s+)?request timed out:\s*turn\/start/i.test(message);
 }
 
 export default function InputBox({
@@ -233,13 +239,17 @@ export default function InputBox({
       const rollbackOptimistic = onDirectSubmit?.(text);
       setDraft('');
       try {
-        await rpc('webui/turn/start', { threadId, text, options: runOptions });
+        await rpc('webui/turn/start', { threadId, text, options: runOptions }, TURN_START_RPC_TIMEOUT_MS);
       } catch (caught) {
         const message = caught instanceof Error ? caught.message : String(caught);
         if (shouldRollbackDirectSubmitFailure(message)) {
           if (typeof rollbackOptimistic === 'function') rollbackOptimistic();
           setDraft(previousDraft);
           throw caught;
+        }
+        if (isUncertainDirectSubmitFailure(message)) {
+          setError('Message sent; waiting for Codex status after reconnect');
+          return;
         }
         onDirectSubmitError?.(text, message);
         setError(message);

@@ -1,12 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { trimTimelineWindow, turnToTimelineItems, type TimelineItem } from '../lib/timeline';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { turnToTimelineItems, type TimelineItem } from '../lib/timeline';
 import type { CodexTurn } from '../types/codex';
 
 const PAGE_SIZE = 50;
-const WINDOW_SIZE = 200;
+const WINDOW_TURN_LIMIT = 200;
 
 interface TurnListResult {
-  data: CodexTurn[];
+  data?: CodexTurn[];
+  turns?: CodexTurn[];
+  thread?: { turns?: CodexTurn[] };
   nextCursor?: string | null;
   next_cursor?: string | null;
 }
@@ -19,28 +21,64 @@ function normalizeTurns(turns: CodexTurn[]): TimelineItem[] {
   return turns.flatMap(turnToTimelineItems);
 }
 
-function trimOlderWindow<T>(items: T[], limit: number): T[] {
-  return items.length <= limit ? items : items.slice(0, limit);
+function trimNewestTurnWindow(turns: CodexTurn[], limit: number): CodexTurn[] {
+  return turns.length <= limit ? turns : turns.slice(turns.length - limit);
+}
+
+function trimOldestTurnWindow(turns: CodexTurn[], limit: number): CodexTurn[] {
+  return turns.length <= limit ? turns : turns.slice(0, limit);
 }
 
 function resultTurns(result: TurnListResult): CodexTurn[] {
-  return Array.isArray(result.data) ? result.data : [];
+  if (Array.isArray(result.data)) return result.data;
+  if (Array.isArray(result.turns)) return result.turns;
+  if (Array.isArray(result.thread?.turns)) return result.thread.turns;
+  return [];
+}
+
+function mergeLatestTurns(current: CodexTurn[], latest: CodexTurn[], limit: number): CodexTurn[] {
+  if (latest.length === 0) return current;
+  if (current.length === 0) return trimNewestTurnWindow(latest, limit);
+
+  const indexes = new Map<string, number>();
+  const next = [...current];
+  next.forEach((turn, index) => indexes.set(turn.id, index));
+
+  for (const turn of latest) {
+    const existingIndex = indexes.get(turn.id);
+    if (existingIndex === undefined) {
+      indexes.set(turn.id, next.length);
+      next.push(turn);
+    } else {
+      next[existingIndex] = turn;
+    }
+  }
+
+  return trimNewestTurnWindow(next, limit);
+}
+
+function mergeOlderTurns(current: CodexTurn[], older: CodexTurn[], limit: number): CodexTurn[] {
+  if (older.length === 0) return current;
+  const currentIds = new Set(current.map((turn) => turn.id));
+  const merged = [...older.filter((turn) => !currentIds.has(turn.id)), ...current];
+  return trimOldestTurnWindow(merged, limit);
 }
 
 export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method: string, params?: unknown) => Promise<T>) {
   const activeThreadRef = useRef(activeThreadId);
   const requestGenerationRef = useRef(0);
-  const [items, setItems] = useState<TimelineItem[]>([]);
+  const [turns, setTurns] = useState<CodexTurn[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [isViewingLatest, setIsViewingLatest] = useState(true);
   activeThreadRef.current = activeThreadId;
+  const items = useMemo<TimelineItem[]>(() => normalizeTurns(turns), [turns]);
 
   const isCurrentRequest = useCallback((threadId: string, generation: number) => {
     return activeThreadRef.current === threadId && requestGenerationRef.current === generation;
   }, []);
 
-  const loadLatest = useCallback(async () => {
+  const fetchLatest = useCallback(async (mode: 'merge' | 'replace') => {
     if (!activeThreadId) return;
     const threadId = activeThreadId;
     const generation = ++requestGenerationRef.current;
@@ -55,18 +93,20 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
       });
       if (!isCurrentRequest(threadId, generation)) return;
       const latest = [...resultTurns(result)].reverse();
-      setItems(trimTimelineWindow(normalizeTurns(latest), WINDOW_SIZE));
-      setCursor(getNextCursor(result));
-      setIsViewingLatest(true);
+      setTurns((current) => (mode === 'replace' ? latest : mergeLatestTurns(current, latest, WINDOW_TURN_LIMIT)));
+      const nextCursor = getNextCursor(result);
+      setCursor((currentCursor) => (mode === 'replace' || isViewingLatest ? nextCursor : currentCursor));
+      if (mode === 'replace') setIsViewingLatest(true);
     } catch {
       if (!isCurrentRequest(threadId, generation)) return;
-      setItems([]);
-      setCursor(null);
-      setIsViewingLatest(true);
+      // Keep the last successfully rendered timeline during transient transport or app-server failures.
     } finally {
       if (isCurrentRequest(threadId, generation)) setLoading(false);
     }
-  }, [activeThreadId, isCurrentRequest, rpc]);
+  }, [activeThreadId, isCurrentRequest, isViewingLatest, rpc]);
+
+  const reload = useCallback(() => fetchLatest('merge'), [fetchLatest]);
+  const jumpToLatest = useCallback(() => fetchLatest('replace'), [fetchLatest]);
 
   const loadOlder = useCallback(async () => {
     if (!activeThreadId || !cursor || loading) return;
@@ -84,13 +124,12 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
       });
       if (!isCurrentRequest(threadId, generation)) return;
       const older = [...resultTurns(result)].reverse();
-      const olderItems = normalizeTurns(older);
-      setItems((current) => trimOlderWindow([...olderItems, ...current], WINDOW_SIZE));
+      setTurns((current) => mergeOlderTurns(current, older, WINDOW_TURN_LIMIT));
       setCursor(getNextCursor(result));
       setIsViewingLatest(false);
     } catch {
       if (!isCurrentRequest(threadId, generation)) return;
-      setCursor(null);
+      // Keep the current cursor so a transient older-page failure does not strand pagination.
     } finally {
       if (isCurrentRequest(threadId, generation)) setLoading(false);
     }
@@ -99,7 +138,7 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
   useEffect(() => {
     const threadId = activeThreadId;
     const generation = ++requestGenerationRef.current;
-    setItems([]);
+    setTurns([]);
     setCursor(null);
     setIsViewingLatest(true);
 
@@ -118,15 +157,13 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
       .then((result) => {
         if (!isCurrentRequest(threadId, generation)) return;
         const latest = [...resultTurns(result)].reverse();
-        setItems(trimTimelineWindow(normalizeTurns(latest), WINDOW_SIZE));
+        setTurns(latest);
         setCursor(getNextCursor(result));
         setIsViewingLatest(true);
       })
       .catch(() => {
         if (!isCurrentRequest(threadId, generation)) return;
-        setItems([]);
-        setCursor(null);
-        setIsViewingLatest(true);
+        // Initial load already reset this thread's display. Do not clear a newer successful result.
       })
       .finally(() => {
         if (isCurrentRequest(threadId, generation)) setLoading(false);
@@ -137,7 +174,5 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
     };
   }, [activeThreadId, isCurrentRequest, rpc]);
 
-  const jumpToLatest = loadLatest;
-
-  return { items, loadOlder, hasOlder: Boolean(cursor), loading, reload: loadLatest, jumpToLatest, isViewingLatest };
+  return { items, loadOlder, hasOlder: Boolean(cursor), loading, reload, jumpToLatest, isViewingLatest };
 }

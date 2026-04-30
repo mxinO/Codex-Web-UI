@@ -15,6 +15,7 @@ import {
   requestKey,
   shouldShowLiveStreamingItem,
   timelineItemsWithLiveTurnOverlay,
+  withTimelineNotificationMeta,
   turnToTimelineItems,
   trimTimelineWindow,
   visibleLiveTurnItemsForTimeline,
@@ -188,6 +189,24 @@ describe('timeline', () => {
     expect(mergeTimelineItemsByTimestamp([user, assistant, bang]).map((item) => item.id)).toEqual(['bang:1000:1', 'u1', 'a1']);
   });
 
+  it('uses sortOrder to break same-timestamp ties for mixed live and client items', () => {
+    const live: TimelineItem = { id: 'live-1', kind: 'assistant', timestamp: 1000, sortOrder: 10, text: 'live first', phase: 'commentary', turnId: 'turn-1' };
+    const bang: TimelineItem = {
+      id: 'bang-1',
+      kind: 'bangCommand',
+      timestamp: 1000,
+      sortOrder: 11,
+      command: 'pwd',
+      cwd: '/repo',
+      output: '/repo\n',
+      status: 'completed',
+      exitCode: 0,
+    };
+    const queued: TimelineItem = { id: 'queued-1', kind: 'queued', timestamp: 1000, sortOrder: 12, message: { id: 'q1', text: 'next', createdAt: 1000 } };
+
+    expect(mergeTimelineItemsByTimestamp([queued, bang, live]).map((item) => item.id)).toEqual(['live-1', 'bang-1', 'queued-1']);
+  });
+
   it('normalizes malformed arrays and missing item ids defensively', () => {
     const turn: CodexTurn = {
       id: 'turn-2',
@@ -351,6 +370,26 @@ describe('timeline', () => {
       { pendingStartCount: 10 },
     );
     expect(pendingWindow).toEqual({ activeThreadId: 'thread-1', activeTurnId: null, startCount: 10 });
+
+    expect(
+      nextLiveNotificationWindow(pendingWindow, { activeThreadId: 'thread-1', activeTurnId: 'turn-1' }, 18),
+    ).toEqual({
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-1',
+      startCount: 10,
+    });
+  });
+
+  it('preserves pending submit notifications across a synthetic pending turn id', () => {
+    const idleWindow = { activeThreadId: 'thread-1', activeTurnId: null, startCount: 10 };
+
+    const pendingWindow = nextLiveNotificationWindow(
+      idleWindow,
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-start-pending:thread-1' },
+      12,
+      { pendingStartCount: 10 },
+    );
+    expect(pendingWindow).toEqual({ activeThreadId: 'thread-1', activeTurnId: 'turn-start-pending:thread-1', startCount: 10 });
 
     expect(
       nextLiveNotificationWindow(pendingWindow, { activeThreadId: 'thread-1', activeTurnId: 'turn-1' }, 18),
@@ -594,6 +633,42 @@ describe('timeline', () => {
       'Now I will patch it.',
       'turn-1:edit-1',
     ]);
+  });
+
+  it('uses notification metadata timestamps for live turn item ordering', () => {
+    const items = liveTurnItemsFromNotifications(
+      [
+        withTimelineNotificationMeta(
+          { method: 'event_msg', params: { type: 'agent_message', message: 'First', phase: 'commentary', turn_id: 'turn-1' } },
+          { order: 1, receivedAt: 1000, streamId: 'stream-1', seq: 1 },
+        ),
+        withTimelineNotificationMeta(
+          {
+            method: 'item/completed',
+            params: {
+              threadId: 'thread-1',
+              turnId: 'turn-1',
+              item: {
+                type: 'commandExecution',
+                id: 'cmd-1',
+                command: 'pwd',
+                cwd: '/repo',
+                status: 'completed',
+                aggregatedOutput: '/repo\n',
+                exitCode: 0,
+              },
+            },
+          },
+          { order: 2, receivedAt: 2000, streamId: 'stream-1', seq: 2 },
+        ),
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      9999,
+    );
+
+    expect(items.map((item) => item.timestamp)).toEqual([1000, 2000]);
+    expect(items.map((item) => item.sortOrder)).toEqual([1, 2]);
   });
 
   it('treats repeated event message snapshots as replacement updates', () => {

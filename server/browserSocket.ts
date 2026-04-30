@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import type http from 'node:http';
@@ -112,6 +112,11 @@ const FILE_DIFF_PATCH_MAX_BYTES_PER_FILE = FILE_DIFF_SNAPSHOT_MAX_BYTES;
 const FILE_DIFF_PATCH_MAX_PENDING_NOTIFICATIONS = 100;
 const FILE_DIFF_PATCH_MAX_INCOMPLETE_TURNS = 200;
 const COMPACTION_PENDING_TURN_PREFIX = 'compact-pending:';
+const TURN_START_PENDING_TURN_PREFIX = 'turn-start-pending:';
+const TURN_START_RPC_TIMEOUT_MS = 10 * 60 * 1000;
+const RECENT_NOTIFICATION_MAX_ENTRIES = 500;
+const RECENT_NOTIFICATION_MAX_BYTES = 2 * 1024 * 1024;
+const RECENT_NOTIFICATION_SINGLE_MAX_BYTES = 256 * 1024;
 
 function getOptionalString(params: unknown, key: string): string | null {
   if (!isRecord(params) || !hasOwn(params, key)) return null;
@@ -367,6 +372,46 @@ function pendingCompactionTurnId(threadId: string): string {
 
 function isPendingCompactionTurnForThread(turnId: string | null | undefined, threadId: string | null | undefined): boolean {
   return Boolean(turnId && threadId && turnId === pendingCompactionTurnId(threadId));
+}
+
+function pendingTurnStartTurnId(threadId: string): string {
+  return `${TURN_START_PENDING_TURN_PREFIX}${threadId}`;
+}
+
+function isPendingTurnStartForThread(turnId: string | null | undefined, threadId: string | null | undefined): boolean {
+  return Boolean(turnId && threadId && turnId === pendingTurnStartTurnId(threadId));
+}
+
+function isPendingTurnForThread(turnId: string | null | undefined, threadId: string | null | undefined): boolean {
+  return isPendingCompactionTurnForThread(turnId, threadId) || isPendingTurnStartForThread(turnId, threadId);
+}
+
+function completionMatchesActiveTurn(
+  activeTurnId: string | null | undefined,
+  activeThreadId: string | null | undefined,
+  completedTurnId: string | null,
+): boolean {
+  if (!activeTurnId) return false;
+  if (!completedTurnId) return true;
+  if (completedTurnId === activeTurnId) return true;
+  return isPendingCompactionTurnForThread(activeTurnId, activeThreadId);
+}
+
+function isTurnStartTimeout(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /timed out:\s*turn\/start|request timed out:\s*turn\/start/i.test(message);
+}
+
+function lastNotificationSeq(params: unknown): number | null {
+  if (!isRecord(params)) return null;
+  const value = params.lastNotificationSeq;
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function lastNotificationStreamId(params: unknown): string | null {
+  if (!isRecord(params)) return null;
+  const value = params.lastNotificationStreamId;
+  return typeof value === 'string' && value.trim() ? value : null;
 }
 
 function browseBasePath(deps: BrowserSocketDeps): string {
@@ -851,11 +896,16 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   let closed = false;
   let queuedStartInFlight: { threadId: string; queuedMessage: QueuedMessage } | null = null;
   let bangCommandInFlight = false;
+  const notificationStreamId = randomUUID();
   const pendingTurnStartContexts: TurnContext[] = [];
   const pendingServerRequests = new Map<string, JsonRpcServerRequest>();
   const resumedThreadIds = new Set<string>();
   const resumeThreadPromises = new Map<string, Promise<void>>();
   const knownThreadPaths = new Map<string, string>();
+  const timedOutQueuedStarts = new Map<string, QueuedMessage>();
+  const recentNotifications: Array<{ seq: number; message: unknown; bytes: number }> = [];
+  let recentNotificationSeq = 0;
+  let recentNotificationBytes = 0;
   const fileSnapshots = new Map<string, FileSnapshot>();
   const patchSnapshots = new Map<string, PatchSnapshot>();
   const incompletePatchTurnKeys = new Set<string>();
@@ -924,6 +974,11 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       if (typeof oldest !== 'string') break;
       completedTurnKeys.delete(oldest);
     }
+  };
+
+  const hasCompletedTurn = (threadId: string | null, turnId: string | null): boolean => {
+    if (!turnId) return false;
+    return completedTurnKeys.has(turnKey(threadId, turnId)) || completedTurnKeys.has(turnKey(null, turnId));
   };
 
   const rememberTurnThreadPath = (threadId: string | null, turnId: string | null, threadPath: string | null) => {
@@ -1405,10 +1460,51 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       type: 'server/hello',
       hostname: deps.config.hostname,
       startCwd: deps.startCwd ?? null,
+      notificationStreamId,
       state,
       appServerHealth: deps.codex.health(),
       requests: Array.from(pendingServerRequests.values()),
     });
+  };
+
+  const notificationByteLength = (message: unknown): number => {
+    try {
+      return Buffer.byteLength(JSON.stringify(message), 'utf8');
+    } catch {
+      return RECENT_NOTIFICATION_SINGLE_MAX_BYTES + 1;
+    }
+  };
+
+  const rememberNotification = (message: unknown): number => {
+    const seq = (recentNotificationSeq += 1);
+    const bytes = notificationByteLength(message);
+    if (bytes > RECENT_NOTIFICATION_SINGLE_MAX_BYTES) return seq;
+
+    recentNotifications.push({ seq, message, bytes });
+    recentNotificationBytes += bytes;
+    while (recentNotifications.length > RECENT_NOTIFICATION_MAX_ENTRIES || recentNotificationBytes > RECENT_NOTIFICATION_MAX_BYTES) {
+      const removed = recentNotifications.shift();
+      if (!removed) break;
+      recentNotificationBytes -= removed.bytes;
+    }
+    return seq;
+  };
+
+  const sendNotification = (client: WebSocket, seq: number, message: unknown) => {
+    send(client, { type: 'codex/notification', streamId: notificationStreamId, seq, message });
+  };
+
+  const broadcastNotification = (message: unknown) => {
+    const seq = rememberNotification(message);
+    for (const client of wss.clients) sendNotification(client, seq, message);
+  };
+
+  const replayNotifications = (client: WebSocket, requestedStreamId: string | null, afterSeq: number | null) => {
+    if (requestedStreamId === null && afterSeq === null) return;
+    const effectiveAfterSeq = requestedStreamId === notificationStreamId ? afterSeq : null;
+    for (const notification of recentNotifications) {
+      if (effectiveAfterSeq === null || notification.seq > effectiveAfterSeq) sendNotification(client, notification.seq, notification.message);
+    }
   };
 
   const clearActiveTurn = (
@@ -1468,16 +1564,11 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   };
 
   const broadcastFileChangeSummaryChanged = (threadId: string, turnId: string) => {
-    for (const client of wss.clients) {
-      send(client, {
-        type: 'codex/notification',
-        message: {
-          jsonrpc: '2.0',
-          method: 'webui/fileChange/summaryChanged',
-          params: { threadId, turnId },
-        },
-      });
-    }
+    broadcastNotification({
+      jsonrpc: '2.0',
+      method: 'webui/fileChange/summaryChanged',
+      params: { threadId, turnId },
+    });
   };
 
   const ensureCodexStarted = (): Promise<void> | null => {
@@ -1556,6 +1647,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           options,
           context.cwd,
         ),
+        TURN_START_RPC_TIMEOUT_MS,
       );
     } finally {
       const index = pendingTurnStartContexts.indexOf(context);
@@ -1590,13 +1682,14 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       finalizedForCompletionKey = true;
     }
 
+    const afterFinalize = deps.stateStore.read();
     const activeCompletion =
-      Boolean(current.activeThreadId && current.activeTurnId) &&
-      (!completedThreadId || completedThreadId === current.activeThreadId) &&
-      (!completedTurnId || completedTurnId === current.activeTurnId || isPendingCompactionTurnForThread(current.activeTurnId, current.activeThreadId));
+      Boolean(afterFinalize.activeThreadId && afterFinalize.activeTurnId) &&
+      (!completedThreadId || completedThreadId === afterFinalize.activeThreadId) &&
+      completionMatchesActiveTurn(afterFinalize.activeTurnId, afterFinalize.activeThreadId, completedTurnId);
 
     if (!activeCompletion || queuedStartInFlight) {
-      if (!current.activeThreadId && current.activeTurnId) {
+      if (!afterFinalize.activeThreadId && afterFinalize.activeTurnId) {
         const cleared = deps.stateStore.update((state) => ({ ...state, activeTurnId: null }));
         broadcastHello(cleared);
       }
@@ -1612,6 +1705,12 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     const claim: { threadId?: string; queuedMessage?: QueuedMessage } = {};
 
     const claimed = deps.stateStore.update((current) => {
+      const stillActiveCompletion =
+        Boolean(current.activeThreadId && current.activeTurnId) &&
+        (!completedThreadId || completedThreadId === current.activeThreadId) &&
+        completionMatchesActiveTurn(current.activeTurnId, current.activeThreadId, completedTurnId);
+      if (!stillActiveCompletion) return current;
+
       if (!current.activeThreadId) {
         return { ...current, activeTurnId: null };
       }
@@ -1623,7 +1722,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
       claim.threadId = current.activeThreadId;
       claim.queuedMessage = shifted.next;
-      return { ...current, activeTurnId: null, queue: shifted.queue };
+      return { ...current, activeTurnId: pendingTurnStartTurnId(current.activeThreadId), queue: shifted.queue };
     });
     broadcastHello(claimed);
 
@@ -1649,10 +1748,17 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     try {
       const result = await startTurn({ threadId, text: queuedMessage.text, options: queuedMessage.options });
       const nextTurnId = extractTurnId(result);
-      const next = deps.stateStore.update((current) => ({
-        ...current,
-        activeTurnId: current.activeThreadId === threadId ? nextTurnId : current.activeTurnId,
-      }));
+      timedOutQueuedStarts.delete(threadId);
+      const alreadyCompleted = hasCompletedTurn(threadId, nextTurnId);
+      const next = deps.stateStore.update((current) => {
+        if (current.activeThreadId !== threadId) return current;
+        if (alreadyCompleted && (current.activeTurnId === nextTurnId || isPendingTurnStartForThread(current.activeTurnId, threadId))) {
+          return { ...current, activeTurnId: null };
+        }
+        if (current.activeTurnId === nextTurnId) return current;
+        if (isPendingTurnStartForThread(current.activeTurnId, threadId)) return { ...current, activeTurnId: nextTurnId };
+        return current;
+      });
       if (next.activeThreadId === threadId) {
         rememberTurnThreadPath(threadId, nextTurnId, next.activeThreadPath);
         rememberTurnCwd(threadId, nextTurnId, next.activeCwd);
@@ -1661,9 +1767,24 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       broadcastHello(next);
     } catch (error) {
       logWarn('Failed to start queued turn', error);
+      if (isTurnStartTimeout(error)) {
+        timedOutQueuedStarts.set(threadId, queuedMessage);
+        const next = deps.stateStore.update((current) => {
+          if (current.activeThreadId !== threadId || !isPendingTurnStartForThread(current.activeTurnId, threadId)) return current;
+          return {
+            ...current,
+            activeTurnId: null,
+            queue: current.queue.some((message) => message.id === queuedMessage.id)
+              ? current.queue
+              : [queuedMessage, ...current.queue].slice(0, deps.config.queueLimit),
+          };
+        });
+        broadcastHello(next);
+        return;
+      }
       const next = deps.stateStore.update((current) => ({
         ...current,
-        activeTurnId: current.activeThreadId === threadId ? null : current.activeTurnId,
+        activeTurnId: current.activeThreadId === threadId && isPendingTurnStartForThread(current.activeTurnId, threadId) ? null : current.activeTurnId,
         queue: current.queue.some((message) => message.id === queuedMessage.id)
           ? current.queue
           : [queuedMessage, ...current.queue].slice(0, deps.config.queueLimit),
@@ -1692,8 +1813,21 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     rememberTurnCwd(threadId, turnId, cwd);
     rememberLivePatchTurn(threadId, turnId);
 
+    const timedOutQueuedStart = threadId ? timedOutQueuedStarts.get(threadId) : null;
+    if (threadId && timedOutQueuedStart) {
+      timedOutQueuedStarts.delete(threadId);
+      deps.stateStore.update((state) =>
+        state.activeThreadId === threadId
+          ? {
+              ...state,
+              queue: state.queue.filter((message) => message.id !== timedOutQueuedStart.id || message.text !== timedOutQueuedStart.text),
+            }
+          : state,
+      );
+    }
+
     if (!threadId || current.activeThreadId !== threadId || current.activeTurnId === turnId) return;
-    if (current.activeTurnId && current.activeTurnId !== turnId && !isPendingCompactionTurnForThread(current.activeTurnId, threadId)) return;
+    if (current.activeTurnId && current.activeTurnId !== turnId && !isPendingTurnForThread(current.activeTurnId, threadId)) return;
 
     const next = deps.stateStore.update((state) => ({
       ...state,
@@ -1705,17 +1839,19 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   };
 
   const unsubscribeNotification = deps.codex.onNotification((message) => {
-    for (const client of wss.clients) send(client, { type: 'codex/notification', message });
+    const seq = rememberNotification(message);
+    const isTaskStart = message.method === 'turn/started' || (message.method === 'event_msg' && isTaskStartedEvent(message));
+    if (isTaskStart) handleTaskStarted(message);
+
+    for (const client of wss.clients) sendNotification(client, seq, message);
     const resolvedRequestId = extractResolvedRequestId(message);
     if (resolvedRequestId !== null && pendingServerRequests.delete(requestKey(resolvedRequestId))) {
       broadcastRequestResolved(resolvedRequestId);
     }
     if (message.method === 'event_msg') {
       enqueuePatchApplyEnd(message);
-      if (isTaskStartedEvent(message)) handleTaskStarted(message);
       if (isTaskCompleteEvent(message)) void handleTurnCompleted(message);
     }
-    if (message.method === 'turn/started') handleTaskStarted(message);
     if (message.method === 'item/completed') enqueueStructuredFileChange(message);
     if (message.method === 'turn/completed') void handleTurnCompleted(message);
     if (message.method === 'thread/compacted') void handleTurnCompleted(message);
@@ -1780,6 +1916,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
       if (request.type === 'client/hello') {
         sendHello(ws);
+        replayNotifications(ws, lastNotificationStreamId(request.params), lastNotificationSeq(request.params));
         return;
       }
 
@@ -2151,13 +2288,39 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
-          const result = await startTurn({ threadId, text, options: runOptionsFromParams(request.params) });
+          const pendingTurnId = pendingTurnStartTurnId(threadId);
+          const pendingState = deps.stateStore.update((current) =>
+            current.activeThreadId === threadId && !current.activeTurnId ? { ...current, activeTurnId: pendingTurnId } : current,
+          );
+          if (pendingState.activeThreadId === threadId && pendingState.activeTurnId === pendingTurnId) {
+            rememberTurnThreadPath(threadId, pendingTurnId, pendingState.activeThreadPath);
+            rememberTurnCwd(threadId, pendingTurnId, pendingState.activeCwd);
+            broadcastHello(pendingState);
+          }
+
+          let result: { turn: { id: string } };
+          try {
+            result = await startTurn({ threadId, text, options: runOptionsFromParams(request.params) });
+          } catch (error) {
+            if (!isTurnStartTimeout(error)) {
+              const cleared = clearActiveTurn({ threadId, turnId: pendingTurnId }, { broadcast: false });
+              broadcastHello(cleared);
+            }
+            throw error;
+          }
+
           const nextTurnId = extractTurnId(result);
-          const state = deps.stateStore.update((current) => ({
-            ...current,
-            activeTurnId: current.activeThreadId === threadId ? nextTurnId : current.activeTurnId,
-          }));
-          if (state.activeThreadId === threadId) {
+          const alreadyCompleted = hasCompletedTurn(threadId, nextTurnId);
+          const state = deps.stateStore.update((current) => {
+            if (current.activeThreadId !== threadId) return current;
+            if (alreadyCompleted && (current.activeTurnId === nextTurnId || current.activeTurnId === pendingTurnId)) {
+              return { ...current, activeTurnId: null };
+            }
+            if (current.activeTurnId === nextTurnId) return current;
+            if (current.activeTurnId === pendingTurnId) return { ...current, activeTurnId: nextTurnId };
+            return current;
+          });
+          if (state.activeThreadId === threadId && state.activeTurnId === nextTurnId) {
             rememberTurnThreadPath(threadId, nextTurnId, state.activeThreadPath);
             rememberTurnCwd(threadId, nextTurnId, state.activeCwd);
             rememberLivePatchTurn(threadId, nextTurnId);

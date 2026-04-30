@@ -11,6 +11,7 @@ import InputBox from '../../src/components/InputBox';
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
 type InputRpc = React.ComponentProps<typeof InputBox>['rpc'];
+const TURN_START_RPC_TIMEOUT_MS = 10 * 60 * 1000;
 
 function asRpc(mock: unknown): InputRpc {
   return mock as InputRpc;
@@ -189,7 +190,7 @@ describe('InputBox', () => {
       await Promise.resolve();
     });
 
-    expect(rpc).toHaveBeenCalledWith('webui/turn/start', { threadId: 'thread-1', text: 'hello', options: runOptions });
+    expect(rpc).toHaveBeenCalledWith('webui/turn/start', { threadId: 'thread-1', text: 'hello', options: runOptions }, TURN_START_RPC_TIMEOUT_MS);
   });
 
   it('notifies the app about a direct send before the turn RPC resolves', async () => {
@@ -210,7 +211,7 @@ describe('InputBox', () => {
     });
 
     expect(onDirectSubmit).toHaveBeenCalledWith('hello now');
-    expect(rpc).toHaveBeenCalledWith('webui/turn/start', { threadId: 'thread-1', text: 'hello now', options: undefined });
+    expect(rpc).toHaveBeenCalledWith('webui/turn/start', { threadId: 'thread-1', text: 'hello now', options: undefined }, TURN_START_RPC_TIMEOUT_MS);
 
     await act(async () => {
       turnStart.resolve({ turn: { id: 'turn-1' } });
@@ -246,9 +247,65 @@ describe('InputBox', () => {
     expect(document.querySelector('.input-error')?.textContent).toBe('Codex ran out of room in the model context');
   });
 
-  it('rolls back direct sends for transport failures before Codex accepts them', async () => {
+  it('keeps direct sends visible when the socket closes after submission', async () => {
     const rpc = vi.fn((method: string) => {
       if (method === 'webui/turn/start') return Promise.reject(new Error('socket closed'));
+      return Promise.reject(new Error(`unexpected method ${method}`));
+    });
+    const rollback = vi.fn();
+    const onDirectSubmit = vi.fn(() => rollback);
+    const onDirectSubmitError = vi.fn();
+    renderInputBox({ rpc: asRpc(rpc), draftOverride: 'continue', onDirectSubmit, onDirectSubmitError });
+    const textarea = document.querySelector<HTMLTextAreaElement>('textarea');
+    const submit = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Send');
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await act(async () => {
+      submit?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(onDirectSubmit).toHaveBeenCalledWith('continue');
+    expect(rollback).not.toHaveBeenCalled();
+    expect(onDirectSubmitError).not.toHaveBeenCalled();
+    expect(textarea?.value).toBe('');
+    expect(document.querySelector('.input-error')?.textContent).toBe('Message sent; waiting for Codex status after reconnect');
+  });
+
+  it('keeps direct sends visible when the app-server turn/start RPC times out after submission', async () => {
+    const rpc = vi.fn((method: string) => {
+      if (method === 'webui/turn/start') return Promise.reject(new Error('JSON-RPC request timed out: turn/start'));
+      return Promise.reject(new Error(`unexpected method ${method}`));
+    });
+    const rollback = vi.fn();
+    const onDirectSubmit = vi.fn(() => rollback);
+    const onDirectSubmitError = vi.fn();
+    renderInputBox({ rpc: asRpc(rpc), draftOverride: 'continue', onDirectSubmit, onDirectSubmitError });
+    const textarea = document.querySelector<HTMLTextAreaElement>('textarea');
+    const submit = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Send');
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await act(async () => {
+      submit?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(onDirectSubmit).toHaveBeenCalledWith('continue');
+    expect(rollback).not.toHaveBeenCalled();
+    expect(onDirectSubmitError).not.toHaveBeenCalled();
+    expect(textarea?.value).toBe('');
+    expect(document.querySelector('.input-error')?.textContent).toBe('Message sent; waiting for Codex status after reconnect');
+  });
+
+  it('rolls back direct sends for transport failures before the message leaves the browser', async () => {
+    const rpc = vi.fn((method: string) => {
+      if (method === 'webui/turn/start') return Promise.reject(new Error('failed to send RPC request'));
       return Promise.reject(new Error(`unexpected method ${method}`));
     });
     const rollback = vi.fn();
@@ -271,7 +328,7 @@ describe('InputBox', () => {
     expect(rollback).toHaveBeenCalledTimes(1);
     expect(onDirectSubmitError).not.toHaveBeenCalled();
     expect(textarea?.value).toBe('continue');
-    expect(document.querySelector('.input-error')?.textContent).toBe('socket closed');
+    expect(document.querySelector('.input-error')?.textContent).toBe('failed to send RPC request');
   });
 
   it('passes run options when queueing a message', async () => {

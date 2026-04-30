@@ -9,7 +9,7 @@ import type { CodexTurn } from '../../src/types/codex';
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
 type HookResult = ReturnType<typeof useThreadTimeline>;
-type RpcResult = { data: CodexTurn[]; nextCursor?: string | null; next_cursor?: string | null };
+type RpcResult = { data?: CodexTurn[]; turns?: CodexTurn[]; thread?: { turns?: CodexTurn[] }; nextCursor?: string | null; next_cursor?: string | null };
 type TimelineRpc = Parameters<typeof useThreadTimeline>[1];
 
 interface Deferred<T> {
@@ -157,6 +157,206 @@ describe('useThreadTimeline', () => {
     expect(texts).not.toContain('latest-0');
     expect(currentTimeline?.hasOlder).toBe(true);
     expect((currentTimeline as HookResult & { isViewingLatest?: boolean })?.isViewingLatest).toBe(false);
+  });
+
+  it('accepts turns response shape when loading history', async () => {
+    const first = deferred<RpcResult>();
+    const rpc = vi.fn(() => first.promise);
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      first.resolve({ turns: [makeTurn('newer'), makeTurn('older')], nextCursor: 'older-cursor' });
+      await first.promise;
+    });
+
+    expect(currentTimeline?.items.map(itemText)).toEqual(['older', 'newer']);
+    expect(currentTimeline?.hasOlder).toBe(true);
+  });
+
+  it('accepts nested thread turns response shape when loading history', async () => {
+    const first = deferred<RpcResult>();
+    const rpc = vi.fn(() => first.promise);
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      first.resolve({ thread: { turns: [makeTurn('newer'), makeTurn('older')] }, nextCursor: null });
+      await first.promise;
+    });
+
+    expect(currentTimeline?.items.map(itemText)).toEqual(['older', 'newer']);
+  });
+
+  it('reload merges newly fetched latest turns without dropping older loaded messages', async () => {
+    const latest = deferred<RpcResult>();
+    const older = deferred<RpcResult>();
+    const catchup = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(latest.promise).mockReturnValueOnce(older.promise).mockReturnValueOnce(catchup.promise);
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      latest.resolve({ data: [makeTurn('turn-3'), makeTurn('turn-2')], nextCursor: 'cursor-1' });
+      await latest.promise;
+    });
+    await act(async () => {
+      currentTimeline?.loadOlder();
+    });
+    await act(async () => {
+      older.resolve({ data: [makeTurn('turn-1')], nextCursor: null });
+      await older.promise;
+    });
+
+    expect(currentTimeline?.items.map(itemText)).toEqual(['turn-1', 'turn-2', 'turn-3']);
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      catchup.resolve({ data: [makeTurn('turn-4'), makeTurn('turn-3', 'turn-3 updated')], nextCursor: null });
+      await catchup.promise;
+    });
+
+    expect(currentTimeline?.items.map(itemText)).toEqual(['turn-1', 'turn-2', 'turn-3 updated', 'turn-4']);
+  });
+
+  it('reload merges sparse stale latest pages without deleting rendered newer turns', async () => {
+    const latest = deferred<RpcResult>();
+    const staleReload = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(latest.promise).mockReturnValueOnce(staleReload.promise);
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      latest.resolve({ data: [makeTurn('turn-3'), makeTurn('turn-2'), makeTurn('turn-1')], nextCursor: null });
+      await latest.promise;
+    });
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      staleReload.resolve({ data: [makeTurn('turn-2', 'turn-2 refreshed')], nextCursor: null });
+      await staleReload.promise;
+    });
+
+    expect(currentTimeline?.items.map(itemText)).toEqual(['turn-1', 'turn-2 refreshed', 'turn-3']);
+  });
+
+  it('reload after older pagination preserves the older-page cursor', async () => {
+    const latest = deferred<RpcResult>();
+    const older = deferred<RpcResult>();
+    const catchup = deferred<RpcResult>();
+    const nextOlder = deferred<RpcResult>();
+    const rpc = vi
+      .fn()
+      .mockReturnValueOnce(latest.promise)
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(catchup.promise)
+      .mockReturnValueOnce(nextOlder.promise);
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      latest.resolve({ data: [makeTurn('turn-4'), makeTurn('turn-3')], nextCursor: 'cursor-after-latest' });
+      await latest.promise;
+    });
+    await act(async () => {
+      currentTimeline?.loadOlder();
+    });
+    await act(async () => {
+      older.resolve({ data: [makeTurn('turn-2')], nextCursor: 'cursor-after-older' });
+      await older.promise;
+    });
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      catchup.resolve({ data: [makeTurn('turn-5'), makeTurn('turn-4')], nextCursor: 'stale-latest-cursor' });
+      await catchup.promise;
+    });
+    await act(async () => {
+      currentTimeline?.loadOlder();
+    });
+
+    expect(rpc).toHaveBeenLastCalledWith('thread/turns/list', {
+      threadId: 'thread-1',
+      limit: 50,
+      sortDirection: 'desc',
+      cursor: 'cursor-after-older',
+    });
+
+    await act(async () => {
+      nextOlder.resolve({ data: [makeTurn('turn-1')], nextCursor: null });
+      await nextOlder.promise;
+    });
+    expect(currentTimeline?.items.map(itemText)).toEqual(['turn-1', 'turn-2', 'turn-3', 'turn-4', 'turn-5']);
+  });
+
+  it('reload after exhausting older pagination does not restore a latest-page cursor', async () => {
+    const latest = deferred<RpcResult>();
+    const older = deferred<RpcResult>();
+    const catchup = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(latest.promise).mockReturnValueOnce(older.promise).mockReturnValueOnce(catchup.promise);
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      latest.resolve({ data: [makeTurn('turn-3')], nextCursor: 'cursor-after-latest' });
+      await latest.promise;
+    });
+    await act(async () => {
+      currentTimeline?.loadOlder();
+    });
+    await act(async () => {
+      older.resolve({ data: [makeTurn('turn-2')], nextCursor: null });
+      await older.promise;
+    });
+    expect(currentTimeline?.hasOlder).toBe(false);
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      catchup.resolve({ data: [makeTurn('turn-4'), makeTurn('turn-3')], nextCursor: 'stale-latest-cursor' });
+      await catchup.promise;
+    });
+    await act(async () => {
+      currentTimeline?.loadOlder();
+    });
+
+    expect(currentTimeline?.hasOlder).toBe(false);
+    expect(rpc).toHaveBeenCalledTimes(3);
+    expect(currentTimeline?.items.map(itemText)).toEqual(['turn-2', 'turn-3', 'turn-4']);
+  });
+
+  it('reload failure preserves existing messages and older cursor', async () => {
+    const latest = deferred<RpcResult>();
+    const failedReload = deferred<RpcResult>();
+    const older = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(latest.promise).mockReturnValueOnce(failedReload.promise).mockReturnValueOnce(older.promise);
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      latest.resolve({ data: [makeTurn('turn-2')], nextCursor: 'cursor-1' });
+      await latest.promise;
+    });
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      failedReload.reject(new Error('network lag'));
+      await failedReload.promise.catch(() => undefined);
+    });
+
+    expect(currentTimeline?.items.map(itemText)).toEqual(['turn-2']);
+    expect(currentTimeline?.hasOlder).toBe(true);
+
+    await act(async () => {
+      currentTimeline?.loadOlder();
+    });
+    await act(async () => {
+      older.resolve({ data: [makeTurn('turn-1')], nextCursor: null });
+      await older.promise;
+    });
+
+    expect(currentTimeline?.items.map(itemText)).toEqual(['turn-1', 'turn-2']);
   });
 
   it('jumpToLatest refetches latest items after loading an older page', async () => {

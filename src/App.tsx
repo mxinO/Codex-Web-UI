@@ -33,6 +33,7 @@ import {
   approvalItemsFromRequests,
   fileChangeHasInlineDiff,
   latestCompletionNotificationCount,
+  isSyntheticPendingTurnId,
   liveTurnItemsFromNotifications,
   mergeTimelineItemsByTimestamp,
   nextLiveNotificationWindow,
@@ -173,11 +174,24 @@ export default function App() {
   const bangCounterRef = useRef(0);
   const pendingUserCounterRef = useRef(0);
   const ephemeralCounterRef = useRef(0);
+  const localSortCounterRef = useRef(0);
+  const notificationCountRef = useRef(socket.notificationCount);
+  const localSortOrdersRef = useRef(new Map<string, number>());
   const [pendingTurnWindow, setPendingTurnWindow] = useState<{ id: string; threadId: string | null; startCount: number } | null>(null);
   const activeFileSummaryScopeRef = useRef({ threadId: activeThreadId, threadPath: activeThreadPath, turnId: state?.activeTurnId ?? null });
   const liveNotificationWindowRef = useRef({ activeThreadId, activeTurnId: state?.activeTurnId ?? null, startCount: socket.notificationCount });
   const lastHandledCompletionCountRef = useRef<number | null>(null);
   const pendingTurnStartCount = pendingTurnWindow?.threadId === activeThreadId ? pendingTurnWindow.startCount : null;
+  notificationCountRef.current = socket.notificationCount;
+  const localSortOrder = useCallback((key?: string) => {
+    if (key) {
+      const existing = localSortOrdersRef.current.get(key);
+      if (existing !== undefined) return existing;
+    }
+    const next = notificationCountRef.current + 0.5 + (localSortCounterRef.current += 1) / 1_000_000;
+    if (key) localSortOrdersRef.current.set(key, next);
+    return next;
+  }, []);
   liveNotificationWindowRef.current = nextLiveNotificationWindow(
     liveNotificationWindowRef.current,
     { activeThreadId, activeTurnId: state?.activeTurnId ?? null },
@@ -235,16 +249,24 @@ export default function App() {
     () => visibleLiveTurnItemsForTimeline(timelineItemsForChat, liveTurnItems),
     [liveTurnItems, timelineItemsForChat],
   );
-  const approvalItems = useMemo(() => approvalItemsFromRequests(socket.requests, answeredApprovals), [answeredApprovals, socket.requests]);
   const queuedTimelineItems = useMemo<TimelineItem[]>(
     () =>
       queuedMessages.map((message) => ({
         id: `queued:${message.id}`,
         kind: 'queued',
         timestamp: message.createdAt,
+        sortOrder: localSortOrder(`queued:${message.id}`),
         message,
       })),
-    [queuedMessages],
+    [localSortOrder, queuedMessages],
+  );
+  const approvalItems = useMemo(
+    () =>
+      approvalItemsFromRequests(socket.requests, answeredApprovals).map((item) => ({
+        ...item,
+        sortOrder: localSortOrder(item.id),
+      })),
+    [answeredApprovals, localSortOrder, socket.requests],
   );
   const chatItems = useMemo<TimelineItem[]>(() => {
     if (!timeline.isViewingLatest) return timeline.items;
@@ -277,7 +299,7 @@ export default function App() {
   }, [activeThreadId]);
 
   useEffect(() => {
-    if (pendingTurnWindow && state?.activeTurnId) setPendingTurnWindow(null);
+    if (pendingTurnWindow && state?.activeTurnId && !isSyntheticPendingTurnId(state.activeTurnId)) setPendingTurnWindow(null);
   }, [pendingTurnWindow, state?.activeTurnId]);
 
   useEffect(() => {
@@ -359,17 +381,17 @@ export default function App() {
       const detail = getBangCommandOutputDetail(event);
       if (!detail) return;
 
-      const now = Date.now();
-      const counter = (bangCounterRef.current += 1);
-      const item = bangOutputEventToTimelineItem(detail, activeThreadId, now, counter);
-      if (!item) return;
+    const now = Date.now();
+    const counter = (bangCounterRef.current += 1);
+    const item = bangOutputEventToTimelineItem(detail, activeThreadId, now, counter);
+    if (!item) return;
 
-      setEphemeralItems((items) => appendEphemeralBangItem(items, item));
+      setEphemeralItems((items) => appendEphemeralBangItem(items, { ...item, sortOrder: localSortOrder(`bang:${item.id}`) }));
     };
 
     window.addEventListener('webui-bang-output', handleBangOutput);
     return () => window.removeEventListener('webui-bang-output', handleBangOutput);
-  }, [activeThreadId]);
+  }, [activeThreadId, localSortOrder]);
 
   const setModel = useCallback((value: string | null) => {
     setModelState(value);
@@ -415,12 +437,12 @@ export default function App() {
     const id = `pending:user:${now}:${(pendingUserCounterRef.current += 1)}`;
     const pendingWindow = { id, threadId: activeThreadId, startCount: socket.notificationCount };
     setPendingTurnWindow(pendingWindow);
-    setPendingUserItems((items) => [...items, { id, kind: 'user', timestamp: now, text }]);
+    setPendingUserItems((items) => [...items, { id, kind: 'user', timestamp: now, sortOrder: localSortOrder(id), text }]);
     return () => {
       setPendingUserItems((items) => items.filter((item) => item.id !== id));
       setPendingTurnWindow((current) => (current?.id === pendingWindow.id ? null : current));
     };
-  }, [activeThreadId, socket.notificationCount]);
+  }, [activeThreadId, localSortOrder, socket.notificationCount]);
 
   const addDirectSubmitError = useCallback((_: string, error: string) => {
     const id = `direct-submit-error:${Date.now()}:${(ephemeralCounterRef.current += 1)}`;

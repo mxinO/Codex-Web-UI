@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { withTimelineNotificationMeta } from '../lib/timeline';
 import type { CodexRunOptions } from '../types/ui';
 
 export type ConnectionState = 'connecting' | 'connected' | 'disconnected' | 'auth-error';
@@ -15,6 +16,7 @@ interface ServerHello {
   type: 'server/hello';
   hostname: string;
   startCwd: string | null;
+  notificationStreamId?: string | null;
   appServerHealth?: AppServerHealth;
   state: {
     activeThreadId: string | null;
@@ -31,7 +33,7 @@ type ServerMessage =
   | ServerHello
   | { type: 'rpc/result'; id: number; result: unknown }
   | { type: 'rpc/error'; id: number; error: string }
-  | { type: 'codex/notification'; message: unknown }
+  | { type: 'codex/notification'; streamId?: string; seq?: number; message: unknown }
   | { type: 'codex/request'; message: unknown }
   | { type: 'codex/requestResolved'; requestId: number | string }
   | { type: 'auth/error' };
@@ -79,6 +81,39 @@ function requestIdOf(request: unknown): string | null {
   return typeof id === 'string' || typeof id === 'number' ? requestKey(id) : null;
 }
 
+interface StoredNotificationReplayState {
+  streamId: string | null;
+  seq: number | null;
+}
+
+function notificationSeqStorageKey(): string {
+  return `codex-web-ui:notificationReplay:${window.location.host}`;
+}
+
+function readStoredNotificationReplayState(): StoredNotificationReplayState {
+  try {
+    const value = window.localStorage.getItem(notificationSeqStorageKey());
+    if (!value) return { streamId: null, seq: null };
+    const parsed = JSON.parse(value) as unknown;
+    if (typeof parsed === 'number' && Number.isFinite(parsed) && parsed >= 0) return { streamId: null, seq: parsed };
+    if (typeof parsed !== 'object' || parsed === null) return { streamId: null, seq: null };
+    const record = parsed as Record<string, unknown>;
+    const streamId = typeof record.streamId === 'string' && record.streamId.trim() ? record.streamId : null;
+    const seq = typeof record.seq === 'number' && Number.isFinite(record.seq) && record.seq >= 0 ? record.seq : null;
+    return { streamId, seq };
+  } catch {
+    return { streamId: null, seq: null };
+  }
+}
+
+function writeStoredNotificationReplayState(value: StoredNotificationReplayState): void {
+  try {
+    window.localStorage.setItem(notificationSeqStorageKey(), JSON.stringify(value));
+  } catch {
+    // Reconnect replay still works in-memory when storage is unavailable.
+  }
+}
+
 export function useCodexSocket() {
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
   const [hello, setHello] = useState<ServerHello | null>(null);
@@ -95,6 +130,9 @@ export function useCodexSocket() {
   const connectionStateRef = useRef<ConnectionState>('connecting');
   const reconnectTimerRef = useRef<number | null>(null);
   const hasConnectedRef = useRef(false);
+  const storedReplayStateRef = useRef<StoredNotificationReplayState>(readStoredNotificationReplayState());
+  const seenServerNotificationSeqsRef = useRef<Set<string>>(new Set());
+  const nextNotificationOrderRef = useRef(0);
 
   const setTrackedConnectionState = useCallback((state: ConnectionState) => {
     connectionStateRef.current = state;
@@ -127,13 +165,48 @@ export function useCodexSocket() {
   }, []);
 
   const queueNotification = useCallback(
-    (message: unknown) => {
-      notificationBufferRef.current.push(message);
+    (message: unknown, source: { streamId?: string | null; seq?: number | null } = {}) => {
+      const order = (nextNotificationOrderRef.current += 1);
+      const notification = withTimelineNotificationMeta(message, {
+        order,
+        receivedAt: Date.now(),
+        streamId: source.streamId ?? null,
+        seq: source.seq ?? null,
+      });
+      notificationBufferRef.current.push(notification);
       if (notificationFlushTimerRef.current !== null) return;
       notificationFlushTimerRef.current = window.setTimeout(flushNotifications, NOTIFICATION_FLUSH_DELAY_MS);
     },
     [flushNotifications],
   );
+
+  const rememberNotificationStream = useCallback((streamId: string | null | undefined) => {
+    if (typeof streamId !== 'string' || !streamId.trim()) return;
+    const current = storedReplayStateRef.current;
+    if (current.streamId === streamId) return;
+    storedReplayStateRef.current = { streamId, seq: null };
+    writeStoredNotificationReplayState(storedReplayStateRef.current);
+  }, []);
+
+  const rememberNotificationSeq = useCallback((streamId: string | null | undefined, seq: number | undefined): boolean => {
+    if (typeof seq !== 'number' || !Number.isFinite(seq) || seq < 0) return true;
+    const normalizedStreamId = typeof streamId === 'string' && streamId.trim() ? streamId : storedReplayStateRef.current.streamId;
+    const key = `${normalizedStreamId ?? ''}\0${seq}`;
+    const seen = seenServerNotificationSeqsRef.current;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    while (seen.size > MAX_RETAINED_NOTIFICATIONS) {
+      const oldest = seen.values().next().value;
+      if (typeof oldest !== 'string') break;
+      seen.delete(oldest);
+    }
+    const current = storedReplayStateRef.current;
+    if (normalizedStreamId !== current.streamId || current.seq === null || seq > current.seq) {
+      storedReplayStateRef.current = { streamId: normalizedStreamId ?? null, seq };
+      writeStoredNotificationReplayState(storedReplayStateRef.current);
+    }
+    return true;
+  }, []);
 
   const submitToken = useCallback(
     async (token: string) => {
@@ -202,13 +275,21 @@ export function useCodexSocket() {
         if (stopped) return;
         retry = 250;
         if (hasConnectedRef.current) {
-          clearNotificationBuffer();
-          setNotifications([]);
+          flushNotifications();
           setReconnectEpoch((value) => value + 1);
         }
         hasConnectedRef.current = true;
         setTrackedConnectionState('connected');
-        ws.send(JSON.stringify({ type: 'client/hello' }));
+        const replayState = storedReplayStateRef.current;
+        ws.send(
+          JSON.stringify({
+            type: 'client/hello',
+            params: {
+              lastNotificationStreamId: replayState.streamId,
+              lastNotificationSeq: replayState.seq,
+            },
+          }),
+        );
       };
 
       ws.onmessage = (event) => {
@@ -217,6 +298,7 @@ export function useCodexSocket() {
         if (!message) return;
 
         if (message.type === 'server/hello') {
+          rememberNotificationStream(message.notificationStreamId);
           setHello(message);
           setRequests(message.requests ?? []);
         } else if (message.type === 'auth/error') {
@@ -224,7 +306,8 @@ export function useCodexSocket() {
           rejectPending(new Error('authentication failed'));
           ws.close();
         } else if (message.type === 'codex/notification') {
-          queueNotification(message.message);
+          if (!rememberNotificationSeq(message.streamId, message.seq)) return;
+          queueNotification(message.message, { streamId: message.streamId ?? null, seq: message.seq ?? null });
         } else if (message.type === 'codex/request') {
           setRequests((items) => [...items.slice(-49), message.message]);
         } else if (message.type === 'codex/requestResolved') {
@@ -243,7 +326,7 @@ export function useCodexSocket() {
         if (wsRef.current === ws) {
           wsRef.current = null;
         }
-        clearNotificationBuffer();
+        flushNotifications();
         rejectPending(new Error('socket closed'));
         if (stopped || connectionStateRef.current === 'auth-error') return;
         setTrackedConnectionState('disconnected');
@@ -265,7 +348,7 @@ export function useCodexSocket() {
       wsRef.current?.close();
       wsRef.current = null;
     };
-  }, [authRetryEpoch, clearNotificationBuffer, queueNotification, rejectPending, setTrackedConnectionState]);
+  }, [authRetryEpoch, clearNotificationBuffer, flushNotifications, queueNotification, rejectPending, rememberNotificationSeq, rememberNotificationStream, setTrackedConnectionState]);
 
   const rpc = useCallback(<T,>(method: string, params?: unknown, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) => {
     const ws = wsRef.current;
