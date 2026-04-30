@@ -40,6 +40,14 @@ You can also install directly from GitHub:
 npm install -g https://github.com/mxinO/Codex-Web-UI/archive/refs/heads/main.tar.gz
 ```
 
+To update an installed command:
+
+```bash
+codex-web-ui --update
+```
+
+That reruns the global install from the GitHub `main` tarball and exits without starting or restarting a server. To update from another package spec or tarball, use `codex-web-ui --update --source <tarball-url-or-package-spec>`.
+
 The installed command serves the committed UI bundle from the package install directory, while new Codex sessions default to the directory where `codex-web-ui` is launched. Runtime state defaults to `${XDG_STATE_HOME:-~/.local/state}/codex-web-ui`; override it with `--state-dir <path>` or `CODEX_WEB_UI_STATE_DIR`.
 When changing frontend code, run `npm run build` before committing so the installable bundle stays current.
 

@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { runUpdate } from './update.mjs';
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
@@ -28,10 +29,12 @@ function printHelp() {
 
 Usage:
   codex-web-ui [--host <host>] [--port <port>] [--state-dir <path>] [--no-auth] [--mock]
+  codex-web-ui --update [--source <tarball-url-or-package-spec>]
 
 Examples:
   codex-web-ui --host 127.0.0.1 --port 3001
   codex-web-ui --host 0.0.0.0 --port 3002
+  codex-web-ui --update
 
 The command can be run from any project directory. New Codex sessions default to
 the directory where this command is started.
@@ -46,6 +49,11 @@ if (args.includes('--help') || args.includes('-h')) {
 if (args.includes('--version') || args.includes('-v')) {
   process.stdout.write(`${readPackageVersion()}\n`);
   process.exit(0);
+}
+
+if (args.includes('--update')) {
+  const code = await runUpdate(args, { currentVersion: readPackageVersion() });
+  process.exit(code);
 }
 
 const tsxBin = path.join(packageRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'tsx.cmd' : 'tsx');
