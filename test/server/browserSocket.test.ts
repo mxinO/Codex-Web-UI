@@ -1971,6 +1971,36 @@ describe('attachBrowserSocket fs RPC wrappers', () => {
     });
   });
 
+  it('includes symlinked directories when browsing new session cwd choices', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws } = await makeHarness(request);
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-browse-symlink-'));
+    const target = join(workspace, 'target');
+    mkdirSync(target);
+    symlinkSync(target, join(workspace, 'linked-target'), 'dir');
+    writeFileSync(join(workspace, 'linked-file-target'), 'file');
+    symlinkSync(join(workspace, 'linked-file-target'), join(workspace, 'linked-file'), 'file');
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 31, method: 'webui/fs/browseDirectory', params: { path: workspace } }));
+    const response = await nextMessage(ws);
+
+    expect(request).not.toHaveBeenCalled();
+    expect(response).toEqual({
+      type: 'rpc/result',
+      id: 31,
+      result: {
+        path: workspace,
+        parent: tmpdir(),
+        truncated: false,
+        entries: [
+          { name: 'linked-target', path: join(workspace, 'linked-target'), isDirectory: true },
+          { name: 'target', path: target, isDirectory: true },
+        ],
+      },
+    });
+  });
+
   it('caps browsed directory entries for large folders', async () => {
     const request = vi.fn<CodexAppServer['request']>();
     const { ws } = await makeHarness(request);

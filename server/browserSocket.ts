@@ -366,12 +366,13 @@ async function browseDirectory(deps: BrowserSocketDeps, requestedPath: string) {
   const directory = await fs.opendir(resolvedPath);
   let truncated = false;
   for await (const entry of directory) {
-    if (!entry.isDirectory()) continue;
+    const entryPath = nodePath.join(resolvedPath, entry.name);
+    if (!(await isBrowsableDirectoryEntry(entry, entryPath))) continue;
     if (entries.length >= BROWSE_DIRECTORY_LIMIT) {
       truncated = true;
       break;
     }
-    entries.push({ name: entry.name, path: nodePath.join(resolvedPath, entry.name), isDirectory: true });
+    entries.push({ name: entry.name, path: entryPath, isDirectory: true });
   }
   return {
     path: resolvedPath,
@@ -379,6 +380,17 @@ async function browseDirectory(deps: BrowserSocketDeps, requestedPath: string) {
     truncated,
     entries: entries.sort((a, b) => a.name.localeCompare(b.name)),
   };
+}
+
+async function isBrowsableDirectoryEntry(entry: fsSync.Dirent, entryPath: string): Promise<boolean> {
+  if (entry.isDirectory()) return true;
+  if (!entry.isSymbolicLink()) return false;
+
+  try {
+    return (await fs.stat(entryPath)).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function turnListParams(params: unknown): { threadId: string; cursor: unknown; limit: number; sortDirection: string } | string {
