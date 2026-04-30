@@ -71,6 +71,10 @@ function getInsertText(event: Event): string | null {
   return typeof value === 'string' && value.trim() ? value.trim() : null;
 }
 
+function shouldRollbackDirectSubmitFailure(message: string): boolean {
+  return /not connected|socket closed|authentication failed|failed to send rpc request|json-rpc socket is closed/i.test(message);
+}
+
 export default function InputBox({
   rpc,
   threadId,
@@ -231,10 +235,15 @@ export default function InputBox({
       try {
         await rpc('webui/turn/start', { threadId, text, options: runOptions });
       } catch (caught) {
-        if (typeof rollbackOptimistic === 'function') rollbackOptimistic();
-        onDirectSubmitError?.(text, caught instanceof Error ? caught.message : String(caught));
-        setDraft(previousDraft);
-        throw caught;
+        const message = caught instanceof Error ? caught.message : String(caught);
+        if (shouldRollbackDirectSubmitFailure(message)) {
+          if (typeof rollbackOptimistic === 'function') rollbackOptimistic();
+          setDraft(previousDraft);
+          throw caught;
+        }
+        onDirectSubmitError?.(text, message);
+        setError(message);
+        return;
       }
       setDraft('');
     } catch (caught) {

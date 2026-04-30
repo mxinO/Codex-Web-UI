@@ -423,10 +423,12 @@ export default function App() {
         id,
         kind: 'error',
         timestamp: Date.now(),
-        text: `Message was not sent: ${error}`,
+        text: `Turn failed: ${error}`,
       },
     ]);
-  }, []);
+    void timeline.reload();
+    window.setTimeout(() => void timeline.reload(), 1000);
+  }, [timeline.reload]);
 
   const openDetailItem = useCallback((item: TimelineItem) => {
     if (item.kind !== 'fileChange') {

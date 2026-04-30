@@ -218,7 +218,7 @@ describe('InputBox', () => {
     });
   });
 
-  it('reports direct send failures after rolling back the optimistic row', async () => {
+  it('reports Codex-side turn failures without rolling back the sent message', async () => {
     const rpc = vi.fn((method: string) => {
       if (method === 'webui/turn/start') return Promise.reject(new Error('Codex ran out of room in the model context'));
       return Promise.reject(new Error(`unexpected method ${method}`));
@@ -240,10 +240,38 @@ describe('InputBox', () => {
     });
 
     expect(onDirectSubmit).toHaveBeenCalledWith('continue');
-    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(rollback).not.toHaveBeenCalled();
     expect(onDirectSubmitError).toHaveBeenCalledWith('continue', 'Codex ran out of room in the model context');
-    expect(textarea?.value).toBe('continue');
+    expect(textarea?.value).toBe('');
     expect(document.querySelector('.input-error')?.textContent).toBe('Codex ran out of room in the model context');
+  });
+
+  it('rolls back direct sends for transport failures before Codex accepts them', async () => {
+    const rpc = vi.fn((method: string) => {
+      if (method === 'webui/turn/start') return Promise.reject(new Error('socket closed'));
+      return Promise.reject(new Error(`unexpected method ${method}`));
+    });
+    const rollback = vi.fn();
+    const onDirectSubmit = vi.fn(() => rollback);
+    const onDirectSubmitError = vi.fn();
+    renderInputBox({ rpc: asRpc(rpc), draftOverride: 'continue', onDirectSubmit, onDirectSubmitError });
+    const textarea = document.querySelector<HTMLTextAreaElement>('textarea');
+    const submit = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Send');
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    await act(async () => {
+      submit?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(onDirectSubmit).toHaveBeenCalledWith('continue');
+    expect(rollback).toHaveBeenCalledTimes(1);
+    expect(onDirectSubmitError).not.toHaveBeenCalled();
+    expect(textarea?.value).toBe('continue');
+    expect(document.querySelector('.input-error')?.textContent).toBe('socket closed');
   });
 
   it('passes run options when queueing a message', async () => {
