@@ -14,6 +14,7 @@ interface ChatItemProps {
   onQueuedEdit?: (message: Extract<TimelineItem, { kind: 'queued' }>['message']) => void;
   onQueuedRemove?: (id: string) => void;
   onOpenFileSummary?: (turnId: string, path: string, changeCount: number) => void;
+  onOpenMentionedFile?: (path: string) => void;
 }
 
 function itemString(value: unknown, key: string, fallback: string): string {
@@ -43,7 +44,15 @@ function toolLabel(item: TimelineItem): string {
   return `Tool: ${type}`;
 }
 
-export default function ChatItem({ item, onOpenDetail, onApprovalDecision, onQueuedEdit, onQueuedRemove, onOpenFileSummary }: ChatItemProps) {
+export default function ChatItem({
+  item,
+  onOpenDetail,
+  onApprovalDecision,
+  onQueuedEdit,
+  onQueuedRemove,
+  onOpenFileSummary,
+  onOpenMentionedFile,
+}: ChatItemProps) {
   if (item.kind === 'user') {
     return (
       <div className="chat-row chat-row--user">
@@ -57,7 +66,7 @@ export default function ChatItem({ item, onOpenDetail, onApprovalDecision, onQue
       <div className="chat-row chat-row--assistant">
         <div className="chat-bubble chat-bubble--assistant">
           <Suspense fallback={<div className="detail-loading">Loading markdown...</div>}>
-            <MarkdownView content={item.text} />
+            <MarkdownView content={item.text} onOpenFile={onOpenMentionedFile} />
           </Suspense>
         </div>
       </div>
@@ -67,7 +76,7 @@ export default function ChatItem({ item, onOpenDetail, onApprovalDecision, onQue
   if (item.kind === 'streaming') {
     return (
       <div className="chat-row chat-row--assistant">
-        <StreamingCard text={item.text} active={item.active} />
+        <StreamingCard text={item.text} active={item.active} onOpenMentionedFile={onOpenMentionedFile} />
       </div>
     );
   }

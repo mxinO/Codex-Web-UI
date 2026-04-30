@@ -15,6 +15,7 @@ interface ChatTimelineProps {
   onQueuedEdit?: (message: Extract<TimelineItem, { kind: 'queued' }>['message']) => void;
   onQueuedRemove?: (id: string) => void;
   onOpenFileSummary?: (turnId: string, path: string, changeCount: number) => void;
+  onOpenMentionedFile?: (path: string) => void;
 }
 
 const BOTTOM_STICKY_THRESHOLD_PX = 80;
@@ -66,6 +67,7 @@ export default function ChatTimeline({
   onQueuedEdit,
   onQueuedRemove,
   onOpenFileSummary,
+  onOpenMentionedFile,
 }: ChatTimelineProps) {
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const columnRef = useRef<HTMLDivElement | null>(null);
@@ -137,6 +139,7 @@ export default function ChatTimeline({
               onQueuedEdit={onQueuedEdit}
               onQueuedRemove={onQueuedRemove}
               onOpenFileSummary={onOpenFileSummary}
+              onOpenMentionedFile={onOpenMentionedFile}
             />
           ),
         )}

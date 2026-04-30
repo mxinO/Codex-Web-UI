@@ -7,6 +7,7 @@ import { CodexAppServer } from './appServer.js';
 import { createAuthToken, authCookie, hashToken, isTokenValid, parseTokenFromCookie } from './auth.js';
 import { attachBrowserSocket } from './browserSocket.js';
 import { readConfig } from './config.js';
+import { createFilePreviewHandler } from './filePreview.js';
 import { resolveExistingPathInsideRoot, resolveWritablePathInsideRoot } from './fileTransfer.js';
 import { HostStateStore } from './hostState.js';
 import { logError, logInfo } from './logger.js';
@@ -45,6 +46,8 @@ function getQueryPath(req: express.Request): string | null {
 function getActiveCwd(): string | null {
   return stateStore.read().activeCwd;
 }
+
+app.get('/api/file', createFilePreviewHandler({ authorized, getActiveCwd }));
 
 app.get('/api/download', async (req, res) => {
   if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });

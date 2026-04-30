@@ -1499,6 +1499,94 @@ button.activity-card:focus-visible {
   color: var(--text-secondary);
 }
 
+.image-viewer {
+  width: min(1120px, 94vw);
+  height: min(820px, 88vh);
+  min-height: 340px;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-soft);
+  overflow: hidden;
+}
+
+.image-viewer__header {
+  text-transform: none;
+}
+
+.image-viewer__title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  font-family: Consolas, 'SFMono-Regular', 'Liberation Mono', monospace;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.image-viewer__actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+}
+
+.image-viewer__download,
+.image-viewer__close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 28px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.image-viewer__download:hover,
+.image-viewer__close:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+}
+
+.image-viewer__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  padding: 14px;
+  background:
+    linear-gradient(45deg, color-mix(in srgb, var(--border) 35%, transparent) 25%, transparent 25%),
+    linear-gradient(-45deg, color-mix(in srgb, var(--border) 35%, transparent) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, color-mix(in srgb, var(--border) 35%, transparent) 75%),
+    linear-gradient(-45deg, transparent 75%, color-mix(in srgb, var(--border) 35%, transparent) 75%),
+    var(--surface-sunken);
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+  background-size: 16px 16px;
+  overflow: auto;
+}
+
+.image-viewer__image {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  box-shadow: 0 1px 16px rgb(0 0 0 / 22%);
+}
+
+.image-viewer__error {
+  max-width: min(420px, 100%);
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--red) 45%, var(--border));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--red) 8%, var(--surface-raised));
+  color: var(--red);
+  font-size: 13px;
+}
+
 .modal-overlay {
   position: fixed;
   inset: 0;
@@ -1719,6 +1807,24 @@ button.activity-card:focus-visible {
   color: var(--text-accent);
   text-decoration-color: color-mix(in srgb, var(--text-accent) 45%, transparent);
   text-underline-offset: 2px;
+}
+
+.markdown-file-link {
+  display: inline;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--text-accent);
+  font: inherit;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--text-accent) 45%, transparent);
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.markdown-file-link:hover {
+  text-decoration-color: currentColor;
 }
 
 .markdown-body blockquote {

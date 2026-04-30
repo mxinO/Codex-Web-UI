@@ -7,6 +7,7 @@ import FileChangeTray, { type ActiveFileSummary } from './components/FileChangeT
 import FileEditorModal from './components/FileEditorModal';
 import FileExplorer from './components/FileExplorer';
 import Header from './components/Header';
+import ImageViewerModal from './components/ImageViewerModal';
 import InputBox from './components/InputBox';
 import SessionPicker from './components/SessionPicker';
 import { useCodexSocket } from './hooks/useCodexSocket';
@@ -14,6 +15,7 @@ import { useQueue, type ClientQueuedMessage } from './hooks/useQueue';
 import { useThreadTimeline } from './hooks/useThreadTimeline';
 import { useTheme } from './hooks/useTheme';
 import { appendEphemeralBangItem, bangOutputEventToTimelineItem, getBangCommandOutputDetail } from './lib/bangCommands';
+import { isImagePath, normalizeMentionedFilePath } from './lib/filePreview';
 import {
   COLLABORATION_MODES,
   REASONING_EFFORTS,
@@ -48,6 +50,10 @@ interface OpenEditor {
   readOnly: boolean;
   content: string;
   modifiedAtMs: number | null;
+}
+
+interface OpenImage {
+  path: string;
 }
 
 type UserTimelineItem = Extract<TimelineItem, { kind: 'user' }>;
@@ -153,6 +159,7 @@ export default function App() {
   const [detailItem, setDetailItem] = useState<TimelineItem | null>(null);
   const [composerDraft, setComposerDraft] = useState<string | null>(null);
   const [editor, setEditor] = useState<OpenEditor | null>(null);
+  const [imageViewer, setImageViewer] = useState<OpenImage | null>(null);
   const [activeFileSummary, setActiveFileSummary] = useState<ActiveFileSummary | null>(null);
   const [ephemeralItems, setEphemeralItems] = useState<TimelineItem[]>([]);
   const [pendingUserItems, setPendingUserItems] = useState<UserTimelineItem[]>([]);
@@ -557,11 +564,19 @@ export default function App() {
 
   const openFile = async (path: string, readOnly: boolean) => {
     setSessionError(null);
+    const normalizedPath = normalizeMentionedFilePath(path);
+    if (isImagePath(normalizedPath)) {
+      setEditor(null);
+      setImageViewer({ path: normalizedPath });
+      return;
+    }
+
     try {
-      const contentResult = await socket.rpc<unknown>('webui/fs/readFile', { path });
-      const metadataResult = await socket.rpc<unknown>('webui/fs/getMetadata', { path });
+      setImageViewer(null);
+      const contentResult = await socket.rpc<unknown>('webui/fs/readFile', { path: normalizedPath });
+      const metadataResult = await socket.rpc<unknown>('webui/fs/getMetadata', { path: normalizedPath });
       setEditor({
-        path,
+        path: normalizedPath,
         readOnly,
         content: decodeUtf8Base64(extractBase64(contentResult)),
         modifiedAtMs: extractModifiedAtMs(metadataResult),
@@ -653,6 +668,7 @@ export default function App() {
                   onQueuedEdit={(message) => void editQueued(message as ClientQueuedMessage)}
                   onQueuedRemove={(id) => void removeQueued(id)}
                   onOpenFileSummary={openFileSummaryDiff}
+                  onOpenMentionedFile={(path) => void openFile(path, true)}
                 />
               ) : (
                 <div className="empty-state">No active session loaded.</div>
@@ -681,6 +697,13 @@ export default function App() {
           readOnly={editor.readOnly}
           onClose={() => setEditor(null)}
           onSave={(content) => saveFile(editor.path, content)}
+        />
+      )}
+      {imageViewer && (
+        <ImageViewerModal
+          path={imageViewer.path}
+          onClose={() => setImageViewer(null)}
+          onPreviewError={(message) => setSessionError(`${message} ${imageViewer.path}`)}
         />
       )}
       {cwdPickerOpen && (

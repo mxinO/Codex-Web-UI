@@ -58,6 +58,68 @@ describe('ChatItem details', () => {
     expect(document.querySelector('.markdown-body li')?.textContent).toBe('item');
   });
 
+  it('opens assistant file mentions without linking code spans or existing markdown links', async () => {
+    const onOpenMentionedFile = vi.fn();
+    const item: TimelineItem = {
+      id: 'a1',
+      kind: 'assistant',
+      timestamp: 1,
+      text: 'Open src/App.tsx:42, keep `src/ignored.ts`, and see [guide](docs/guide.md).',
+      phase: null,
+    };
+
+    render(
+      <ChatItem
+        item={item}
+        onOpenDetail={vi.fn()}
+        onApprovalDecision={onApprovalDecision}
+        onOpenMentionedFile={onOpenMentionedFile}
+      />,
+    );
+
+    await act(async () => {
+      await import('../../src/components/MarkdownView');
+    });
+    await flushLazy();
+
+    const fileLinks = Array.from(document.querySelectorAll<HTMLButtonElement>('.markdown-file-link'));
+    expect(fileLinks).toHaveLength(1);
+    expect(fileLinks[0].textContent).toBe('src/App.tsx:42');
+    expect(document.querySelector('code')?.textContent).toBe('src/ignored.ts');
+    expect(document.querySelector<HTMLAnchorElement>('a[href="docs/guide.md"]')?.textContent).toBe('guide');
+
+    act(() => {
+      fileLinks[0].click();
+    });
+
+    expect(onOpenMentionedFile).toHaveBeenCalledWith('src/App.tsx');
+  });
+
+  it('opens streaming file mentions through the same viewer callback', async () => {
+    const onOpenMentionedFile = vi.fn();
+    const item: TimelineItem = { id: 's1', kind: 'streaming', timestamp: 1, text: 'Review plots/output.png before replying.', active: true };
+
+    render(
+      <ChatItem
+        item={item}
+        onOpenDetail={vi.fn()}
+        onApprovalDecision={onApprovalDecision}
+        onOpenMentionedFile={onOpenMentionedFile}
+      />,
+    );
+
+    await act(async () => {
+      await import('../../src/components/MarkdownView');
+    });
+    await flushLazy();
+
+    act(() => {
+      document.querySelector<HTMLButtonElement>('.markdown-file-link')?.click();
+    });
+
+    expect(onOpenMentionedFile).toHaveBeenCalledWith('plots/output.png');
+  });
+
   it('opens command cards through the detail callback', () => {
     const onOpenDetail = vi.fn();
     const item: TimelineItem = {
