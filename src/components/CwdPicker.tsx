@@ -1,4 +1,4 @@
-import { ArrowUp, Folder, RefreshCw } from 'lucide-react';
+import { ArrowUp, Folder, FolderPlus, RefreshCw } from 'lucide-react';
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 
 type Rpc = <T>(method: string, params?: unknown, timeoutMs?: number) => Promise<T>;
@@ -54,6 +54,11 @@ function stripTrailingSlashes(filePath: string): string {
   return stripped || '/';
 }
 
+function joinPath(parent: string, child: string): string {
+  const trimmedParent = stripTrailingSlashes(parent);
+  return `${trimmedParent}/${child}`.replace(/\/+/g, '/');
+}
+
 function typedBrowseRequest(filePath: string): TypedBrowseRequest | null {
   const trimmed = filePath.trim();
   if (!trimmed) return null;
@@ -100,9 +105,14 @@ export default function CwdPicker({ initialCwd, rpc, busy = false, onCancel, onC
   const [browseLoading, setBrowseLoading] = useState(false);
   const [browseError, setBrowseError] = useState<string | null>(null);
   const [browseTruncated, setBrowseTruncated] = useState(false);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createName, setCreateName] = useState('');
+  const [createBusy, setCreateBusy] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
   const titleId = useId();
   const browseSeqRef = useRef(0);
   const skipBrowsePathEffectForRef = useRef<string | null>(null);
+  const createInputRef = useRef<HTMLInputElement | null>(null);
   const trimmedCwd = cwd.trim();
 
   const loadDirectory = useCallback(
@@ -156,8 +166,15 @@ export default function CwdPicker({ initialCwd, rpc, busy = false, onCancel, onC
     return () => window.clearTimeout(timer);
   }, [loadDirectory, rpc, typedCwd]);
 
+  useEffect(() => {
+    if (createOpen) createInputRef.current?.focus();
+  }, [createOpen]);
+
   const chooseFolder = (path: string) => {
     setTypedCwd(null);
+    setCreateOpen(false);
+    setCreateError(null);
+    setCreateName('');
     setCwd(path);
     setBrowsePath(path);
   };
@@ -165,6 +182,7 @@ export default function CwdPicker({ initialCwd, rpc, busy = false, onCancel, onC
   const browseTypedPath = () => {
     if (trimmedCwd) {
       setTypedCwd(null);
+      setCreateError(null);
       setBrowsePath(trimmedCwd);
     }
   };
@@ -172,6 +190,41 @@ export default function CwdPicker({ initialCwd, rpc, busy = false, onCancel, onC
   const handleInputChange = (value: string) => {
     setCwd(value);
     setTypedCwd(value);
+  };
+
+  const openCreateFolder = () => {
+    setCreateOpen(true);
+    setCreateError(null);
+    setCreateName('');
+  };
+
+  const createFolder = async () => {
+    if (!rpc || createBusy) return;
+    const name = createName.trim();
+    if (!name) {
+      setCreateError('Folder name is required');
+      return;
+    }
+    if (name.includes('/') || name.includes('\0')) {
+      setCreateError('Folder name cannot contain slashes');
+      return;
+    }
+
+    const parentDir = trimmedCwd || browsePath.trim() || '/';
+    const path = joinPath(parentDir, name);
+    setCreateBusy(true);
+    setCreateError(null);
+    try {
+      const result = await rpc<{ path?: unknown }>('webui/fs/createBrowseDirectory', { path });
+      const createdPath = typeof result.path === 'string' && result.path.trim() ? result.path : path;
+      setCreateOpen(false);
+      setCreateName('');
+      chooseFolder(createdPath);
+    } catch (caught) {
+      setCreateError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setCreateBusy(false);
+    }
   };
 
   return (
@@ -183,7 +236,7 @@ export default function CwdPicker({ initialCwd, rpc, busy = false, onCancel, onC
         aria-labelledby={titleId}
         onSubmit={(event) => {
           event.preventDefault();
-          if (trimmedCwd && !busy) onConfirm(trimmedCwd);
+          if (trimmedCwd && !busy && !createBusy) onConfirm(trimmedCwd);
         }}
       >
         <h2 id={titleId}>New Session</h2>
@@ -210,10 +263,57 @@ export default function CwdPicker({ initialCwd, rpc, busy = false, onCancel, onC
               >
                 <RefreshCw size={15} aria-hidden="true" />
               </button>
+              <button
+                className="icon-button icon-button--square"
+                type="button"
+                onClick={openCreateFolder}
+                disabled={busy || browseLoading || createBusy}
+                title="New folder"
+                aria-label="New folder"
+              >
+                <FolderPlus size={15} aria-hidden="true" />
+              </button>
               <span className="cwd-browser-path" title={browsePath}>
                 {browsePath}
               </span>
             </div>
+            {createOpen && (
+              <div className="cwd-create-row">
+                <input
+                  ref={createInputRef}
+                  className="text-input cwd-create-input"
+                  value={createName}
+                  onChange={(event) => {
+                    setCreateName(event.target.value);
+                    setCreateError(null);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key !== 'Enter') return;
+                    event.preventDefault();
+                    void createFolder();
+                  }}
+                  placeholder="Folder name"
+                  aria-label="Folder name"
+                  disabled={createBusy}
+                />
+                <button className="text-button primary" type="button" onClick={() => void createFolder()} disabled={createBusy || !createName.trim()}>
+                  Create
+                </button>
+                <button
+                  className="text-button"
+                  type="button"
+                  onClick={() => {
+                    setCreateOpen(false);
+                    setCreateError(null);
+                    setCreateName('');
+                  }}
+                  disabled={createBusy}
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
+            {createError && <div className="file-error">{createError}</div>}
             {browseError && <div className="file-error">{browseError}</div>}
             <div className="cwd-browser-list" aria-busy={browseLoading}>
               {browseLoading && <div className="file-empty">Loading folders...</div>}
@@ -233,7 +333,7 @@ export default function CwdPicker({ initialCwd, rpc, busy = false, onCancel, onC
           <button className="text-button" type="button" onClick={onCancel}>
             Cancel
           </button>
-          <button className="text-button primary" type="submit" disabled={!trimmedCwd || busy}>
+          <button className="text-button primary" type="submit" disabled={!trimmedCwd || busy || createBusy}>
             Start
           </button>
         </div>

@@ -1,5 +1,5 @@
 import http from 'node:http';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -2157,6 +2157,25 @@ describe('attachBrowserSocket fs RPC wrappers', () => {
         truncated: false,
         entries: [{ name: 'src', path: join(workspace, 'src'), isDirectory: true }],
       },
+    });
+  });
+
+  it('creates browsed directories for new session cwd selection without requiring an active cwd', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-browse-create-'));
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    const newDir = join(workspace, 'new-session');
+    const { ws } = await makeHarness(request, { startCwd: workspace });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 291, method: 'webui/fs/createBrowseDirectory', params: { path: 'new-session' } }));
+    const response = await nextMessage(ws);
+
+    expect(request).not.toHaveBeenCalled();
+    expect(statSync(newDir).isDirectory()).toBe(true);
+    expect(response).toEqual({
+      type: 'rpc/result',
+      id: 291,
+      result: { path: newDir },
     });
   });
 

@@ -2060,6 +2060,20 @@ button.activity-card:focus-visible {
   white-space: nowrap;
 }
 
+.cwd-create-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface-raised) 70%, transparent);
+}
+
+.cwd-create-input {
+  min-height: 32px;
+}
+
 .cwd-browser-list {
   max-height: min(300px, 34vh);
   overflow-y: auto;

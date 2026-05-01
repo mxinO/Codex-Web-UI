@@ -251,4 +251,119 @@ describe('CwdPicker', () => {
     expect(rpc).toHaveBeenCalledWith('webui/fs/browseDirectory', { path: '/work/project' });
     expect(document.querySelector<HTMLButtonElement>('[aria-label="Open folder src"]')).toBeInstanceOf(HTMLButtonElement);
   });
+
+  it('creates a new folder from the picker and selects it', async () => {
+    const rpc = vi.fn((method: string, params?: unknown) => {
+      const path = (params as { path?: string } | undefined)?.path;
+      if (method === 'webui/fs/browseDirectory' && path === '/work') return Promise.resolve({ path: '/work', entries: [] });
+      if (method === 'webui/fs/createBrowseDirectory' && path === '/work/new-run') return Promise.resolve({ path: '/work/new-run' });
+      if (method === 'webui/fs/browseDirectory' && path === '/work/new-run') return Promise.resolve({ path: '/work/new-run', entries: [] });
+      return Promise.reject(new Error(`unexpected ${method} ${path}`));
+    });
+
+    render(<CwdPicker initialCwd="/work" rpc={asCwdRpc(rpc)} onCancel={vi.fn()} onConfirm={vi.fn()} />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="New folder"]')?.click();
+    });
+    const nameInput = document.querySelector<HTMLInputElement>('[aria-label="Folder name"]');
+    expect(document.activeElement).toBe(nameInput);
+    act(() => {
+      changeInputValue(nameInput, 'new-run');
+    });
+    await act(async () => {
+      Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Create')?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(rpc).toHaveBeenCalledWith('webui/fs/createBrowseDirectory', { path: '/work/new-run' });
+    expect(rpc).toHaveBeenCalledWith('webui/fs/browseDirectory', { path: '/work/new-run' });
+    expect(document.querySelector<HTMLInputElement>('.text-input')?.value).toBe('/work/new-run');
+  });
+
+  it('creates new folders under the manually typed cwd instead of stale suggestions', async () => {
+    const rpc = vi.fn((method: string, params?: unknown) => {
+      const path = (params as { path?: string } | undefined)?.path;
+      if (method === 'webui/fs/browseDirectory' && path === '/work') return Promise.resolve({ path: '/work', entries: [] });
+      if (method === 'webui/fs/createBrowseDirectory' && path === '/work/project/runs') return Promise.resolve({ path: '/work/project/runs' });
+      if (method === 'webui/fs/browseDirectory' && path === '/work/project/runs') return Promise.resolve({ path: '/work/project/runs', entries: [] });
+      return Promise.reject(new Error(`unexpected ${method} ${path}`));
+    });
+
+    render(<CwdPicker initialCwd="/work" rpc={asCwdRpc(rpc)} onCancel={vi.fn()} onConfirm={vi.fn()} />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const cwdInput = document.querySelector<HTMLInputElement>('.text-input');
+    act(() => {
+      changeInputValue(cwdInput, '/work/project');
+    });
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="New folder"]')?.click();
+    });
+    act(() => {
+      changeInputValue(document.querySelector<HTMLInputElement>('[aria-label="Folder name"]'), 'runs');
+    });
+    await act(async () => {
+      Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Create')?.click();
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(rpc).toHaveBeenCalledWith('webui/fs/createBrowseDirectory', { path: '/work/project/runs' });
+    expect(document.querySelector<HTMLInputElement>('.text-input')?.value).toBe('/work/project/runs');
+  });
+
+  it('keeps start disabled while a new folder is being created', async () => {
+    let resolveCreate: ((value: unknown) => void) | null = null;
+    const rpc = vi.fn((method: string, params?: unknown) => {
+      const path = (params as { path?: string } | undefined)?.path;
+      if (method === 'webui/fs/browseDirectory' && path === '/work') return Promise.resolve({ path: '/work', entries: [] });
+      if (method === 'webui/fs/createBrowseDirectory' && path === '/work/new-run') {
+        return new Promise((resolve) => {
+          resolveCreate = resolve;
+        });
+      }
+      if (method === 'webui/fs/browseDirectory' && path === '/work/new-run') return Promise.resolve({ path: '/work/new-run', entries: [] });
+      return Promise.reject(new Error(`unexpected ${method} ${path}`));
+    });
+    const onConfirm = vi.fn();
+
+    render(<CwdPicker initialCwd="/work" rpc={asCwdRpc(rpc)} onCancel={vi.fn()} onConfirm={onConfirm} />);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      document.querySelector<HTMLButtonElement>('[aria-label="New folder"]')?.click();
+    });
+    act(() => {
+      changeInputValue(document.querySelector<HTMLInputElement>('[aria-label="Folder name"]'), 'new-run');
+    });
+    await act(async () => {
+      Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Create')?.click();
+      await Promise.resolve();
+    });
+
+    const start = Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === 'Start');
+    expect(start?.disabled).toBe(true);
+    act(() => {
+      start?.click();
+    });
+    expect(onConfirm).not.toHaveBeenCalled();
+
+    await act(async () => {
+      resolveCreate?.({ path: '/work/new-run' });
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    expect(start?.disabled).toBe(false);
+  });
 });

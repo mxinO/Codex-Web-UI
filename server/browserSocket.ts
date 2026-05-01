@@ -499,6 +499,17 @@ async function createDirectory(deps: BrowserSocketDeps, requestedPath: string) {
   return {};
 }
 
+async function createBrowseDirectory(deps: BrowserSocketDeps, requestedPath: string) {
+  const basePath = browseBasePath(deps);
+  const candidate = nodePath.isAbsolute(requestedPath) ? requestedPath : nodePath.resolve(basePath, requestedPath);
+  const targetParent = await fs.realpath(nodePath.dirname(candidate));
+  const targetName = nodePath.basename(candidate);
+  if (!targetName || targetName === '.' || targetName === '..') throw new Error('directory name is required');
+  const resolvedPath = nodePath.join(targetParent, targetName);
+  await fs.mkdir(resolvedPath);
+  return { path: resolvedPath };
+}
+
 async function getMetadata(deps: BrowserSocketDeps, requestedPath: string) {
   const { lexicalPath, realPath } = await resolveReadableRpcPaths(deps, requestedPath);
   const [stats, linkStats] = await Promise.all([fs.stat(realPath), fs.lstat(lexicalPath)]);
@@ -2162,6 +2173,18 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
 
           const result = await createDirectory(deps, filePath);
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/fs/createBrowseDirectory') {
+          const filePath = getRequiredString(request.params, 'path');
+          if (!filePath) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+            return;
+          }
+
+          const result = await createBrowseDirectory(deps, filePath);
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
