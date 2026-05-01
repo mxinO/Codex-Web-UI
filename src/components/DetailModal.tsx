@@ -378,6 +378,19 @@ function fileChangeDiff(item: Extract<TimelineItem, { kind: 'fileChange' }>): Fi
   return null;
 }
 
+function fileChangePath(item: Extract<TimelineItem, { kind: 'fileChange' }>): string | null {
+  if (item.resolvedDiff?.path) return item.resolvedDiff.path;
+  if (item.filePath) return item.filePath;
+
+  for (const change of allRecordChanges(item.item)) {
+    const filePath = firstStringAt(change, [['path'], ['file'], ['filePath'], ['file_path']]);
+    if (filePath) return filePath;
+  }
+
+  const change = firstRecordChange(item.item);
+  return firstStringAt(change, [['path'], ['file'], ['filePath'], ['file_path']]);
+}
+
 function getFocusableElements(element: HTMLElement): HTMLElement[] {
   return Array.from(
     element.querySelectorAll<HTMLElement>('a[href], button:not(:disabled), input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])'),
@@ -432,6 +445,8 @@ export default function DetailModal({ item, onClose }: { item: TimelineItem | nu
   };
 
   const diff = item.kind === 'fileChange' && !item.diffLoading && !item.diffError ? fileChangeDiff(item) : null;
+  const titlePath = item.kind === 'fileChange' ? fileChangePath(item) : null;
+  const titleText = titlePath ?? item.kind;
   const body =
     item.kind === 'assistant' ? (
       <Suspense fallback={<div className="detail-loading">Loading markdown...</div>}>
@@ -465,8 +480,10 @@ export default function DetailModal({ item, onClose }: { item: TimelineItem | nu
         onClick={(event) => event.stopPropagation()}
         onKeyDown={handleKeyDown}
       >
-        <div className="modal-header">
-          <span id="detail-modal-title">{item.kind}</span>
+        <div className={`modal-header${titlePath ? ' file-editor-header' : ''}`}>
+          <span id="detail-modal-title" className={titlePath ? 'file-editor-title' : undefined} title={titlePath ?? undefined}>
+            {titleText}
+          </span>
           <button className="icon-button" type="button" aria-label="Close detail" onClick={onClose} ref={closeButtonRef}>
             X
           </button>

@@ -95,6 +95,51 @@ describe('FileExplorer', () => {
     expect(fileButton('/repo-a/a/nested.txt')).not.toBeNull();
   });
 
+  it('refreshes loaded nested directories from the toolbar button', async () => {
+    const rootInitialLoad = deferred<unknown>();
+    const childInitialLoad = deferred<unknown>();
+    const rootRefresh = deferred<unknown>();
+    const childRefresh = deferred<unknown>();
+    const readCounts = new Map<string, number>();
+    const rpc = vi.fn((method: string, params?: unknown) => {
+      const path = (params as { path?: string } | undefined)?.path;
+      if (method !== 'webui/fs/readDirectory') return Promise.reject(new Error(`unexpected method ${method}`));
+      readCounts.set(String(path), (readCounts.get(String(path)) ?? 0) + 1);
+      if (path === '/repo-a') return readCounts.get('/repo-a') === 1 ? rootInitialLoad.promise : rootRefresh.promise;
+      if (path === '/repo-a/a') return readCounts.get('/repo-a/a') === 1 ? childInitialLoad.promise : childRefresh.promise;
+      return Promise.reject(new Error(`unexpected path ${path}`));
+    });
+
+    renderFileExplorer(asRpc(rpc), '/repo-a');
+
+    await act(async () => {
+      rootInitialLoad.resolve({ entries: [{ name: 'a', path: '/repo-a/a', isDirectory: true }] });
+      await Promise.resolve();
+    });
+    await act(async () => {
+      buttonByLabel('Expand a').click();
+      childInitialLoad.resolve({ entries: [{ name: 'old.txt', path: '/repo-a/a/old.txt', isFile: true }] });
+      await Promise.resolve();
+    });
+
+    expect(fileButton('/repo-a/a/old.txt')).not.toBeNull();
+
+    act(() => {
+      buttonByLabel('Refresh file explorer').click();
+    });
+    await act(async () => {
+      rootRefresh.resolve({ entries: [{ name: 'a', path: '/repo-a/a', isDirectory: true }] });
+      await Promise.resolve();
+    });
+    await act(async () => {
+      childRefresh.resolve({ entries: [{ name: 'new.txt', path: '/repo-a/a/new.txt', isFile: true }] });
+      await Promise.resolve();
+    });
+
+    expect(fileButton('/repo-a/a/new.txt')).not.toBeNull();
+    expect(document.querySelector('[title="/repo-a/a/old.txt"]')).toBeNull();
+  });
+
   it('does not refresh the old directory after create resolves following navigation', async () => {
     const rootAInitialLoad = deferred<unknown>();
     const rootAStaleRefresh = deferred<unknown>();

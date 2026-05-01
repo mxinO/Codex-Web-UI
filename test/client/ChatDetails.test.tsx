@@ -334,6 +334,9 @@ describe('DetailModal', () => {
     render(<DetailModal item={item} onClose={vi.fn()} />);
 
     expect(document.querySelector('.detail-pre')).toBeNull();
+    expect(document.querySelector('#detail-modal-title')?.textContent).toBe('src/App.tsx');
+    expect(document.querySelector('#detail-modal-title')?.getAttribute('title')).toBe('src/App.tsx');
+    expect(document.querySelector('#detail-modal-title')?.classList.contains('file-editor-title')).toBe(true);
 
     await act(async () => {
       await import('../../src/components/DiffViewer');

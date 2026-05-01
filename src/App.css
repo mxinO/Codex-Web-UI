@@ -1526,6 +1526,10 @@ button.activity-card:focus-visible {
   text-transform: none;
 }
 
+.modal-header.file-editor-header {
+  text-transform: none;
+}
+
 .file-editor-title {
   flex: 1 1 auto;
   min-width: 0;

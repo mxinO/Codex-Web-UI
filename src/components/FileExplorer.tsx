@@ -180,6 +180,21 @@ export default function FileExplorer({ root, rpc, onOpenFile }: FileExplorerProp
     if (!wasExpanded && !directories[dir]?.loaded) await loadDirectory(dir);
   };
 
+  const refreshTree = async () => {
+    const generation = rootGenerationRef.current;
+    const dirs = new Set<string>([normalizedRoot]);
+    for (const dir of expandedDirectories) dirs.add(dir);
+    for (const dir of Object.keys(directories)) {
+      if (directories[dir]?.loaded) dirs.add(dir);
+    }
+
+    const orderedDirs = Array.from(dirs).sort((a, b) => a.split('/').length - b.split('/').length || a.localeCompare(b));
+    for (const dir of orderedDirs) {
+      if (generation !== rootGenerationRef.current) return;
+      await loadDirectory(dir);
+    }
+  };
+
   const createEntry = async (kind: 'file' | 'directory', parentDir: string) => {
     const label = kind === 'file' ? 'file name' : 'directory name';
     const name = window.prompt(`New ${label}`);
@@ -374,7 +389,7 @@ export default function FileExplorer({ root, rpc, onOpenFile }: FileExplorerProp
         <button className="file-action" type="button" onClick={() => triggerUpload(normalizedRoot)} title="Upload to root" aria-label="Upload to root">
           <Upload size={14} aria-hidden="true" />
         </button>
-        <button className="file-action" type="button" onClick={() => void loadDirectory(normalizedRoot)} disabled={rootState?.loading} title="Refresh" aria-label="Refresh file explorer">
+        <button className="file-action" type="button" onClick={() => void refreshTree()} disabled={rootState?.loading} title="Refresh" aria-label="Refresh file explorer">
           <RefreshCw size={14} aria-hidden="true" />
         </button>
       </div>
