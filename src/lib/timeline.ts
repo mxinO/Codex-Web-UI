@@ -64,6 +64,8 @@ export interface TimelineNotificationMeta {
 
 const NOTIFICATION_META_KEY = '__codexWebUiNotificationMeta';
 const SYNTHETIC_PENDING_TURN_PREFIXES = ['turn-start-pending:', 'compact-pending:'];
+const TERMINAL_EVENT_TYPES = new Set(['task_complete', 'task_failed', 'task_interrupted']);
+const TERMINAL_NOTIFICATION_METHODS = new Set(['turn/completed', 'turn/failed', 'turn/interrupted', 'thread/compacted']);
 
 export function withTimelineNotificationMeta(notification: unknown, meta: TimelineNotificationMeta): unknown {
   if (!isRecord(notification)) return notification;
@@ -176,9 +178,8 @@ export function notificationIsTurnComplete(notification: unknown, scope: Timelin
   if (!isRecord(notification) || typeof notification.method !== 'string') return false;
   const payload = notificationPayload(notification);
   const isComplete =
-    notification.method === 'turn/completed' ||
-    notification.method === 'thread/compacted' ||
-    (notification.method === 'event_msg' && isRecord(payload) && payload.type === 'task_complete');
+    TERMINAL_NOTIFICATION_METHODS.has(notification.method) ||
+    (notification.method === 'event_msg' && isRecord(payload) && typeof payload.type === 'string' && TERMINAL_EVENT_TYPES.has(payload.type));
   if (!isComplete) return false;
 
   const threadId = notificationThreadId(notification);
@@ -292,11 +293,53 @@ function fileChangeSummaryItem(turn: CodexTurn, timestamp: number): TimelineItem
   };
 }
 
+function positiveCountField(value: unknown, key: string): number | null {
+  const candidate = numberOrNullField(value, key);
+  return candidate !== null && candidate > 0 ? candidate : null;
+}
+
+function syntheticFileChangeSummaryItem(turn: CodexTurn, items: CodexItem[], timestamp: number): TimelineItem | null {
+  let summaryFiles: Array<{ path: string; changeCount: number }> | null = null;
+
+  for (const item of items) {
+    if (item.type !== 'webuiFileChangeSummary') continue;
+    const files = (item as Record<string, unknown>).files;
+    if (!Array.isArray(files)) continue;
+
+    const orderedFiles = new Map<string, { path: string; changeCount: number; order: number }>();
+    for (const file of files) {
+      const path = changePath(file);
+      if (!path) continue;
+      const changeCount = positiveCountField(file, 'changeCount') ?? positiveCountField(file, 'editCount') ?? 1;
+      const existing = orderedFiles.get(path);
+      if (existing) {
+        existing.changeCount += changeCount;
+        continue;
+      }
+      orderedFiles.set(path, { path, changeCount, order: orderedFiles.size });
+    }
+
+    summaryFiles = Array.from(orderedFiles.values())
+      .sort((a, b) => a.order - b.order)
+      .map(({ path, changeCount }) => ({ path, changeCount }));
+  }
+
+  if (!summaryFiles || summaryFiles.length === 0) return null;
+  return {
+    id: `${turn.id}:file-summary`,
+    kind: 'fileChangeSummary',
+    timestamp,
+    turnId: turn.id,
+    files: summaryFiles,
+  };
+}
+
 export function turnToTimelineItems(turn: CodexTurn): TimelineItem[] {
   const timestamp = (turn.startedAt ?? 0) * 1000;
   const items = Array.isArray(turn.items) ? turn.items : [];
   const timelineItems = items.flatMap((item, index): TimelineItem[] => {
     const id = safeItemId(turn, item, index);
+    if (item.type === 'webuiFileChangeSummary') return [];
     if (item.type === 'fileChange') return fileChangeItemsForTurnItem({ ...turn, items }, item, index, timestamp);
     if (item.type === 'userMessage') return [{ id, kind: 'user', timestamp, text: userText(item) }];
     if (item.type === 'agentMessage') return [{ id, kind: 'assistant', timestamp, text: stringField(item, 'text'), phase: nullableStringField(item, 'phase') }];
@@ -322,7 +365,7 @@ export function turnToTimelineItems(turn: CodexTurn): TimelineItem[] {
     if (item.type === 'error') return [{ id, kind: 'error', timestamp, text: stringField(item, 'message') || stringField(item, 'text') || item.type }];
     return [{ id, kind: 'tool', timestamp, item }];
   });
-  const summary = fileChangeSummaryItem({ ...turn, items }, timestamp);
+  const summary = syntheticFileChangeSummaryItem(turn, items, timestamp) ?? fileChangeSummaryItem({ ...turn, items }, timestamp);
   return summary ? [...timelineItems, summary] : timelineItems;
 }
 
@@ -656,7 +699,7 @@ export function liveTurnItemsFromNotifications(
     const timestamp = notificationTimestamp(notification, now);
     const sortOrder = notificationSortOrder(notification);
 
-    if (notification.method === 'turn/completed' || notification.method === 'thread/compacted') {
+    if (TERMINAL_NOTIFICATION_METHODS.has(notification.method)) {
       if (notificationMatchesActiveTurn(notification, scope)) deltaIndex = null;
       continue;
     }
@@ -671,7 +714,7 @@ export function liveTurnItemsFromNotifications(
     if (notification.method === 'event_msg') {
       const payload = notificationPayload(notification);
       if (!isRecord(payload)) continue;
-      if (payload.type === 'task_complete') {
+      if (typeof payload.type === 'string' && TERMINAL_EVENT_TYPES.has(payload.type)) {
         if (notificationIsTurnComplete(notification, scope)) deltaIndex = null;
         continue;
       }
@@ -842,7 +885,7 @@ export function liveStreamingItemFromNotifications(
   for (const notification of notifications) {
     if (!isRecord(notification) || typeof notification.method !== 'string') continue;
 
-    if (notification.method === 'turn/completed' || notification.method === 'thread/compacted') {
+    if (TERMINAL_NOTIFICATION_METHODS.has(notification.method)) {
       if (notificationMatchesActiveTurn(notification, scope)) turnId = notificationTurnId(notification) ?? turnId;
       continue;
     }
@@ -858,7 +901,7 @@ export function liveStreamingItemFromNotifications(
     if (notification.method !== 'event_msg') continue;
     const payload = notificationPayload(notification);
     if (!isRecord(payload)) continue;
-    if (payload.type === 'task_complete') {
+    if (typeof payload.type === 'string' && TERMINAL_EVENT_TYPES.has(payload.type)) {
       if (notificationIsTurnComplete(notification, scope)) turnId = notificationTurnId(notification) ?? turnId;
       continue;
     }

@@ -159,6 +159,14 @@ async function waitForRequestCalls(request: ReturnType<typeof vi.fn>, count: num
   throw new Error(`request was called ${request.mock.calls.length} times, expected ${count}`);
 }
 
+async function waitForActiveTurnCleared(stateStore: HostStateStore): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (stateStore.read().activeTurnId === null) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+  }
+  throw new Error(`active turn was not cleared: ${stateStore.read().activeTurnId ?? '<null>'}`);
+}
+
 afterEach(() => {
   for (const cleanup of cleanups.splice(0)) cleanup();
 });
@@ -941,6 +949,70 @@ describe('attachBrowserSocket app-server requests', () => {
         before: 'title\n\nline one\n',
         after: 'title changed\n\nline one\nline two\n',
         source: 'stored',
+      },
+    });
+  });
+
+  it('waits for queued file-change captures before returning the active tray summary', async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const threadPath = join(sessionDir, 'rollout-2026-04-29T00-00-00-thread-summary-race.jsonl');
+    const firstPath = join(root, 'first.txt');
+    const secondPath = join(root, 'second.txt');
+    writeFileSync(threadPath, '');
+    writeFileSync(firstPath, 'first before\n');
+    writeFileSync(secondPath, 'second before\n');
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, notifyRaw } = await makeHarness(request);
+    stateStore.update((state) => ({
+      ...state,
+      activeCwd: root,
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-1',
+      activeThreadPath: threadPath,
+    }));
+    notifyRaw({ jsonrpc: '2.0', method: 'turn/started', params: { threadId: 'thread-1', turnId: 'turn-1' } });
+
+    writeFileSync(firstPath, 'first after\n');
+    writeFileSync(secondPath, 'second after\n');
+    notifyRaw({
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'fileChange',
+          id: 'file-change-summary',
+          status: 'completed',
+          changes: [
+            { path: firstPath, type: 'update', diff: '@@ -1 +1 @@\n-first before\n+first after\n' },
+            { path: secondPath, type: 'update', diff: '@@ -1 +1 @@\n-second before\n+second after\n' },
+          ],
+        },
+      },
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 671,
+        method: 'webui/fileChange/summary',
+        params: { threadId: 'thread-1', threadPath, turnId: 'turn-1' },
+      }),
+    );
+
+    expect(await nextRpcResponse(ws, 671)).toMatchObject({
+      type: 'rpc/result',
+      id: 671,
+      result: {
+        turnId: 'turn-1',
+        files: [
+          { path: firstPath, editCount: 1, hasDiff: true },
+          { path: secondPath, editCount: 1, hasDiff: true },
+        ],
       },
     });
   });
@@ -2402,6 +2474,56 @@ describe('attachBrowserSocket app-server lifecycle', () => {
     expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'thread/turns/list']);
   });
 
+  it('adds stored file summaries to terminal turn history responses', async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const threadPath = join(sessionDir, 'rollout-2026-04-29T00-00-00-thread-history.jsonl');
+    const filePath = join(root, 'history-summary.txt');
+    writeFileSync(threadPath, '');
+    writeFileSync(filePath, 'after\n');
+    const store = new FileEditStore(sessionFileEditDbPath(threadPath));
+    store.recordSnapshot({ turnId: 'turn-1', itemId: 'approval-1', path: filePath, before: 'before\n' });
+    store.finalizeFile({ turnId: 'turn-1', path: filePath, after: 'after\n' });
+    store.close();
+
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: root, path: threadPath } } as T;
+      if (method === 'thread/turns/list') {
+        return {
+          data: [{ id: 'turn-1', status: 'interrupted', items: [], startedAt: 1, completedAt: 2 }],
+        } as T;
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws } = await makeHarness(request);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 43, method: 'thread/turns/list', params: { threadId: 'thread-1' } }));
+
+    expect(await nextRpcResponse(ws, 43)).toEqual({
+      type: 'rpc/result',
+      id: 43,
+      result: {
+        data: [
+          {
+            id: 'turn-1',
+            status: 'interrupted',
+            startedAt: 1,
+            completedAt: 2,
+            items: [
+              {
+                type: 'webuiFileChangeSummary',
+                id: 'webui-file-summary:turn-1',
+                files: [{ path: filePath, editCount: 1, hasDiff: true, updatedAtMs: expect.any(Number) }],
+              },
+            ],
+          },
+        ],
+      },
+    });
+  });
+
   it('clears stale active thread state when resume reports a missing rollout', async () => {
     const request = vi.fn<CodexAppServer['request']>().mockRejectedValue(new Error('no rollout found for thread id thread-1'));
     const { ws, stateStore } = await makeHarness(request, {
@@ -2539,6 +2661,130 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     expect(start).not.toHaveBeenCalled();
     expect(request).not.toHaveBeenCalled();
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null });
+  });
+
+  it('finalizes the active file summary when a turn is stopped', async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const threadPath = join(sessionDir, 'rollout-2026-04-29T00-00-00-thread-stop.jsonl');
+    const firstPath = join(root, 'stop-first.txt');
+    const secondPath = join(root, 'stop-second.txt');
+    writeFileSync(threadPath, '');
+    writeFileSync(firstPath, 'first before stop\n');
+    writeFileSync(secondPath, 'second before stop\n');
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: root, path: threadPath } } as T;
+      if (method === 'turn/interrupt') return { ok: true } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, requestFromServer } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeCwd: root,
+      activeThreadId: 'thread-1',
+      activeThreadPath: threadPath,
+      activeTurnId: 'turn-1',
+    });
+
+    const approvalBroadcast = nextMessage(ws);
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: 'approval-stop',
+      method: 'item/fileChange/requestApproval',
+      params: { changes: [{ path: firstPath }, { path: secondPath }] },
+    });
+    await approvalBroadcast;
+    writeFileSync(firstPath, 'first after stop\n');
+    writeFileSync(secondPath, 'second after stop\n');
+
+    const stopResponse = nextRpcResponse(ws, 18);
+    ws.send(JSON.stringify({ type: 'rpc', id: 18, method: 'webui/turn/interrupt' }));
+    expect(await stopResponse).toEqual({ type: 'rpc/result', id: 18, result: { ok: true } });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 19,
+        method: 'webui/fileChange/summary',
+        params: { threadId: 'thread-1', threadPath, turnId: 'turn-1' },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 19)).toMatchObject({
+      type: 'rpc/result',
+      id: 19,
+      result: {
+        turnId: 'turn-1',
+        files: [
+          { path: firstPath, editCount: 1, hasDiff: true },
+          { path: secondPath, editCount: 1, hasDiff: true },
+        ],
+      },
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 20,
+        method: 'webui/fileChange/diff',
+        params: { threadId: 'thread-1', threadPath, turnId: 'turn-1', path: firstPath, changes: [{ path: firstPath }] },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 20)).toEqual({
+      type: 'rpc/result',
+      id: 20,
+      result: { path: firstPath, before: 'first before stop\n', after: 'first after stop\n', source: 'stored' },
+    });
+  });
+
+  it('finalizes file summaries when Codex reports an interrupted turn', async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const threadPath = join(sessionDir, 'rollout-2026-04-29T00-00-00-thread-interrupted.jsonl');
+    const filePath = join(root, 'interrupted.txt');
+    writeFileSync(threadPath, '');
+    writeFileSync(filePath, 'before interrupted\n');
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, requestFromServer, notifyRaw } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeCwd: root,
+      activeThreadId: 'thread-1',
+      activeThreadPath: threadPath,
+      activeTurnId: 'turn-1',
+    });
+
+    const approvalBroadcast = nextMessage(ws);
+    requestFromServer({
+      jsonrpc: '2.0',
+      id: 'approval-interrupted',
+      method: 'item/fileChange/requestApproval',
+      params: { path: filePath },
+    });
+    await approvalBroadcast;
+    writeFileSync(filePath, 'after interrupted\n');
+
+    notifyRaw({ jsonrpc: '2.0', method: 'turn/interrupted', params: { threadId: 'thread-1', turnId: 'turn-1' } });
+    await waitForActiveTurnCleared(stateStore);
+
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null });
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 21,
+        method: 'webui/fileChange/diff',
+        params: { threadId: 'thread-1', threadPath, turnId: 'turn-1', path: filePath, changes: [{ path: filePath }] },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 21)).toEqual({
+      type: 'rpc/result',
+      id: 21,
+      result: { path: filePath, before: 'before interrupted\n', after: 'after interrupted\n', source: 'stored' },
+    });
   });
 
   it('lets stop clear an active turn when the resumed thread is no longer known to Codex', async () => {

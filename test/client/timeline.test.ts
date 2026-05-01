@@ -147,6 +147,82 @@ describe('timeline', () => {
     ]);
   });
 
+  it('uses a synthetic webui file summary as the per-turn summary without deriving a duplicate raw summary', () => {
+    const turn: CodexTurn = {
+      id: 'turn-file',
+      status: 'completed',
+      startedAt: 10,
+      completedAt: 11,
+      items: [
+        { type: 'agentMessage', id: 'a1', text: 'editing', phase: 'commentary' },
+        { type: 'fileChange', id: 'f1', status: 'completed', changes: [{ path: '/repo/raw.txt', diff: 'raw\n' }] },
+        {
+          type: 'webuiFileChangeSummary',
+          id: 'summary-1',
+          files: [
+            { path: '/repo/final.txt', editCount: 3 },
+            { path: '/repo/also-final.txt', changeCount: 2 },
+          ],
+        },
+      ],
+    };
+
+    const items = turnToTimelineItems(turn);
+    const summaries = items.filter((item): item is Extract<TimelineItem, { kind: 'fileChangeSummary' }> => item.kind === 'fileChangeSummary');
+
+    expect(items.map((item) => item.kind)).toEqual(['assistant', 'fileChange', 'fileChangeSummary']);
+    expect(summaries).toEqual([
+      {
+        id: 'turn-file:file-summary',
+        kind: 'fileChangeSummary',
+        timestamp: 10000,
+        turnId: 'turn-file',
+        files: [
+          { path: '/repo/final.txt', changeCount: 3 },
+          { path: '/repo/also-final.txt', changeCount: 2 },
+        ],
+      },
+    ]);
+  });
+
+  it('appends exactly one synthetic webui file summary at the end of the turn', () => {
+    const turn: CodexTurn = {
+      id: 'turn-file',
+      status: 'completed',
+      startedAt: 10,
+      completedAt: 11,
+      items: [
+        {
+          type: 'webuiFileChangeSummary',
+          id: 'summary-1',
+          files: [{ path: '/repo/old.txt', editCount: 1 }],
+        },
+        { type: 'commandExecution', id: 'c1', command: 'npm test', cwd: '/repo', status: 'completed', aggregatedOutput: 'ok\n', exitCode: 0, durationMs: 1 },
+        {
+          type: 'webuiFileChangeSummary',
+          id: 'summary-2',
+          files: [
+            { path: '/repo/a.txt', editCount: 2 },
+            { path: '/repo/a.txt', changeCount: 1 },
+            { path: '/repo/b.txt', editCount: 1 },
+          ],
+        },
+      ],
+    };
+
+    const items = turnToTimelineItems(turn);
+
+    expect(items.map((item) => item.kind)).toEqual(['command', 'fileChangeSummary']);
+    expect(items.at(-1)).toMatchObject({
+      id: 'turn-file:file-summary',
+      kind: 'fileChangeSummary',
+      files: [
+        { path: '/repo/a.txt', changeCount: 3 },
+        { path: '/repo/b.txt', changeCount: 1 },
+      ],
+    });
+  });
+
   it('renders warning and error items as severity-specific timeline cards', () => {
     const turn: CodexTurn = {
       id: 'turn-warning',
@@ -585,6 +661,15 @@ describe('timeline', () => {
     expect(latestCompletionNotificationCount(notifications, 12, { activeThreadId: 'thread-1', activeTurnId: 'turn-compact' })).toBe(12);
   });
 
+  it('treats interrupted and failed notifications as terminal turn signals', () => {
+    const scope = { activeThreadId: 'thread-1', activeTurnId: 'turn-1' };
+
+    expect(latestCompletionNotificationCount([{ method: 'turn/interrupted', params: { threadId: 'thread-1', turnId: 'turn-1' } }], 4, scope)).toBe(4);
+    expect(latestCompletionNotificationCount([{ method: 'turn/failed', params: { threadId: 'thread-1', turnId: 'turn-1' } }], 5, scope)).toBe(5);
+    expect(latestCompletionNotificationCount([{ method: 'event_msg', params: { type: 'task_interrupted', thread_id: 'thread-1', turn_id: 'turn-1' } }], 6, scope)).toBe(6);
+    expect(latestCompletionNotificationCount([{ method: 'event_msg', params: { type: 'task_failed', thread_id: 'thread-1', turn_id: 'turn-1' } }], 7, scope)).toBe(7);
+  });
+
   it('derives live command, file, and tool cards from completed item notifications', () => {
     const items = liveTimelineItemsFromNotifications(
       [
@@ -946,6 +1031,18 @@ describe('timeline', () => {
     expect(
       notificationIsTurnComplete(
         { method: 'event_msg', params: { type: 'task_complete', turn_id: 'turn-active' } },
+        { activeThreadId: 'thread-active', activeTurnId: 'turn-active' },
+      ),
+    ).toBe(true);
+    expect(
+      notificationIsTurnComplete(
+        { method: 'event_msg', params: { type: 'task_interrupted', turn_id: 'turn-active' } },
+        { activeThreadId: 'thread-active', activeTurnId: 'turn-active' },
+      ),
+    ).toBe(true);
+    expect(
+      notificationIsTurnComplete(
+        { method: 'turn/failed', params: { turnId: 'turn-active' } },
         { activeThreadId: 'thread-active', activeTurnId: 'turn-active' },
       ),
     ).toBe(true);

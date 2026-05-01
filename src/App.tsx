@@ -60,6 +60,7 @@ interface OpenImage {
 }
 
 type UserTimelineItem = Extract<TimelineItem, { kind: 'user' }>;
+type FileChangeSummaryTimelineItem = Extract<TimelineItem, { kind: 'fileChangeSummary' }>;
 
 function decodeUtf8Base64(value: string): string {
   const binary = window.atob(value);
@@ -158,6 +159,25 @@ function sameTimelineItemList(left: TimelineItem[], right: TimelineItem[]): bool
   });
 }
 
+function activeFileSummaryToTimelineItem(
+  summary: ActiveFileSummary,
+  timestamp: number,
+  sortOrder?: number,
+): FileChangeSummaryTimelineItem | null {
+  const files = summary.files
+    .filter((file) => file.path.trim().length > 0 && file.editCount > 0)
+    .map((file) => ({ path: file.path, changeCount: file.editCount }));
+  if (files.length === 0) return null;
+  return {
+    id: `${summary.turnId}:file-summary`,
+    kind: 'fileChangeSummary',
+    timestamp,
+    sortOrder,
+    turnId: summary.turnId,
+    files,
+  };
+}
+
 export default function App() {
   const socket = useCodexSocket();
   const { theme, setTheme } = useTheme();
@@ -179,6 +199,7 @@ export default function App() {
   const [ephemeralItems, setEphemeralItems] = useState<TimelineItem[]>([]);
   const [pendingUserItems, setPendingUserItems] = useState<UserTimelineItem[]>([]);
   const [retainedLiveTurnItems, setRetainedLiveTurnItems] = useState<TimelineItem[]>([]);
+  const [retainedFileSummaryItems, setRetainedFileSummaryItems] = useState<FileChangeSummaryTimelineItem[]>([]);
   const [pendingCompactionThreadId, setPendingCompactionThreadId] = useState<string | null>(null);
   const [answeredApprovals, setAnsweredApprovals] = useState<Set<string>>(() => new Set());
   const [model, setModelState] = useState<string | null>(() => sanitizeStoredModel(localStorageValue('codex-web-ui:model')));
@@ -193,6 +214,8 @@ export default function App() {
   const localSortOrdersRef = useRef(new Map<string, number>());
   const [pendingTurnWindow, setPendingTurnWindow] = useState<{ id: string; threadId: string | null; startCount: number } | null>(null);
   const activeFileSummaryScopeRef = useRef({ threadId: activeThreadId, threadPath: activeThreadPath, turnId: state?.activeTurnId ?? null });
+  const previousActiveTurnRef = useRef({ threadId: activeThreadId, threadPath: activeThreadPath, turnId: state?.activeTurnId ?? null });
+  const finalizedFileSummaryFetchesRef = useRef(new Set<string>());
   const liveNotificationWindowRef = useRef({ activeThreadId, activeTurnId: state?.activeTurnId ?? null, startCount: socket.notificationCount });
   const lastHandledCompletionCountRef = useRef<number | null>(null);
   const pendingTurnStartCount = pendingTurnWindow?.threadId === activeThreadId ? pendingTurnWindow.startCount : null;
@@ -267,6 +290,19 @@ export default function App() {
     () => visibleLiveTurnItemsForTimeline([...timelineItemsForChat, ...visibleLiveTurnItems], retainedLiveTurnItems),
     [retainedLiveTurnItems, timelineItemsForChat, visibleLiveTurnItems],
   );
+  const historyFileSummaryTurnIds = useMemo(
+    () =>
+      new Set(
+        timelineItemsForChat
+          .filter((item): item is FileChangeSummaryTimelineItem => item.kind === 'fileChangeSummary')
+          .map((item) => item.turnId),
+      ),
+    [timelineItemsForChat],
+  );
+  const visibleRetainedFileSummaryItems = useMemo(
+    () => retainedFileSummaryItems.filter((item) => !historyFileSummaryTurnIds.has(item.turnId)),
+    [historyFileSummaryTurnIds, retainedFileSummaryItems],
+  );
   const queuedTimelineItems = useMemo<TimelineItem[]>(
     () =>
       queuedMessages.map((message) => ({
@@ -291,13 +327,14 @@ export default function App() {
     return mergeTimelineItemsByTimestamp([
       ...timelineItemsForChat,
       ...visibleRetainedLiveTurnItems,
+      ...visibleRetainedFileSummaryItems,
       ...pendingUserItems,
       ...queuedTimelineItems,
       ...ephemeralItems,
       ...visibleLiveTurnItems,
       ...approvalItems,
     ]);
-  }, [approvalItems, ephemeralItems, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items, timelineItemsForChat, visibleLiveTurnItems, visibleRetainedLiveTurnItems]);
+  }, [approvalItems, ephemeralItems, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items, timelineItemsForChat, visibleLiveTurnItems, visibleRetainedFileSummaryItems, visibleRetainedLiveTurnItems]);
   const runOptions = useMemo<CodexRunOptions>(() => ({ model, mode: effectiveMode(mode, model), effort, sandbox }), [effort, mode, model, sandbox]);
   const isRunning = Boolean(state?.activeTurnId || (pendingCompactionThreadId && pendingCompactionThreadId === activeThreadId));
 
@@ -307,6 +344,36 @@ export default function App() {
       return sameTimelineItemList(current, next) ? current : next;
     });
   }, []);
+
+  const appendRetainedFileSummary = useCallback((summary: ActiveFileSummary, timestamp = Date.now()) => {
+    const item = activeFileSummaryToTimelineItem(summary, timestamp, localSortOrder(`${summary.turnId}:file-summary`));
+    if (!item) return;
+    setRetainedFileSummaryItems((current) => [...current.filter((existing) => existing.turnId !== item.turnId), item]);
+  }, [localSortOrder]);
+
+  const loadFinalizedFileSummary = useCallback(async (threadId: string | null, threadPath: string | null, turnId: string) => {
+    if (!threadId || socket.connectionState !== 'connected') return;
+    const key = `${threadId}\0${threadPath ?? ''}\0${turnId}`;
+    if (finalizedFileSummaryFetchesRef.current.has(key)) return;
+    finalizedFileSummaryFetchesRef.current.add(key);
+
+    try {
+      const result = await socket.rpc<ActiveFileSummary>('webui/fileChange/summary', { threadId, turnId, threadPath });
+      const current = activeFileSummaryScopeRef.current;
+      if (current.threadId !== threadId || current.threadPath !== threadPath) {
+        finalizedFileSummaryFetchesRef.current.delete(key);
+        return;
+      }
+      if (result.files.length > 0) {
+        appendRetainedFileSummary({ ...result, turnId: result.turnId || turnId });
+        return;
+      }
+      finalizedFileSummaryFetchesRef.current.delete(key);
+    } catch {
+      finalizedFileSummaryFetchesRef.current.delete(key);
+      // Keep the retained client-side snapshot if the finalized summary is not available yet.
+    }
+  }, [appendRetainedFileSummary, socket.connectionState, socket.rpc]);
 
   useEffect(() => {
     if (state?.queue) replaceQueue(state.queue);
@@ -320,14 +387,23 @@ export default function App() {
     setEphemeralItems([]);
     setPendingUserItems([]);
     setRetainedLiveTurnItems([]);
+    setRetainedFileSummaryItems([]);
     setAnsweredApprovals(new Set());
     setActiveFileSummary(null);
     setPendingTurnWindow(null);
+    finalizedFileSummaryFetchesRef.current.clear();
   }, [activeThreadId]);
 
   useEffect(() => {
     updateRetainedLiveTurnItems(timelineItemsForChat);
   }, [timelineItemsForChat, updateRetainedLiveTurnItems]);
+
+  useEffect(() => {
+    setRetainedFileSummaryItems((current) => {
+      const next = current.filter((item) => !historyFileSummaryTurnIds.has(item.turnId));
+      return next.length === current.length ? current : next;
+    });
+  }, [historyFileSummaryTurnIds]);
 
   useEffect(() => {
     if (state?.activeTurnId || visibleLiveTurnItems.length === 0) return;
@@ -369,6 +445,23 @@ export default function App() {
     }
     void loadActiveFileSummary(state.activeTurnId);
   }, [loadActiveFileSummary, state?.activeTurnId]);
+
+  useEffect(() => {
+    const current = { threadId: activeThreadId, threadPath: activeThreadPath, turnId: state?.activeTurnId ?? null };
+    const previous = previousActiveTurnRef.current;
+    const previousTurnEnded =
+      previous.threadId === current.threadId &&
+      Boolean(previous.turnId) &&
+      previous.turnId !== current.turnId &&
+      !isSyntheticPendingTurnId(previous.turnId);
+
+    if (previousTurnEnded && previous.turnId) {
+      if (activeFileSummary?.turnId === previous.turnId) appendRetainedFileSummary(activeFileSummary);
+      void loadFinalizedFileSummary(previous.threadId, previous.threadPath, previous.turnId);
+    }
+
+    previousActiveTurnRef.current = current;
+  }, [activeFileSummary, activeThreadId, activeThreadPath, appendRetainedFileSummary, loadFinalizedFileSummary, state?.activeTurnId]);
 
   useEffect(() => {
     if (!state?.activeTurnId || !lastNotification || typeof lastNotification !== 'object') return;

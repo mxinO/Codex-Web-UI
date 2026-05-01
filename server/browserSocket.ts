@@ -255,10 +255,11 @@ function notificationTurnId(message: { params?: unknown; payload?: unknown }): s
   );
 }
 
-function isTaskCompleteEvent(message: { method?: unknown; params?: unknown; payload?: unknown }): boolean {
+function isTaskTerminalEvent(message: { method?: unknown; params?: unknown; payload?: unknown }): boolean {
   if (message.method !== 'event_msg') return false;
   const payload = notificationPayload(message);
-  return getStringPath(payload, ['type']) === 'task_complete';
+  const type = getStringPath(payload, ['type']);
+  return type === 'task_complete' || type === 'task_failed' || type === 'task_interrupted';
 }
 
 function isTaskStartedEvent(message: { method?: unknown; params?: unknown; payload?: unknown }): boolean {
@@ -1446,17 +1447,112 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
   };
 
-  const finalizeTurnFileDiffs = async (threadPath: string | null, turnId: string) => {
-    const store = openFileEditStore(threadPath);
-    if (!store) return;
+  const webuiFileChangeSummaryItem = (turnId: string, files: ReturnType<FileEditStore['listTurnFiles']>) => ({
+    type: 'webuiFileChangeSummary',
+    id: `webui-file-summary:${turnId}`,
+    files: files.map((file) => ({ path: file.path, editCount: file.editCount, hasDiff: file.hasDiff, updatedAtMs: file.updatedAtMs })),
+  });
+
+  const augmentTurnWithStoredFileSummary = (turn: unknown, listFiles: (turnId: string) => ReturnType<FileEditStore['listTurnFiles']>): unknown => {
+    if (!isRecord(turn)) return turn;
+    const turnId = getStringPath(turn, ['id']);
+    const status = getStringPath(turn, ['status']);
+    if (!turnId || status === 'inProgress') return turn;
+    const items = Array.isArray(turn.items) ? turn.items : [];
+    if (items.some((item) => isRecord(item) && item.type === 'webuiFileChangeSummary')) return turn;
+
+    const files = listFiles(turnId);
+    if (files.length === 0) return turn;
+    return { ...turn, items: [...items, webuiFileChangeSummaryItem(turnId, files)] };
+  };
+
+  const augmentTurnListWithStoredFileSummaries = (result: unknown, threadId: string): unknown => {
+    const state = deps.stateStore.read();
+    const threadPath = knownThreadPaths.get(threadId) ?? (state.activeThreadId === threadId ? state.activeThreadPath : null);
+    const validatedPath = validatedThreadPath(state, threadId, null, threadPath);
+    const store = openFileEditStore(validatedPath, { readonly: true });
+    if (!store) return result;
+
     try {
-      const files = store.listTurnFiles(turnId);
-      for (const file of files) {
-        const after = await readCurrentFileForDiff(file.path);
-        store.finalizeFile({ turnId, path: file.path, after });
+      const augmentTurns = (turns: unknown[]) => turns.map((turn) => augmentTurnWithStoredFileSummary(turn, (turnId) => store.listTurnFiles(turnId)));
+
+      if (Array.isArray(result)) return augmentTurns(result);
+      if (!isRecord(result)) return result;
+
+      let next: Record<string, unknown> = result;
+      if (Array.isArray(result.data)) next = { ...next, data: augmentTurns(result.data) };
+      if (Array.isArray(result.turns)) next = { ...next, turns: augmentTurns(result.turns) };
+      if (isRecord(result.thread) && Array.isArray(result.thread.turns)) {
+        next = { ...next, thread: { ...result.thread, turns: augmentTurns(result.thread.turns) } };
       }
+      return next;
     } finally {
       store.close();
+    }
+  };
+
+  const drainPatchCaptureQueue = (): Promise<void> | null => {
+    if (patchCaptureQueueDepth === 0) return null;
+    return patchCaptureChain.catch((error) => {
+      logWarn('Failed to drain file edit capture queue', error);
+    });
+  };
+
+  const finalizeTurnFileDiffs = (threadPath: string | null, turnId: string): boolean | Promise<boolean> => {
+    if (!threadPath || !nodePath.isAbsolute(threadPath) || !fsSync.existsSync(sessionFileEditDbPath(threadPath))) return false;
+    const store = openFileEditStore(threadPath);
+    if (!store) return false;
+
+    let files: ReturnType<FileEditStore['listTurnFiles']>;
+    try {
+      files = store.listTurnFiles(turnId);
+      if (files.length === 0) {
+        store.close();
+        return false;
+      }
+    } catch (error) {
+      store.close();
+      throw error;
+    }
+
+    const finalize = async () => {
+      try {
+        for (const file of files) {
+          const after = await readCurrentFileForDiff(file.path);
+          store.finalizeFile({ turnId, path: file.path, after });
+        }
+        return true;
+      } finally {
+        store.close();
+      }
+    };
+
+    return finalize();
+  };
+
+  const finalizeTurnFileSummary = async (threadId: string | null, turnId: string, threadPath: string | null) => {
+    const drain = drainPatchCaptureQueue();
+    if (drain) await drain;
+    const state = deps.stateStore.read();
+    const key = turnKey(threadId, turnId);
+    const finalizeThreadPath =
+      threadPath ??
+      turnThreadPaths.get(key) ??
+      turnThreadPaths.get(turnKey(null, turnId)) ??
+      (!threadId || threadId === state.activeThreadId ? state.activeThreadPath : null);
+    const finalized = finalizeTurnFileDiffs(finalizeThreadPath, turnId);
+    const hasChanges = typeof finalized === 'boolean' ? finalized : await finalized;
+    const broadcastThreadId = threadId ?? (state.activeTurnId === turnId ? state.activeThreadId : null);
+    if (hasChanges && broadcastThreadId) broadcastFileChangeSummaryChanged(broadcastThreadId, turnId);
+    return hasChanges;
+  };
+
+  const finalizeActiveTurnBeforeClear = async (threadId: string | null, turnId: string, threadPath: string | null) => {
+    try {
+      return await finalizeTurnFileSummary(threadId, turnId, threadPath);
+    } catch (error) {
+      logWarn('Failed to finalize stopped file edit diffs', error);
+      return false;
     }
   };
 
@@ -1683,9 +1779,8 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         const finalizeThreadPath =
           (completionKey ? turnThreadPaths.get(completionKey) : null) ??
           (!threadIdToFinalize || threadIdToFinalize === current.activeThreadId ? current.activeThreadPath : null);
-        await finalizeTurnFileDiffs(finalizeThreadPath, turnIdToFinalize);
+        await finalizeTurnFileSummary(threadIdToFinalize, turnIdToFinalize, finalizeThreadPath);
         finalizedForCompletionKey = true;
-        if (threadIdToFinalize) broadcastFileChangeSummaryChanged(threadIdToFinalize, turnIdToFinalize);
       } catch (error) {
         logWarn('Failed to finalize file edit diffs', error);
       }
@@ -1861,10 +1956,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
     if (message.method === 'event_msg') {
       enqueuePatchApplyEnd(message);
-      if (isTaskCompleteEvent(message)) void handleTurnCompleted(message);
+      if (isTaskTerminalEvent(message)) void handleTurnCompleted(message);
     }
     if (message.method === 'item/completed') enqueueStructuredFileChange(message);
-    if (message.method === 'turn/completed') void handleTurnCompleted(message);
+    if (message.method === 'turn/completed' || message.method === 'turn/failed' || message.method === 'turn/interrupted') void handleTurnCompleted(message);
     if (message.method === 'thread/compacted') void handleTurnCompleted(message);
   });
 
@@ -1884,7 +1979,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       pendingServerRequests.clear();
       const current = deps.stateStore.read();
       if (current.activeTurnId) {
-        clearActiveTurn({}, { broadcast: true });
+        const { activeThreadId, activeThreadPath, activeTurnId } = current;
+        void finalizeActiveTurnBeforeClear(activeThreadId, activeTurnId, activeThreadPath).finally(() => {
+          clearActiveTurn({ threadId: activeThreadId, turnId: activeTurnId }, { broadcast: true });
+        });
         return;
       }
     }
@@ -2234,6 +2332,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           const threadId = getOptionalString(request.params, 'threadId');
           const threadPath = getOptionalString(request.params, 'threadPath');
 
+          {
+            const drain = drainPatchCaptureQueue();
+            if (drain) await drain;
+          }
           send(ws, { type: 'rpc/result', id: request.id, result: { turnId, files: listStoredTurnFiles(turnId, threadId, threadPath) } });
           return;
         }
@@ -2249,6 +2351,9 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           try {
             await ensureThreadResumed(params.threadId);
             result = await requestCodex('thread/turns/list', params);
+            const drain = drainPatchCaptureQueue();
+            if (drain) await drain;
+            result = augmentTurnListWithStoredFileSummaries(result, params.threadId);
           } catch (error) {
             if (isMissingThreadError(error)) clearMissingActiveThread(params.threadId, error);
             throw error;
@@ -2359,6 +2464,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             throw new Error('no active turn to interrupt');
           }
           if (!state.activeThreadId) {
+            await finalizeActiveTurnBeforeClear(null, state.activeTurnId, state.activeThreadPath);
             const next = clearActiveTurn({ turnId: state.activeTurnId }, { broadcast: false });
             send(ws, { type: 'rpc/result', id: request.id, result: { ok: false, cleared: true, error: 'active turn has no thread' } });
             broadcastHello(next);
@@ -2367,8 +2473,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
           const activeThreadId = state.activeThreadId;
           const activeTurnId = state.activeTurnId;
+          const activeThreadPath = state.activeThreadPath;
           const health = deps.codex.health();
           if (!health.connected || health.dead) {
+            await finalizeActiveTurnBeforeClear(activeThreadId, activeTurnId, activeThreadPath);
             const next = clearActiveTurn({ threadId: activeThreadId, turnId: activeTurnId }, { broadcast: false });
             send(ws, {
               type: 'rpc/result',
@@ -2385,11 +2493,13 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
               threadId: activeThreadId,
               turnId: activeTurnId,
             });
+            await finalizeActiveTurnBeforeClear(activeThreadId, activeTurnId, activeThreadPath);
             const next = clearActiveTurn({ threadId: activeThreadId, turnId: activeTurnId }, { broadcast: false });
             send(ws, { type: 'rpc/result', id: request.id, result });
             broadcastHello(next);
           } catch (error) {
             if (!shouldClearActiveTurnAfterInterruptFailure(error)) throw error;
+            await finalizeActiveTurnBeforeClear(activeThreadId, activeTurnId, activeThreadPath);
             const next = clearActiveTurn({ threadId: activeThreadId, turnId: activeTurnId }, { broadcast: false });
             send(ws, {
               type: 'rpc/result',
