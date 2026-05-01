@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import {
   approvalItemsFromRequests,
+  claimedQueuedUserItemsWithoutHistory,
+  claimedQueuedUserItemsFromQueueTransition,
   liveStreamingItemFromNotifications,
   mergeRetainedLiveTurnItems,
   mergeTimelineItemsByTimestamp,
@@ -14,11 +16,13 @@ import {
   liveTimelineItemsFromNotifications,
   liveTurnItemsFromNotifications,
   requestKey,
+  pendingUserItemsWithoutHistory,
   shouldShowLiveStreamingItem,
   timelineItemsWithLiveTurnOverlay,
   withTimelineNotificationMeta,
   turnToTimelineItems,
   trimTimelineWindow,
+  visibleRetainedLiveTurnItemsForTimeline,
   visibleLiveTurnItemsForTimeline,
 } from '../../src/lib/timeline';
 import type { TimelineItem } from '../../src/lib/timeline';
@@ -496,6 +500,203 @@ describe('timeline', () => {
       { id: 'turn-1:a1', kind: 'assistant', timestamp: 1000, text: 'Previous answer.', phase: 'final_answer', turnId: 'turn-1' },
     ];
     expect(mergeRetainedLiveTurnItems(caughtUpHistory, retained, [])).toEqual([]);
+  });
+
+  it('retains old live items when active turn transitions directly to a pending start', () => {
+    const previousLiveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', message: 'Previous answer.', phase: 'final_answer', turn_id: 'turn-1' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      1000,
+    );
+    const staleHistory: TimelineItem[] = [
+      { id: 'turn-0:a1', kind: 'assistant', timestamp: 500, text: 'Older persisted answer.', phase: null, turnId: 'turn-0' },
+    ];
+
+    const retained = mergeRetainedLiveTurnItems(staleHistory, [], previousLiveItems);
+    const pendingWindow = nextLiveNotificationWindow(
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1', startCount: 5 },
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-start-pending:thread-1' },
+      8,
+    );
+
+    expect(pendingWindow).toEqual({ activeThreadId: 'thread-1', activeTurnId: 'turn-start-pending:thread-1', startCount: 8 });
+    expect(visibleRetainedLiveTurnItemsForTimeline(staleHistory, [], retained)).toEqual(retained);
+  });
+
+  it('does not hide retained live output because a new live turn reuses a synthetic id and text', () => {
+    const retained: TimelineItem[] = [
+      {
+        id: 'live:streaming:unscoped:1',
+        kind: 'streaming',
+        timestamp: 1,
+        text: 'same partial',
+        active: false,
+        turnId: 'turn-1',
+      },
+    ];
+    const newLive: TimelineItem[] = [
+      {
+        id: 'live:streaming:unscoped:1',
+        kind: 'streaming',
+        timestamp: 2,
+        text: 'same partial',
+        active: true,
+        turnId: 'turn-2',
+      },
+    ];
+
+    expect(visibleRetainedLiveTurnItemsForTimeline([], newLive, retained)).toEqual(retained);
+  });
+
+  it('hides retained live output while the same live item is still current for the same turn', () => {
+    const retained: TimelineItem[] = [
+      {
+        id: 'live:streaming:turn-1:1',
+        kind: 'streaming',
+        timestamp: 1,
+        text: 'same partial',
+        active: false,
+        turnId: 'turn-1',
+      },
+    ];
+    const currentLive: TimelineItem[] = [
+      {
+        id: 'live:streaming:turn-1:1',
+        kind: 'streaming',
+        timestamp: 2,
+        text: 'same partial',
+        active: true,
+        turnId: 'turn-1',
+      },
+    ];
+
+    expect(visibleRetainedLiveTurnItemsForTimeline([], currentLive, retained)).toEqual([]);
+  });
+
+  it('keeps a claimed queued prompt visible until persisted history confirms it', () => {
+    const previousQueue = [{ id: 'queued-1', text: 'queued prompt', createdAt: 1000 }];
+    const claimed = claimedQueuedUserItemsFromQueueTransition(
+      previousQueue,
+      [],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-start-pending:thread-1' },
+      () => 10,
+    );
+
+    expect(claimed).toEqual([
+      { id: 'claimed-queued:user:queued-1', kind: 'user', timestamp: 1000, sortOrder: 10, text: 'queued prompt' },
+    ]);
+    expect(pendingUserItemsWithoutHistory([], claimed)).toEqual(claimed);
+    expect(
+      claimedQueuedUserItemsWithoutHistory([{ id: 'turn-2:u1', kind: 'user', timestamp: 1500, text: 'queued prompt' }], claimed),
+    ).toEqual([]);
+  });
+
+  it('does not confirm a claimed queued prompt from an earlier identical user message', () => {
+    const claimed: Extract<TimelineItem, { kind: 'user' }>[] = [
+      { id: 'claimed-queued:user:queued-1', kind: 'user', timestamp: 1000, sortOrder: 10, text: 'same' },
+    ];
+
+    expect(
+      claimedQueuedUserItemsWithoutHistory([{ id: 'turn-old:u1', kind: 'user', timestamp: 900, text: 'same' }], claimed),
+    ).toEqual(claimed);
+    expect(
+      claimedQueuedUserItemsWithoutHistory([{ id: 'turn-new:u1', kind: 'user', timestamp: 1500, text: 'same' }], claimed),
+    ).toEqual([]);
+  });
+
+  it('claims a timed-out queued prompt when a late real turn starts from idle', () => {
+    const claimed = claimedQueuedUserItemsFromQueueTransition(
+      [{ id: 'queued-1', text: 'late prompt', createdAt: 1000 }],
+      [],
+      { activeThreadId: 'thread-1', activeTurnId: null },
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-late' },
+      () => 10,
+    );
+
+    expect(claimed).toEqual([
+      { id: 'claimed-queued:user:queued-1', kind: 'user', timestamp: 1000, sortOrder: 10, text: 'late prompt' },
+    ]);
+  });
+
+  it('uses strict history confirmation for newly claimed queued prompts', () => {
+    const claimed = claimedQueuedUserItemsFromQueueTransition(
+      [{ id: 'queued-1', text: 'same', createdAt: 1000 }],
+      [],
+      { activeThreadId: 'thread-1', activeTurnId: null },
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-late' },
+      () => 10,
+    );
+
+    expect(claimedQueuedUserItemsWithoutHistory([{ id: 'turn-old:u1', kind: 'user', timestamp: 900, text: 'same' }], claimed)).toEqual(
+      claimed,
+    );
+    expect(claimedQueuedUserItemsWithoutHistory([{ id: 'turn-new:u1', kind: 'user', timestamp: 1500, text: 'same' }], claimed)).toEqual(
+      [],
+    );
+  });
+
+  it('claims only the first removed queued head on an active-turn transition', () => {
+    const claimed = claimedQueuedUserItemsFromQueueTransition(
+      [
+        { id: 'queued-1', text: 'first', createdAt: 1000 },
+        { id: 'queued-2', text: 'second', createdAt: 1001 },
+      ],
+      [],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-start-pending:thread-1' },
+      () => 10,
+    );
+
+    expect(claimed).toEqual([
+      { id: 'claimed-queued:user:queued-1', kind: 'user', timestamp: 1000, sortOrder: 10, text: 'first' },
+    ]);
+  });
+
+  it('does not claim removed queued prompts after the queue head remains visible', () => {
+    expect(
+      claimedQueuedUserItemsFromQueueTransition(
+        [
+          { id: 'queued-1', text: 'first', createdAt: 1000 },
+          { id: 'queued-2', text: 'second', createdAt: 1001 },
+        ],
+        [{ id: 'queued-1', text: 'first', createdAt: 1000 }],
+        { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+        { activeThreadId: 'thread-1', activeTurnId: 'turn-start-pending:thread-1' },
+        () => 10,
+      ),
+    ).toEqual([]);
+  });
+
+  it('caps retained claimed queued prompts after history cleanup', () => {
+    const claimed = Array.from({ length: 55 }, (_, index): Extract<TimelineItem, { kind: 'user' }> => ({
+      id: `claimed-queued:user:queued-${index + 1}`,
+      kind: 'user',
+      timestamp: index + 1,
+      sortOrder: index + 1,
+      text: `prompt ${index + 1}`,
+    }));
+
+    const visible = claimedQueuedUserItemsWithoutHistory([], claimed);
+
+    expect(visible).toHaveLength(50);
+    expect(visible[0].id).toBe('claimed-queued:user:queued-6');
+    expect(visible.at(-1)?.id).toBe('claimed-queued:user:queued-55');
+  });
+
+  it('does not claim manually removed queued prompts without an active-turn transition', () => {
+    expect(
+      claimedQueuedUserItemsFromQueueTransition(
+        [{ id: 'queued-1', text: 'queued prompt', createdAt: 1000 }],
+        [],
+        { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+        { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+        () => 10,
+      ),
+    ).toEqual([]);
   });
 
   it('preserves the pending submit notification window until the real turn id appears', () => {

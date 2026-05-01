@@ -66,6 +66,7 @@ const NOTIFICATION_META_KEY = '__codexWebUiNotificationMeta';
 const SYNTHETIC_PENDING_TURN_PREFIXES = ['turn-start-pending:', 'compact-pending:'];
 const TERMINAL_EVENT_TYPES = new Set(['task_complete', 'task_failed', 'task_interrupted']);
 const TERMINAL_NOTIFICATION_METHODS = new Set(['turn/completed', 'turn/failed', 'turn/interrupted', 'thread/compacted']);
+const CLAIMED_QUEUED_USER_ITEM_LIMIT = 50;
 
 export function withTimelineNotificationMeta(notification: unknown, meta: TimelineNotificationMeta): unknown {
   if (!isRecord(notification)) return notification;
@@ -124,9 +125,9 @@ function notificationPayload(notification: unknown): unknown {
   if (!isRecord(notification)) return null;
   const params = notification.params;
   if (isRecord(params) && isRecord(params.payload)) return params.payload;
+  if (isRecord(notification.payload)) return notification.payload;
   if (isRecord(params)) return params;
-  const payload = notification.payload;
-  return isRecord(payload) ? payload : null;
+  return null;
 }
 
 export function notificationThreadId(notification: unknown): string | null {
@@ -794,6 +795,82 @@ export function visibleLiveTurnItemsForTimeline(items: TimelineItem[], liveItems
     if (text && persistedAssistantTexts.has(`${turnId}\0${text}`)) return false;
     return true;
   });
+}
+
+export function visibleRetainedLiveTurnItemsForTimeline(
+  historyItems: TimelineItem[],
+  currentLiveItems: TimelineItem[],
+  retainedItems: TimelineItem[],
+): TimelineItem[] {
+  const currentLiveKeys = new Set(currentLiveItems.map(liveCurrentDuplicateKey));
+  return visibleLiveTurnItemsForTimeline(historyItems, retainedItems).filter((item) => !currentLiveKeys.has(liveCurrentDuplicateKey(item)));
+}
+
+export function pendingUserItemsWithoutHistory<T extends Extract<TimelineItem, { kind: 'user' }>>(historyItems: TimelineItem[], pendingItems: T[]): T[] {
+  return pendingItems.filter(
+    (pending) =>
+      !historyItems.some(
+        (item) => item.kind === 'user' && item.text.trim() === pending.text.trim() && item.timestamp >= pending.timestamp - 60_000,
+      ),
+  );
+}
+
+export function claimedQueuedUserItemsWithoutHistory<T extends Extract<TimelineItem, { kind: 'user' }>>(historyItems: TimelineItem[], pendingItems: T[]): T[] {
+  const visible = pendingItems.filter(
+    (pending) =>
+      !historyItems.some(
+        (item) => item.kind === 'user' && item.text.trim() === pending.text.trim() && item.timestamp >= pending.timestamp,
+      ),
+  );
+  return visible.length > CLAIMED_QUEUED_USER_ITEM_LIMIT ? visible.slice(-CLAIMED_QUEUED_USER_ITEM_LIMIT) : visible;
+}
+
+function liveCurrentDuplicateKey(item: TimelineItem): string {
+  const turnId = timelineItemTurnId(item) ?? 'unscoped';
+  if (item.kind === 'assistant' || item.kind === 'streaming') {
+    return `${item.kind}:${item.id}:${turnId}:${normalizedMessageBlock(item.text)}`;
+  }
+  return `${item.kind}:${item.id}:${turnId}`;
+}
+
+type QueuedTimelineMessage = Extract<TimelineItem, { kind: 'queued' }>['message'];
+
+function claimedQueuedUserItemId(messageId: string): string {
+  return `claimed-queued:user:${messageId}`;
+}
+
+export function claimedQueuedMessageIdFromPendingUserItem(item: Extract<TimelineItem, { kind: 'user' }>): string | null {
+  const prefix = 'claimed-queued:user:';
+  return item.id.startsWith(prefix) ? item.id.slice(prefix.length) : null;
+}
+
+export function claimedQueuedUserItemsFromQueueTransition(
+  previousQueue: QueuedTimelineMessage[],
+  currentQueue: QueuedTimelineMessage[],
+  previousScope: TimelineNotificationScope,
+  currentScope: TimelineNotificationScope,
+  sortOrderForId: (id: string) => number,
+): Extract<TimelineItem, { kind: 'user' }>[] {
+  const previousTurnId = previousScope.activeTurnId;
+  const currentTurnId = currentScope.activeTurnId;
+  if (!currentTurnId) return [];
+  if (previousScope.activeThreadId !== currentScope.activeThreadId) return [];
+  if (previousTurnId === currentTurnId) return [];
+  if (isSyntheticPendingTurnId(previousTurnId)) return [];
+  if (!previousTurnId && isSyntheticPendingTurnId(currentTurnId)) return [];
+
+  const currentIds = new Set(currentQueue.map((message) => message.id));
+  const removedHeadMessage = previousQueue[0] && !currentIds.has(previousQueue[0].id) ? previousQueue[0] : null;
+  if (!removedHeadMessage) return [];
+
+  const id = claimedQueuedUserItemId(removedHeadMessage.id);
+  return [{
+    id,
+    kind: 'user',
+    timestamp: removedHeadMessage.createdAt,
+    sortOrder: sortOrderForId(id),
+    text: removedHeadMessage.text,
+  }];
 }
 
 function liveRetentionKey(item: TimelineItem): string {

@@ -31,6 +31,9 @@ import { newSessionInitialCwd } from './lib/sessionDefaults';
 import { parseSlashCommand } from './lib/slashCommands';
 import {
   approvalItemsFromRequests,
+  claimedQueuedMessageIdFromPendingUserItem,
+  claimedQueuedUserItemsWithoutHistory,
+  claimedQueuedUserItemsFromQueueTransition,
   fileChangeHasInlineDiff,
   latestCompletionNotificationCount,
   isSyntheticPendingTurnId,
@@ -40,8 +43,10 @@ import {
   nextLiveNotificationWindow,
   notificationsSinceCount,
   notificationMatchesActiveTurn,
+  pendingUserItemsWithoutHistory,
   requestKey,
   timelineItemsWithLiveTurnOverlay,
+  visibleRetainedLiveTurnItemsForTimeline,
   visibleLiveTurnItemsForTimeline,
   type TimelineItem,
 } from './lib/timeline';
@@ -198,6 +203,7 @@ export default function App() {
   const [activeFileSummary, setActiveFileSummary] = useState<ActiveFileSummary | null>(null);
   const [ephemeralItems, setEphemeralItems] = useState<TimelineItem[]>([]);
   const [pendingUserItems, setPendingUserItems] = useState<UserTimelineItem[]>([]);
+  const [claimedQueuedUserItems, setClaimedQueuedUserItems] = useState<UserTimelineItem[]>([]);
   const [retainedLiveTurnItems, setRetainedLiveTurnItems] = useState<TimelineItem[]>([]);
   const [retainedFileSummaryItems, setRetainedFileSummaryItems] = useState<FileChangeSummaryTimelineItem[]>([]);
   const [pendingCompactionThreadId, setPendingCompactionThreadId] = useState<string | null>(null);
@@ -215,6 +221,17 @@ export default function App() {
   const [pendingTurnWindow, setPendingTurnWindow] = useState<{ id: string; threadId: string | null; startCount: number } | null>(null);
   const activeFileSummaryScopeRef = useRef({ threadId: activeThreadId, threadPath: activeThreadPath, turnId: state?.activeTurnId ?? null });
   const previousActiveTurnRef = useRef({ threadId: activeThreadId, threadPath: activeThreadPath, turnId: state?.activeTurnId ?? null });
+  const previousLiveTurnSnapshotRef = useRef<{
+    threadId: string | null;
+    turnId: string | null;
+    historyItems: TimelineItem[];
+    liveItems: TimelineItem[];
+  }>({ threadId: activeThreadId, turnId: state?.activeTurnId ?? null, historyItems: [], liveItems: [] });
+  const previousQueueSnapshotRef = useRef({
+    activeThreadId,
+    activeTurnId: state?.activeTurnId ?? null,
+    queue: state?.queue ?? [],
+  });
   const finalizedFileSummaryFetchesRef = useRef(new Set<string>());
   const liveNotificationWindowRef = useRef({ activeThreadId, activeTurnId: state?.activeTurnId ?? null, startCount: socket.notificationCount });
   const lastHandledCompletionCountRef = useRef<number | null>(null);
@@ -287,7 +304,7 @@ export default function App() {
     [liveTurnItems, timelineItemsForChat],
   );
   const visibleRetainedLiveTurnItems = useMemo(
-    () => visibleLiveTurnItemsForTimeline([...timelineItemsForChat, ...visibleLiveTurnItems], retainedLiveTurnItems),
+    () => visibleRetainedLiveTurnItemsForTimeline(timelineItemsForChat, visibleLiveTurnItems, retainedLiveTurnItems),
     [retainedLiveTurnItems, timelineItemsForChat, visibleLiveTurnItems],
   );
   const historyFileSummaryTurnIds = useMemo(
@@ -329,12 +346,13 @@ export default function App() {
       ...visibleRetainedLiveTurnItems,
       ...visibleRetainedFileSummaryItems,
       ...pendingUserItems,
+      ...claimedQueuedUserItems,
       ...queuedTimelineItems,
       ...ephemeralItems,
       ...visibleLiveTurnItems,
       ...approvalItems,
     ]);
-  }, [approvalItems, ephemeralItems, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items, timelineItemsForChat, visibleLiveTurnItems, visibleRetainedFileSummaryItems, visibleRetainedLiveTurnItems]);
+  }, [approvalItems, claimedQueuedUserItems, ephemeralItems, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items, timelineItemsForChat, visibleLiveTurnItems, visibleRetainedFileSummaryItems, visibleRetainedLiveTurnItems]);
   const runOptions = useMemo<CodexRunOptions>(() => ({ model, mode: effectiveMode(mode, model), effort, sandbox }), [effort, mode, model, sandbox]);
   const isRunning = Boolean(state?.activeTurnId || (pendingCompactionThreadId && pendingCompactionThreadId === activeThreadId));
 
@@ -376,8 +394,32 @@ export default function App() {
   }, [appendRetainedFileSummary, socket.connectionState, socket.rpc]);
 
   useEffect(() => {
-    if (state?.queue) replaceQueue(state.queue);
-  }, [replaceQueue, state?.queue]);
+    if (!state?.queue) return;
+    const nextQueue = state.queue;
+    const previous = previousQueueSnapshotRef.current;
+    const currentScope = { activeThreadId, activeTurnId: state.activeTurnId ?? null };
+    const claimed = claimedQueuedUserItemsFromQueueTransition(
+      previous.queue,
+      nextQueue,
+      { activeThreadId: previous.activeThreadId, activeTurnId: previous.activeTurnId },
+      currentScope,
+      localSortOrder,
+    );
+    const nextQueueIds = new Set(nextQueue.map((message) => message.id));
+
+    setClaimedQueuedUserItems((current) => {
+      const existingIds = new Set(current.map((item) => item.id));
+      const retained = claimedQueuedUserItemsWithoutHistory(timeline.items, current).filter((item) => {
+        const claimedMessageId = claimedQueuedMessageIdFromPendingUserItem(item);
+        return !claimedMessageId || !nextQueueIds.has(claimedMessageId);
+      });
+      const additions = claimedQueuedUserItemsWithoutHistory(timeline.items, claimed.filter((item) => !existingIds.has(item.id)));
+      return additions.length === 0 && retained.length === current.length ? current : [...retained, ...additions];
+    });
+
+    previousQueueSnapshotRef.current = { ...currentScope, queue: nextQueue };
+    replaceQueue(nextQueue);
+  }, [activeThreadId, localSortOrder, replaceQueue, state?.activeTurnId, state?.queue, timeline.items]);
 
   useEffect(() => {
     activeFileSummaryScopeRef.current = { threadId: activeThreadId, threadPath: activeThreadPath, turnId: state?.activeTurnId ?? null };
@@ -386,6 +428,7 @@ export default function App() {
   useEffect(() => {
     setEphemeralItems([]);
     setPendingUserItems([]);
+    setClaimedQueuedUserItems([]);
     setRetainedLiveTurnItems([]);
     setRetainedFileSummaryItems([]);
     setAnsweredApprovals(new Set());
@@ -397,6 +440,27 @@ export default function App() {
   useEffect(() => {
     updateRetainedLiveTurnItems(timelineItemsForChat);
   }, [timelineItemsForChat, updateRetainedLiveTurnItems]);
+
+  useEffect(() => {
+    const currentTurnId = state?.activeTurnId ?? null;
+    const previous = previousLiveTurnSnapshotRef.current;
+    const previousRealTurnEnded =
+      previous.threadId === activeThreadId &&
+      Boolean(previous.turnId) &&
+      previous.turnId !== currentTurnId &&
+      !isSyntheticPendingTurnId(previous.turnId);
+
+    if (previousRealTurnEnded && previous.liveItems.length > 0) {
+      updateRetainedLiveTurnItems(previous.historyItems, previous.liveItems);
+    }
+
+    previousLiveTurnSnapshotRef.current = {
+      threadId: activeThreadId,
+      turnId: currentTurnId,
+      historyItems: timelineItemsForChat,
+      liveItems: visibleLiveTurnItems,
+    };
+  }, [activeThreadId, state?.activeTurnId, timelineItemsForChat, updateRetainedLiveTurnItems, visibleLiveTurnItems]);
 
   useEffect(() => {
     setRetainedFileSummaryItems((current) => {
@@ -473,14 +537,8 @@ export default function App() {
   }, [activeThreadId, lastNotification, loadActiveFileSummary, state?.activeTurnId]);
 
   useEffect(() => {
-    setPendingUserItems((items) =>
-      items.filter(
-        (pending) =>
-          !timeline.items.some(
-            (item) => item.kind === 'user' && item.text.trim() === pending.text.trim() && item.timestamp >= pending.timestamp - 60_000,
-          ),
-      ),
-    );
+    setPendingUserItems((items) => pendingUserItemsWithoutHistory(timeline.items, items));
+    setClaimedQueuedUserItems((items) => claimedQueuedUserItemsWithoutHistory(timeline.items, items));
   }, [timeline.items]);
 
   useEffect(() => {
