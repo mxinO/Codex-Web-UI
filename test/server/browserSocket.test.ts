@@ -2501,6 +2501,12 @@ describe('attachBrowserSocket app-server lifecycle', () => {
       persistExtendedHistory: true,
       excludeTurns: true,
     });
+    expect(request).toHaveBeenNthCalledWith(2, 'thread/turns/list', {
+      threadId: 'thread-1',
+      cursor: null,
+      limit: 50,
+      sortDirection: 'desc',
+    }, 120000);
     expect(start.mock.invocationCallOrder[0]).toBeLessThan(request.mock.invocationCallOrder[0]);
   });
 

@@ -11,6 +11,7 @@ interface ChatTimelineProps {
   showJumpToLatest: boolean;
   showActivityRunning?: boolean;
   loading?: boolean;
+  loadError?: string | null;
   onOpenDetail: (item: TimelineItem) => void;
   onApprovalDecision: (item: Extract<TimelineItem, { kind: 'approval' }>, decision: unknown) => Promise<void>;
   onQueuedEdit?: (message: Extract<TimelineItem, { kind: 'queued' }>['message']) => void;
@@ -79,6 +80,7 @@ export default function ChatTimeline({
   showJumpToLatest,
   showActivityRunning = false,
   loading = false,
+  loadError = null,
   onOpenDetail,
   onApprovalDecision,
   onQueuedEdit,
@@ -245,7 +247,20 @@ export default function ChatTimeline({
         {showActivityRunning && !runningAppendsToLastActivity && (
           <ActivityBlock key="activity:running" items={[]} running onOpenDetail={onOpenDetail} />
         )}
-        {items.length === 0 && !showActivityRunning && <div className="chat-empty">{loading ? 'Loading messages...' : 'No messages loaded.'}</div>}
+        {items.length === 0 && !showActivityRunning && (
+          <div className={`chat-empty${loadError && !loading ? ' chat-empty--error' : ''}`}>
+            {loading ? (
+              'Loading messages...'
+            ) : loadError ? (
+              <>
+                <span>Failed to load messages. Retrying...</span>
+                <span className="chat-empty__detail">{loadError}</span>
+              </>
+            ) : (
+              'No messages loaded.'
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

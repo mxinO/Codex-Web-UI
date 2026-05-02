@@ -64,6 +64,14 @@ afterEach(() => {
 });
 
 describe('ChatTimeline', () => {
+  it('shows a retrying load error instead of an empty-history message', () => {
+    render(<ChatTimeline {...baseProps} items={emptyItems} loadError="RPC request timed out: thread/turns/list" />);
+
+    expect(document.body.textContent).toContain('Failed to load messages. Retrying...');
+    expect(document.body.textContent).toContain('RPC request timed out: thread/turns/list');
+    expect(document.body.textContent).not.toContain('No messages loaded.');
+  });
+
   it('shows a jump-to-latest action while an older page is displayed', () => {
     const onJumpToLatest = vi.fn();
 

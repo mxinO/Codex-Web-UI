@@ -113,6 +113,7 @@ const FILE_DIFF_PATCH_MAX_PENDING_NOTIFICATIONS = 100;
 const FILE_DIFF_PATCH_MAX_INCOMPLETE_TURNS = 200;
 const COMPACTION_PENDING_TURN_PREFIX = 'compact-pending:';
 const TURN_START_PENDING_TURN_PREFIX = 'turn-start-pending:';
+const THREAD_TURNS_LIST_RPC_TIMEOUT_MS = 2 * 60 * 1000;
 const TURN_START_RPC_TIMEOUT_MS = 10 * 60 * 1000;
 const RECENT_NOTIFICATION_MAX_ENTRIES = 500;
 const RECENT_NOTIFICATION_MAX_BYTES = 2 * 1024 * 1024;
@@ -2478,7 +2479,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           let result: unknown;
           try {
             await ensureThreadResumed(params.threadId);
-            result = await requestCodex('thread/turns/list', params);
+            result = await requestCodex('thread/turns/list', params, THREAD_TURNS_LIST_RPC_TIMEOUT_MS);
             const drain = drainPatchCaptureQueue();
             if (drain) await drain;
             result = augmentTurnListWithStoredFileSummaries(result, params.threadId);

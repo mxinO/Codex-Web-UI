@@ -1249,7 +1249,20 @@ button.activity-card:focus-visible {
 .chat-empty {
   display: grid;
   min-height: 160px;
+  gap: 6px;
   place-items: center;
+  text-align: center;
+}
+
+.chat-empty--error {
+  color: var(--red);
+}
+
+.chat-empty__detail {
+  max-width: min(680px, 90%);
+  color: var(--text-secondary);
+  font-size: 12px;
+  overflow-wrap: anywhere;
 }
 
 .field-label {

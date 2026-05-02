@@ -80,6 +80,7 @@ afterEach(() => {
   act(() => {
     root?.unmount();
   });
+  vi.useRealTimers();
   container?.remove();
   root = null;
   container = null;
@@ -102,10 +103,51 @@ describe('useThreadTimeline', () => {
       limit: 12,
       sortDirection: 'desc',
       cursor: null,
-    });
+    }, 120000);
     expect(currentTimeline?.items.map(itemText)).toEqual(['older', 'newer']);
     expect(currentTimeline?.hasOlder).toBe(true);
     expect((currentTimeline as HookResult & { isViewingLatest?: boolean })?.isViewingLatest).toBe(true);
+  });
+
+  it('initial load failure exposes an error and retries the fixed-size latest page', async () => {
+    vi.useFakeTimers();
+    const failed = deferred<RpcResult>();
+    const retry = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(failed.promise).mockReturnValueOnce(retry.promise);
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      failed.reject(new Error('RPC request timed out: thread/turns/list'));
+      await failed.promise.catch(() => undefined);
+    });
+
+    expect(currentTimeline?.items).toEqual([]);
+    expect(currentTimeline?.loading).toBe(false);
+    expect(currentTimeline?.loadError).toBe('RPC request timed out: thread/turns/list');
+
+    await act(async () => {
+      vi.advanceTimersByTime(999);
+    });
+    expect(rpc).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(rpc).toHaveBeenCalledTimes(2);
+    expect(rpc).toHaveBeenLastCalledWith('thread/turns/list', {
+      threadId: 'thread-1',
+      limit: 12,
+      sortDirection: 'desc',
+      cursor: null,
+    }, 120000);
+
+    await act(async () => {
+      retry.resolve({ data: [makeTurn('turn-1')], nextCursor: null });
+      await retry.promise;
+    });
+
+    expect(currentTimeline?.items.map(itemText)).toEqual(['turn-1']);
+    expect(currentTimeline?.loadError).toBeNull();
   });
 
   it('loadOlder prepends older messages while preserving the latest page when under the window limit', async () => {
@@ -664,7 +706,7 @@ describe('useThreadTimeline', () => {
       limit: 12,
       sortDirection: 'desc',
       cursor: 'cursor-after-older',
-    });
+    }, 120000);
 
     await act(async () => {
       nextOlder.resolve({ data: [makeTurn('turn-1')], nextCursor: null });
@@ -772,7 +814,7 @@ describe('useThreadTimeline', () => {
       limit: 12,
       sortDirection: 'desc',
       cursor: null,
-    });
+    }, 120000);
     await act(async () => {
       latestAgain.resolve({ data: [makeTurn('latest-restored')], nextCursor: 'cursor-3' });
       await latestAgain.promise;
@@ -800,6 +842,36 @@ describe('useThreadTimeline', () => {
     });
 
     expect(currentTimeline?.items.map((item) => item.kind === 'assistant' ? item.text : '')).toEqual(['new-thread-turn']);
+  });
+
+  it('does not expose the previous thread older cursor while a new thread is loading', async () => {
+    const firstThread = deferred<RpcResult>();
+    const secondThread = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(firstThread.promise).mockReturnValueOnce(secondThread.promise);
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      firstThread.resolve({ data: [makeTurn('thread-1-latest')], nextCursor: 'thread-1-cursor' });
+      await firstThread.promise;
+    });
+    expect(currentTimeline?.hasOlder).toBe(true);
+
+    await rerenderHook('thread-2', asRpc(rpc));
+    expect(currentTimeline?.items).toEqual([]);
+    expect(currentTimeline?.hasOlder).toBe(false);
+    expect(currentTimeline?.loading).toBe(true);
+
+    await act(async () => {
+      currentTimeline?.loadOlder();
+    });
+    expect(rpc).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      secondThread.resolve({ data: [makeTurn('thread-2-latest')], nextCursor: null });
+      await secondThread.promise;
+    });
+
+    expect(currentTimeline?.items.map((item) => item.kind === 'assistant' ? item.text : '')).toEqual(['thread-2-latest']);
   });
 
   it('stale loadOlder request does not overwrite a newer thread', async () => {

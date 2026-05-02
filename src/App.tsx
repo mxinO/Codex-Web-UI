@@ -968,6 +968,7 @@ export default function App() {
                   showJumpToLatest={!timeline.isViewingLatest}
                   showActivityRunning={timeline.isViewingLatest && showActivityRunning}
                   loading={timeline.loading}
+                  loadError={timeline.loadError}
                   onOpenDetail={openDetailItem}
                   onApprovalDecision={respondToApproval}
                   onQueuedEdit={handleQueuedEdit}
