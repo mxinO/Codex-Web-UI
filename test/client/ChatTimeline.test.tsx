@@ -4,7 +4,7 @@ import React from 'react';
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import ChatTimeline from '../../src/components/ChatTimeline';
+import ChatTimeline, { INITIAL_RENDERED_GROUP_LIMIT, RENDERED_GROUP_INCREMENT } from '../../src/components/ChatTimeline';
 import type { TimelineItem } from '../../src/lib/timeline';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -20,6 +20,10 @@ const baseProps = {
 };
 let root: Root | null = null;
 let container: HTMLDivElement | null = null;
+
+function userItem(index: number): TimelineItem {
+  return { id: `u${index}`, kind: 'user', timestamp: index, text: `message ${index}` };
+}
 
 function render(node: React.ReactNode) {
   container = document.createElement('div');
@@ -100,13 +104,176 @@ describe('ChatTimeline', () => {
     );
 
     const scroller = document.querySelector<HTMLDivElement>('.chat-scroll');
-    Object.defineProperty(scroller, 'scrollTop', { configurable: true, value: 24 });
+    setScrollMetrics(scroller!, { scrollTop: 24, scrollHeight: 1000, clientHeight: 300 });
 
     act(() => {
       scroller?.dispatchEvent(new Event('scroll', { bubbles: true }));
     });
 
     expect(onLoadOlder).toHaveBeenCalledTimes(1);
+  });
+
+  it('renders only the latest loaded group window until the user scrolls up', () => {
+    const items = Array.from({ length: INITIAL_RENDERED_GROUP_LIMIT + 5 }, (_, index) => userItem(index));
+
+    render(<ChatTimeline {...baseProps} items={items} />);
+
+    const rows = Array.from(document.querySelectorAll('.chat-row--user'));
+    expect(rows).toHaveLength(INITIAL_RENDERED_GROUP_LIMIT);
+    expect(rows[0].textContent).toContain('message 5');
+    expect(document.body.textContent).not.toContain('message 0');
+  });
+
+  it('reveals loaded older groups before requesting another history page', () => {
+    const onLoadOlder = vi.fn();
+    const items = Array.from({ length: INITIAL_RENDERED_GROUP_LIMIT + 5 }, (_, index) => userItem(index));
+
+    render(<ChatTimeline {...baseProps} items={items} hasOlder onLoadOlder={onLoadOlder} />);
+
+    const scroller = document.querySelector<HTMLDivElement>('.chat-scroll');
+    setScrollMetrics(scroller!, { scrollTop: 24, scrollHeight: 1000, clientHeight: 300 });
+
+    act(() => {
+      scroller?.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    const expectedVisibleRows = Math.min(items.length, INITIAL_RENDERED_GROUP_LIMIT + RENDERED_GROUP_INCREMENT);
+    expect(document.querySelectorAll('.chat-row--user')).toHaveLength(expectedVisibleRows);
+    expect(document.body.textContent).toContain('message 0');
+    expect(onLoadOlder).not.toHaveBeenCalled();
+  });
+
+  it('collapses revealed older groups again when the user scrolls back to bottom', () => {
+    const items = Array.from({ length: INITIAL_RENDERED_GROUP_LIMIT + 5 }, (_, index) => userItem(index));
+
+    render(<ChatTimeline {...baseProps} items={items} />);
+
+    const scroller = document.querySelector<HTMLDivElement>('.chat-scroll');
+    setScrollMetrics(scroller!, { scrollTop: 24, scrollHeight: 1000, clientHeight: 300 });
+    act(() => {
+      scroller?.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    expect(document.querySelectorAll('.chat-row--user')).toHaveLength(items.length);
+    expect(document.body.textContent).toContain('message 0');
+
+    setScrollMetrics(scroller!, { scrollTop: 700, scrollHeight: 1000, clientHeight: 300 });
+    act(() => {
+      scroller?.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    const rows = Array.from(document.querySelectorAll('.chat-row--user'));
+    expect(rows).toHaveLength(INITIAL_RENDERED_GROUP_LIMIT);
+    expect(rows[0].textContent).toContain('message 5');
+    expect(document.body.textContent).not.toContain('message 0');
+  });
+
+  it('preserves the viewport when an older server page is prepended', () => {
+    const onLoadOlder = vi.fn();
+    const currentItems = Array.from({ length: INITIAL_RENDERED_GROUP_LIMIT }, (_, index) => userItem(index + 10));
+    const olderItems = Array.from({ length: 10 }, (_, index) => userItem(index));
+
+    render(<ChatTimeline {...baseProps} items={currentItems} hasOlder onLoadOlder={onLoadOlder} />);
+
+    const scroller = document.querySelector<HTMLDivElement>('.chat-scroll');
+    setScrollMetrics(scroller!, { scrollTop: 24, scrollHeight: 1000, clientHeight: 300 });
+
+    act(() => {
+      scroller?.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+    expect(scroller?.scrollTop).toBe(24);
+
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 1500 });
+    rerender(<ChatTimeline {...baseProps} items={[...olderItems, ...currentItems]} hasOlder onLoadOlder={onLoadOlder} />);
+
+    expect(scroller?.scrollTop).toBe(524);
+    expect(document.body.textContent).toContain('message 0');
+  });
+
+  it('keeps a pending older-page anchor stable across bottom appends', () => {
+    const onLoadOlder = vi.fn();
+    const currentItems = Array.from({ length: INITIAL_RENDERED_GROUP_LIMIT }, (_, index) => userItem(index + 10));
+    const olderItems = Array.from({ length: 10 }, (_, index) => userItem(index));
+    const appendedItem = userItem(999);
+
+    render(<ChatTimeline {...baseProps} items={currentItems} hasOlder onLoadOlder={onLoadOlder} />);
+
+    const scroller = document.querySelector<HTMLDivElement>('.chat-scroll');
+    setScrollMetrics(scroller!, { scrollTop: 24, scrollHeight: 1000, clientHeight: 300 });
+
+    act(() => {
+      scroller?.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 1100 });
+    rerender(<ChatTimeline {...baseProps} items={[...currentItems, appendedItem]} hasOlder loading onLoadOlder={onLoadOlder} />);
+
+    expect(scroller?.scrollTop).toBe(24);
+
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 1600 });
+    rerender(<ChatTimeline {...baseProps} items={[...olderItems, ...currentItems, appendedItem]} hasOlder={false} onLoadOlder={onLoadOlder} />);
+
+    expect(scroller?.scrollTop).toBe(524);
+    expect(document.body.textContent).toContain('message 0');
+    expect(document.body.textContent).toContain('message 999');
+  });
+
+  it('cancels a pending older-page anchor when the user scrolls back to bottom before it arrives', () => {
+    const onLoadOlder = vi.fn();
+    const currentItems = Array.from({ length: INITIAL_RENDERED_GROUP_LIMIT }, (_, index) => userItem(index + 10));
+    const olderItems = Array.from({ length: 10 }, (_, index) => userItem(index));
+
+    render(<ChatTimeline {...baseProps} items={currentItems} hasOlder onLoadOlder={onLoadOlder} />);
+
+    const scroller = document.querySelector<HTMLDivElement>('.chat-scroll');
+    setScrollMetrics(scroller!, { scrollTop: 24, scrollHeight: 1000, clientHeight: 300 });
+    act(() => {
+      scroller?.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    expect(onLoadOlder).toHaveBeenCalledTimes(1);
+
+    setScrollMetrics(scroller!, { scrollTop: 700, scrollHeight: 1000, clientHeight: 300 });
+    act(() => {
+      scroller?.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 1500 });
+    rerender(
+      <ChatTimeline
+        {...baseProps}
+        items={[...olderItems, ...currentItems]}
+        hasOlder={false}
+        showJumpToLatest
+        onLoadOlder={onLoadOlder}
+      />,
+    );
+
+    expect(scroller?.scrollTop).toBe(700);
+    expect(document.body.textContent).not.toContain('message 0');
+  });
+
+  it('keeps bottom auto-scroll enabled when short content is both top and bottom', () => {
+    const onLoadOlder = vi.fn();
+    const firstItem = userItem(1);
+    const secondItem = userItem(2);
+
+    render(<ChatTimeline {...baseProps} items={[firstItem]} hasOlder onLoadOlder={onLoadOlder} />);
+
+    const scroller = document.querySelector<HTMLDivElement>('.chat-scroll');
+    setScrollMetrics(scroller!, { scrollTop: 0, scrollHeight: 200, clientHeight: 300 });
+    act(() => {
+      scroller?.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    expect(onLoadOlder).not.toHaveBeenCalled();
+
+    Object.defineProperty(scroller, 'scrollHeight', { configurable: true, value: 500 });
+    rerender(<ChatTimeline {...baseProps} items={[firstItem, secondItem]} hasOlder onLoadOlder={onLoadOlder} />);
+
+    expect(scroller?.scrollTop).toBe(500);
   });
 
   it('keeps the latest message visible when new chat items appear', () => {

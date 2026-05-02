@@ -2,8 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { turnToTimelineItems, type TimelineItem } from '../lib/timeline';
 import type { CodexItem, CodexTurn } from '../types/codex';
 
-const PAGE_SIZE = 50;
-const WINDOW_TURN_LIMIT = 200;
+const PAGE_SIZE = 12;
+const WINDOW_TURN_LIMIT = 120;
 
 interface TurnListResult {
   data?: CodexTurn[];

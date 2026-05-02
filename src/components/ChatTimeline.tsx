@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, type UIEvent } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type UIEvent } from 'react';
 import type { TimelineItem } from '../lib/timeline';
 import ActivityBlock from './ActivityBlock';
 import ChatItem from './ChatItem';
@@ -20,6 +20,12 @@ interface ChatTimelineProps {
 }
 
 const BOTTOM_STICKY_THRESHOLD_PX = 80;
+export const INITIAL_RENDERED_GROUP_LIMIT = 60;
+export const RENDERED_GROUP_INCREMENT = 40;
+
+type ScrollPreservation =
+  | { mode: 'next-layout'; scrollHeight: number }
+  | { mode: 'server-prepend'; scrollHeight: number; oldestGroupKey: string | null; sawLoading: boolean };
 
 function isActivityItem(item: TimelineItem): boolean {
   return (
@@ -53,6 +59,14 @@ function groupTimelineItems(items: TimelineItem[]): Array<TimelineItem | Timelin
   return groups;
 }
 
+function groupKey(group: TimelineItem | TimelineItem[] | undefined): string | null {
+  if (!group) return null;
+  if (!Array.isArray(group)) return `item:${group.id}`;
+  const first = group[0]?.id ?? 'empty';
+  const last = group.at(-1)?.id ?? 'empty';
+  return `activity:${first}:${last}:${group.length}`;
+}
+
 function scrollToBottom(scroller: HTMLDivElement) {
   scroller.scrollTop = scroller.scrollHeight;
 }
@@ -75,12 +89,53 @@ export default function ChatTimeline({
   const scrollerRef = useRef<HTMLDivElement | null>(null);
   const columnRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
+  const previousGroupLengthRef = useRef(0);
+  const scrollPreservationRef = useRef<ScrollPreservation | null>(null);
+  const [visibleGroupCount, setVisibleGroupCount] = useState(INITIAL_RENDERED_GROUP_LIMIT);
+  const groups = useMemo(() => groupTimelineItems(items), [items]);
+  const hiddenLoadedGroupCount = Math.max(0, groups.length - visibleGroupCount);
+  const oldestGroupKey = groupKey(groups[0]);
+  const renderedGroups = useMemo(() => {
+    const start = Math.max(0, groups.length - visibleGroupCount);
+    return groups.slice(start);
+  }, [groups, visibleGroupCount]);
+  const lastGroupIndex = renderedGroups.length - 1;
+  const runningAppendsToLastActivity = showActivityRunning && lastGroupIndex >= 0 && Array.isArray(renderedGroups[lastGroupIndex]);
 
   useLayoutEffect(() => {
     const scroller = scrollerRef.current;
-    if (!scroller || showJumpToLatest || !stickToBottomRef.current) return;
+    if (!scroller) return;
+    const preservation = scrollPreservationRef.current;
+    if (preservation) {
+      if (preservation.mode === 'server-prepend') {
+        const prependedHistory = oldestGroupKey !== preservation.oldestGroupKey;
+        if (!prependedHistory) {
+          preservation.scrollHeight = scroller.scrollHeight;
+          if (loading) preservation.sawLoading = true;
+          else if (preservation.sawLoading) scrollPreservationRef.current = null;
+          return;
+        }
+      }
+      scrollPreservationRef.current = null;
+      scroller.scrollTop += scroller.scrollHeight - preservation.scrollHeight;
+      return;
+    }
+    if (showJumpToLatest || !stickToBottomRef.current) return;
     scrollToBottom(scroller);
-  }, [items, showActivityRunning, showJumpToLatest]);
+  }, [groups.length, loading, oldestGroupKey, renderedGroups, showActivityRunning, showJumpToLatest]);
+
+  useEffect(() => {
+    const previousLength = previousGroupLengthRef.current;
+    previousGroupLengthRef.current = groups.length;
+
+    if (groups.length === 0 || groups.length < previousLength) {
+      setVisibleGroupCount(INITIAL_RENDERED_GROUP_LIMIT);
+      return;
+    }
+    if (groups.length > previousLength && stickToBottomRef.current && !showJumpToLatest) {
+      setVisibleGroupCount(INITIAL_RENDERED_GROUP_LIMIT);
+    }
+  }, [groups.length, showJumpToLatest]);
 
   useEffect(() => {
     const scroller = scrollerRef.current;
@@ -95,30 +150,67 @@ export default function ChatTimeline({
     return () => observer.disconnect();
   }, [showJumpToLatest]);
 
+  const preserveScrollForPrepend = (scroller: HTMLDivElement, mode: ScrollPreservation['mode']) => {
+    scrollPreservationRef.current = mode === 'server-prepend'
+      ? { mode, scrollHeight: scroller.scrollHeight, oldestGroupKey, sawLoading: false }
+      : { mode, scrollHeight: scroller.scrollHeight };
+  };
+
+  const revealOlderLoadedGroups = (scroller: HTMLDivElement): boolean => {
+    if (hiddenLoadedGroupCount <= 0) return false;
+    preserveScrollForPrepend(scroller, 'next-layout');
+    setVisibleGroupCount((count) => Math.min(groups.length, count + RENDERED_GROUP_INCREMENT));
+    return true;
+  };
+
+  const requestOlder = (scroller: HTMLDivElement) => {
+    if (loading) return;
+    if (hiddenLoadedGroupCount <= 0 && !hasOlder) return;
+    stickToBottomRef.current = false;
+    if (revealOlderLoadedGroups(scroller)) return;
+    preserveScrollForPrepend(scroller, 'server-prepend');
+    setVisibleGroupCount((count) => count + RENDERED_GROUP_INCREMENT);
+    onLoadOlder();
+  };
+
+  const collapseOlderLoadedGroupsAtBottom = (scroller: HTMLDivElement) => {
+    if (visibleGroupCount <= INITIAL_RENDERED_GROUP_LIMIT) {
+      if (scrollPreservationRef.current?.mode === 'server-prepend') scrollPreservationRef.current = null;
+      return;
+    }
+    preserveScrollForPrepend(scroller, 'next-layout');
+    setVisibleGroupCount(INITIAL_RENDERED_GROUP_LIMIT);
+  };
+
   const handleScroll = (event: UIEvent<HTMLDivElement>) => {
     const scroller = event.currentTarget;
     const distanceFromBottom = scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop;
-    stickToBottomRef.current = distanceFromBottom <= BOTTOM_STICKY_THRESHOLD_PX;
+    const isAtBottom = distanceFromBottom <= BOTTOM_STICKY_THRESHOLD_PX;
+    stickToBottomRef.current = isAtBottom;
 
-    if (!hasOlder || loading) return;
-    if (scroller.scrollTop <= 80) onLoadOlder();
+    if (isAtBottom) collapseOlderLoadedGroupsAtBottom(scroller);
+    if (!isAtBottom && scroller.scrollTop <= 80) requestOlder(scroller);
   };
 
   const handleJumpToLatest = () => {
     stickToBottomRef.current = true;
+    setVisibleGroupCount(INITIAL_RENDERED_GROUP_LIMIT);
     onJumpToLatest();
   };
-  const groups = useMemo(() => groupTimelineItems(items), [items]);
-  const lastGroupIndex = groups.length - 1;
-  const runningAppendsToLastActivity = showActivityRunning && lastGroupIndex >= 0 && Array.isArray(groups[lastGroupIndex]);
+
+  const handleLoadOlderClick = () => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    requestOlder(scroller);
+  };
 
   return (
     <div ref={scrollerRef} className="chat-scroll" onScroll={handleScroll}>
       <div ref={columnRef} className="chat-column">
-        {(hasOlder || showJumpToLatest) && (
+        {(hiddenLoadedGroupCount > 0 || hasOlder || showJumpToLatest) && (
           <div className="timeline-pager">
-            {hasOlder && (
-              <button className="load-more" type="button" onClick={onLoadOlder} disabled={loading}>
+            {(hiddenLoadedGroupCount > 0 || hasOlder) && (
+              <button className="load-more" type="button" onClick={handleLoadOlderClick} disabled={loading}>
                 {loading ? 'Loading...' : 'Load older'}
               </button>
             )}
@@ -129,7 +221,7 @@ export default function ChatTimeline({
             )}
           </div>
         )}
-        {groups.map((entry, index) =>
+        {renderedGroups.map((entry, index) =>
           Array.isArray(entry) ? (
             <ActivityBlock
               key={`activity:${entry[0]?.id ?? 'empty'}`}

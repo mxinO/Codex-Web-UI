@@ -99,7 +99,7 @@ describe('useThreadTimeline', () => {
 
     expect(rpc).toHaveBeenCalledWith('thread/turns/list', {
       threadId: 'thread-1',
-      limit: 50,
+      limit: 12,
       sortDirection: 'desc',
       cursor: null,
     });
@@ -145,15 +145,15 @@ describe('useThreadTimeline', () => {
       currentTimeline?.loadOlder();
     });
     await act(async () => {
-      older.resolve({ data: makeTurns('older', 205), nextCursor: 'cursor-2' });
+      older.resolve({ data: makeTurns('older', 130), nextCursor: 'cursor-2' });
       await older.promise;
     });
 
     const texts = currentTimeline?.items.map((item) => item.kind === 'assistant' ? item.text : '') ?? [];
-    expect(currentTimeline?.items).toHaveLength(200);
-    expect(texts[0]).toBe('older-204');
-    expect(texts.at(-1)).toBe('older-5');
-    expect(texts).not.toContain('older-4');
+    expect(currentTimeline?.items).toHaveLength(120);
+    expect(texts[0]).toBe('older-129');
+    expect(texts.at(-1)).toBe('older-10');
+    expect(texts).not.toContain('older-9');
     expect(texts).not.toContain('latest-0');
     expect(currentTimeline?.hasOlder).toBe(true);
     expect((currentTimeline as HookResult & { isViewingLatest?: boolean })?.isViewingLatest).toBe(false);
@@ -661,7 +661,7 @@ describe('useThreadTimeline', () => {
 
     expect(rpc).toHaveBeenLastCalledWith('thread/turns/list', {
       threadId: 'thread-1',
-      limit: 50,
+      limit: 12,
       sortDirection: 'desc',
       cursor: 'cursor-after-older',
     });
@@ -769,7 +769,7 @@ describe('useThreadTimeline', () => {
     });
     expect(rpc).toHaveBeenLastCalledWith('thread/turns/list', {
       threadId: 'thread-1',
-      limit: 50,
+      limit: 12,
       sortDirection: 'desc',
       cursor: null,
     });
