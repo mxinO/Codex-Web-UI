@@ -123,6 +123,33 @@ describe('ChatItem details', () => {
     expect(onOpenMentionedFile).toHaveBeenCalledWith('plots/output.png');
   });
 
+  it('does not render an active empty streaming item as a chat card', () => {
+    const item: TimelineItem = { id: 's1', kind: 'streaming', timestamp: 1, text: '', active: true };
+
+    render(<ChatItem item={item} onOpenDetail={vi.fn()} onApprovalDecision={onApprovalDecision} />);
+
+    expect(document.querySelector('.streaming-card')).toBeNull();
+    expect(document.querySelector('.chat-row')).toBeNull();
+  });
+
+  it('does not render whitespace-only active streaming text as a chat card', () => {
+    const item: TimelineItem = { id: 's1', kind: 'streaming', timestamp: 1, text: '\n  ', active: true };
+
+    render(<ChatItem item={item} onOpenDetail={vi.fn()} onApprovalDecision={onApprovalDecision} />);
+
+    expect(document.querySelector('.streaming-card')).toBeNull();
+    expect(document.querySelector('.chat-row')).toBeNull();
+  });
+
+  it('shows active streaming text as streaming, not waiting', async () => {
+    const item: TimelineItem = { id: 's1', kind: 'streaming', timestamp: 1, text: 'Working now.', active: true };
+
+    render(<ChatItem item={item} onOpenDetail={vi.fn()} onApprovalDecision={onApprovalDecision} />);
+
+    expect(document.querySelector('.streaming-card__header')?.textContent).toContain('Streaming');
+    expect(document.querySelector('.streaming-card__pulse')).toBeInstanceOf(HTMLSpanElement);
+  });
+
   it('opens command cards through the detail callback', () => {
     const onOpenDetail = vi.fn();
     const item: TimelineItem = {

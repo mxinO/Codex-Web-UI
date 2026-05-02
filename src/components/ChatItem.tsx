@@ -74,6 +74,7 @@ export default function ChatItem({
   }
 
   if (item.kind === 'streaming') {
+    if (item.text.trim().length === 0) return null;
     return (
       <div className="chat-row chat-row--assistant">
         <StreamingCard text={item.text} active={item.active} onOpenMentionedFile={onOpenMentionedFile} />

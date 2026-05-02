@@ -22,13 +22,9 @@ export default function StreamingCard({ text, active, onOpenMentionedFile }: Str
           </span>
         ) : null}
       </div>
-      {text ? (
-        <Suspense fallback={<div className="detail-loading">Loading markdown...</div>}>
-          <MarkdownView content={text} onOpenFile={onOpenMentionedFile} />
-        </Suspense>
-      ) : (
-        <div className="streaming-card__empty">Waiting for assistant output...</div>
-      )}
+      <Suspense fallback={<div className="detail-loading">Loading markdown...</div>}>
+        <MarkdownView content={text} onOpenFile={onOpenMentionedFile} />
+      </Suspense>
     </div>
   );
 }

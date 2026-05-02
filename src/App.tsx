@@ -355,6 +355,11 @@ export default function App() {
   }, [approvalItems, claimedQueuedUserItems, ephemeralItems, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items, timelineItemsForChat, visibleLiveTurnItems, visibleRetainedFileSummaryItems, visibleRetainedLiveTurnItems]);
   const runOptions = useMemo<CodexRunOptions>(() => ({ model, mode: effectiveMode(mode, model), effort, sandbox }), [effort, mode, model, sandbox]);
   const isRunning = Boolean(state?.activeTurnId || (pendingCompactionThreadId && pendingCompactionThreadId === activeThreadId));
+  const hasActiveStreamingText = useMemo(
+    () => visibleLiveTurnItems.some((item) => item.kind === 'streaming' && item.active && item.text.trim().length > 0),
+    [visibleLiveTurnItems],
+  );
+  const showRunningIndicator = isRunning && !hasActiveStreamingText;
 
   const updateRetainedLiveTurnItems = useCallback((historyItems: TimelineItem[], additions: TimelineItem[] = []) => {
     setRetainedLiveTurnItems((current) => {
@@ -953,6 +958,12 @@ export default function App() {
               )}
             </div>
             {activeFileSummary && <FileChangeTray summary={activeFileSummary} onOpenDiff={openFileSummaryDiff} />}
+            {showRunningIndicator && (
+              <div className="running-indicator" role="status" aria-live="polite">
+                <span className="running-indicator__mark" aria-hidden="true">*</span>
+                <span>Running ...</span>
+              </div>
+            )}
             <InputBox
               rpc={socket.rpc}
               threadId={activeThreadId}

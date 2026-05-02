@@ -465,6 +465,28 @@ input:focus-visible {
   background: color-mix(in srgb, var(--bg-primary) 88%, var(--bg-secondary));
 }
 
+.running-indicator {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: min(920px, 100%);
+  margin: 0 auto;
+  padding: 5px 18px 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+}
+
+.running-indicator__mark {
+  color: var(--yellow);
+  font-size: 14px;
+  line-height: 1;
+  transform-origin: 50% 56%;
+  animation: running-indicator-flutter 0.9s ease-in-out infinite;
+}
+
 .file-autocomplete,
 .slash-autocomplete {
   grid-column: 1 / -1;
@@ -696,6 +718,19 @@ input:focus-visible {
   }
 }
 
+@keyframes running-indicator-flutter {
+  0%,
+  100% {
+    opacity: 0.45;
+    transform: scale(0.78) rotate(-8deg);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1.16) rotate(8deg);
+  }
+}
+
 @keyframes streaming-pulse-dot {
   0%,
   80%,
@@ -711,6 +746,7 @@ input:focus-visible {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .running-indicator__mark,
   .streaming-card--active .streaming-card__dot,
   .streaming-card__pulse span {
     animation: none;

@@ -32,7 +32,7 @@ export type TimelineItem = TimelineItemOrder & (
   | { id: string; kind: 'warning'; timestamp: number; text: string }
   | { id: string; kind: 'error'; timestamp: number; text: string }
   | { id: string; kind: 'queued'; timestamp: number; message: { id: string; text: string; createdAt: number; options?: Partial<CodexRunOptions> } }
-  | { id: string; kind: 'streaming'; timestamp: number; text: string; active: boolean; turnId?: string | null }
+  | { id: string; kind: 'streaming'; timestamp: number; text: string; active: boolean; turnId?: string | null; sourceId?: string | null }
   | { id: string; kind: 'approval'; timestamp: number; requestId: number | string; method: string; params: unknown }
 );
 
@@ -343,7 +343,17 @@ export function turnToTimelineItems(turn: CodexTurn): TimelineItem[] {
     if (item.type === 'webuiFileChangeSummary') return [];
     if (item.type === 'fileChange') return fileChangeItemsForTurnItem({ ...turn, items }, item, index, timestamp);
     if (item.type === 'userMessage') return [{ id, kind: 'user', timestamp, text: userText(item) }];
-    if (item.type === 'agentMessage') return [{ id, kind: 'assistant', timestamp, text: stringField(item, 'text'), phase: nullableStringField(item, 'phase') }];
+    if (item.type === 'agentMessage') {
+      return [{
+        id,
+        kind: 'assistant',
+        timestamp,
+        text: stringField(item, 'text'),
+        phase: nullableStringField(item, 'phase'),
+        turnId: turn.id,
+        sourceId: typeof item.id === 'string' ? item.id : null,
+      }];
+    }
     if (item.type === 'commandExecution') {
       return [{
         id,
@@ -431,6 +441,14 @@ export function shouldShowLiveStreamingItem(items: TimelineItem[], liveItem: Ext
 
 function normalizedMessageBlock(text: string): string {
   return text.trim().replace(/\r\n/g, '\n');
+}
+
+function messageLikelyCovers(candidateText: string, coveringText: string): boolean {
+  const candidate = normalizedMessageBlock(candidateText);
+  const covering = normalizedMessageBlock(coveringText);
+  if (!candidate || !covering) return false;
+  if (candidate === covering) return true;
+  return candidate.length >= 12 && covering.length > candidate.length && covering.startsWith(candidate);
 }
 
 export function liveStreamingItemForTimeline(
@@ -601,24 +619,51 @@ function shouldReplaceLiveAssistantSnapshot(
   sourceId: string | null,
 ): boolean {
   if (previous.kind !== 'assistant') return false;
-  if ((previous.phase ?? null) !== phase) return false;
   if ((previous.turnId ?? null) !== turnId) return false;
-  if (sourceId || previous.sourceId) return previous.sourceId === sourceId;
   const previousText = normalizedMessageBlock(previous.text);
   const nextText = normalizedMessageBlock(text);
-  return nextText === previousText;
+  if (sourceId || previous.sourceId) return previous.sourceId === sourceId;
+  if (nextText === previousText) return true;
+  return false;
 }
 
-function assistantPersistedTextKeys(items: TimelineItem[]): Set<string> {
-  const keys = new Set<string>();
+function assistantItemsByTurn(items: TimelineItem[]): Map<string, Extract<TimelineItem, { kind: 'assistant' }>[]> {
+  const byTurn = new Map<string, Extract<TimelineItem, { kind: 'assistant' }>[]>();
   for (const item of items) {
     if (item.kind !== 'assistant') continue;
     const turnId = timelineItemTurnId(item);
     if (!turnId) continue;
     const text = normalizedMessageBlock(item.text);
-    if (text) keys.add(`${turnId}\0${text}`);
+    if (!text) continue;
+    const current = byTurn.get(turnId) ?? [];
+    current.push(item);
+    byTurn.set(turnId, current);
   }
-  return keys;
+  return byTurn;
+}
+
+function assistantIsFinal(item: Extract<TimelineItem, { kind: 'assistant' }>): boolean {
+  return item.phase === null || item.phase === 'final_answer' || item.phase === 'final';
+}
+
+function assistantPhaseGroup(phase: string | null): string {
+  return phase === null || phase === 'final_answer' || phase === 'final' ? 'final' : phase;
+}
+
+function assistantTextKey(turnId: string, phase: string | null, text: string): string {
+  return `${turnId}\0${assistantPhaseGroup(phase)}\0${text}`;
+}
+
+function liveAssistantItemId(turnId: string | null, sourceId: string | null, sequence: number): string {
+  return sourceId && turnId ? `${turnId}:${sourceId}` : `live:assistant:${turnId ?? 'unscoped'}:${sequence}`;
+}
+
+function liveStreamingItemId(turnId: string | null, sourceId: string | null, sequence: number): string {
+  return sourceId && turnId ? `${turnId}:${sourceId}` : `live:streaming:${turnId ?? 'unscoped'}:${sequence}`;
+}
+
+function liveStreamingMessageKey(turnId: string | null, sourceId: string | null): string {
+  return sourceId ? `source:${turnId ?? 'unscoped'}:${sourceId}` : `turn:${turnId ?? 'unscoped'}`;
 }
 
 export function liveTurnItemsFromNotifications(
@@ -631,17 +676,19 @@ export function liveTurnItemsFromNotifications(
   const acceptUnscoped = options.acceptUnscoped ?? active;
   const items: TimelineItem[] = [];
   const itemIndexes = new Map<string, number>();
+  const streamingIndexes = new Map<string, number>();
   let sequence = 0;
   let deltaIndex: number | null = null;
 
-  const rememberItem = (item: TimelineItem) => {
+  const rememberItem = (item: TimelineItem): number => {
     const existingIndex = itemIndexes.get(item.id);
     if (existingIndex !== undefined) {
       items[existingIndex] = item;
-      return;
+      return existingIndex;
     }
     itemIndexes.set(item.id, items.length);
     items.push(item);
+    return items.length - 1;
   };
 
   const pushAssistant = (
@@ -659,8 +706,8 @@ export function liveTurnItemsFromNotifications(
     }
 
     sequence += 1;
-    const id = sourceId && turnId ? `${turnId}:${sourceId}` : `live:assistant:${turnId ?? 'unscoped'}:${sequence}`;
-    rememberItem({
+    const id = liveAssistantItemId(turnId, sourceId, sequence);
+    const index = rememberItem({
       id,
       kind: 'assistant',
       timestamp,
@@ -670,29 +717,41 @@ export function liveTurnItemsFromNotifications(
       turnId,
       sourceId,
     });
+    if (sourceId) streamingIndexes.delete(liveStreamingMessageKey(turnId, sourceId));
+    if (deltaIndex === index) deltaIndex = null;
   };
 
-  const appendDelta = (delta: string, turnId: string | null, timestamp: number, sortOrder: number | null) => {
-    if (deltaIndex !== null && deltaIndex === items.length - 1) {
-      const previous = items[deltaIndex];
-      if (previous?.kind === 'streaming') {
-        items[deltaIndex] = { ...previous, text: `${previous.text}${delta}`, turnId: previous.turnId ?? turnId };
+  const appendDelta = (delta: string, turnId: string | null, sourceId: string | null, timestamp: number, sortOrder: number | null) => {
+    const streamingKey = liveStreamingMessageKey(turnId, sourceId);
+    const existingIndex = streamingIndexes.get(streamingKey) ?? (sourceId ? null : deltaIndex);
+    if (existingIndex !== null && existingIndex !== undefined) {
+      const previous = items[existingIndex];
+      if (previous?.kind === 'streaming' && (previous.turnId ?? 'unscoped') === (turnId ?? 'unscoped') && (previous.sourceId ?? null) === sourceId) {
+        items[existingIndex] = { ...previous, text: `${previous.text}${delta}`, turnId: previous.turnId ?? turnId, sourceId: previous.sourceId ?? sourceId };
+        deltaIndex = existingIndex;
         return;
       }
     }
 
     sequence += 1;
-    const item: TimelineItem = {
-      id: `live:streaming:${turnId ?? 'unscoped'}:${sequence}`,
+    const id = liveStreamingItemId(turnId, sourceId, sequence);
+    const existingById = itemIndexes.get(id);
+    if (existingById !== undefined && items[existingById]?.kind === 'assistant') return;
+    rememberItem({
+      id,
       kind: 'streaming',
       timestamp,
       sortOrder,
       text: delta,
       active: false,
       turnId,
-    };
-    items.push(item);
-    deltaIndex = items.length - 1;
+      sourceId,
+    });
+    const index = itemIndexes.get(id);
+    if (index !== undefined) {
+      deltaIndex = index;
+      streamingIndexes.set(streamingKey, index);
+    }
   };
 
   for (const [notificationIndex, notification] of notifications.entries()) {
@@ -708,7 +767,9 @@ export function liveTurnItemsFromNotifications(
     if (notification.method === 'item/agentMessage/delta' && isRecord(notification.params)) {
       if (!notificationAllowedInLiveWindow(notification, scope, acceptUnscoped)) continue;
       const delta = notification.params.delta;
-      if (typeof delta === 'string') appendDelta(delta, notificationTurnId(notification) ?? scope.activeTurnId, timestamp, sortOrder);
+      if (typeof delta === 'string') {
+        appendDelta(delta, notificationTurnId(notification) ?? scope.activeTurnId, notificationMessageSourceId(notification), timestamp, sortOrder);
+      }
       continue;
     }
 
@@ -733,6 +794,7 @@ export function liveTurnItemsFromNotifications(
         );
       }
       deltaIndex = null;
+      streamingIndexes.delete(liveStreamingMessageKey(notificationTurnId(notification) ?? scope.activeTurnId, null));
       continue;
     }
 
@@ -754,6 +816,7 @@ export function liveTurnItemsFromNotifications(
 
       for (const item of activityItemsFromCompletedNotification(notification, scope, timestamp, sortOrder, String(notificationIndex))) rememberItem(item);
       deltaIndex = null;
+      streamingIndexes.delete(liveStreamingMessageKey(notificationTurnId(notification) ?? scope.activeTurnId, null));
     }
   }
 
@@ -767,15 +830,6 @@ export function liveTurnItemsFromNotifications(
   if (lastStreamingIndex >= 0) {
     const item = items[lastStreamingIndex];
     if (item.kind === 'streaming') items[lastStreamingIndex] = { ...item, active };
-  } else if (active && items.length === 0) {
-    items.push({
-      id: `live:streaming:${scope.activeTurnId ?? 'unscoped'}:waiting`,
-      kind: 'streaming',
-      timestamp: now,
-      text: '',
-      active: true,
-      turnId: scope.activeTurnId,
-    });
   }
 
   return items;
@@ -783,16 +837,70 @@ export function liveTurnItemsFromNotifications(
 
 export function visibleLiveTurnItemsForTimeline(items: TimelineItem[], liveItems: TimelineItem[]): TimelineItem[] {
   const persistedIds = new Set(items.map((item) => item.id));
-  const persistedAssistantTexts = assistantPersistedTextKeys(items);
+  const persistedAssistantsByTurn = assistantItemsByTurn(items);
+  const liveAssistantsByTurn = assistantItemsByTurn(liveItems);
+  const emittedAssistantIdentityKeys = new Set<string>();
+  const emittedUnidentifiedAssistantTextKeys = new Set<string>();
+  const emittedIdentifiedAssistantTextKeys = new Set<string>();
 
-  return liveItems.filter((item) => {
+  const isPersistedAssistantMatch = (item: Extract<TimelineItem, { kind: 'assistant' | 'streaming' }>, turnId: string, text: string): boolean => {
+    const persisted = persistedAssistantsByTurn.get(turnId) ?? [];
+    return persisted.some((assistant) => {
+      if (normalizedMessageBlock(assistant.text) !== text) return false;
+      if (item.sourceId && assistant.sourceId && item.sourceId !== assistant.sourceId) return false;
+      return true;
+    });
+  };
+
+  const isCoveredByAssistant = (item: Extract<TimelineItem, { kind: 'streaming' }>): boolean => {
+    const turnId = timelineItemTurnId(item);
+    if (!turnId) return false;
+    const assistants = [...(persistedAssistantsByTurn.get(turnId) ?? []), ...(liveAssistantsByTurn.get(turnId) ?? [])];
+    return assistants.some(
+      (assistant) => {
+        if (assistant.id === item.id) return false;
+        const sameMessage = !item.sourceId || !assistant.sourceId || item.sourceId === assistant.sourceId;
+        if (!sameMessage) return false;
+        return (!item.active && assistantIsFinal(assistant)) || messageLikelyCovers(item.text, assistant.text);
+      },
+    );
+  };
+
+  const isCoveredByLaterStreaming = (item: Extract<TimelineItem, { kind: 'streaming' }>, index: number): boolean => {
+    const turnId = timelineItemTurnId(item);
+    if (!turnId) return false;
+    return liveItems.slice(index + 1).some((candidate) => {
+      if (candidate.kind !== 'streaming') return false;
+      if (timelineItemTurnId(candidate) !== turnId) return false;
+      if ((item.sourceId || candidate.sourceId) && item.sourceId !== candidate.sourceId) return false;
+      return messageLikelyCovers(item.text, candidate.text);
+    });
+  };
+
+  return liveItems.filter((item, index) => {
     if (persistedIds.has(item.id)) return false;
     if (item.kind !== 'assistant' && item.kind !== 'streaming') return true;
 
     const turnId = timelineItemTurnId(item);
     if (!turnId) return true;
     const text = normalizedMessageBlock(item.text);
-    if (text && persistedAssistantTexts.has(`${turnId}\0${text}`)) return false;
+    if (text && isPersistedAssistantMatch(item, turnId, text)) return false;
+    if (item.kind === 'assistant') {
+      const identityKey = item.sourceId ? `${turnId}\0source:${item.sourceId}` : null;
+      const textKey = assistantTextKey(turnId, item.phase, text);
+      if (identityKey && emittedAssistantIdentityKeys.has(identityKey)) return false;
+      if (identityKey && emittedUnidentifiedAssistantTextKeys.has(textKey)) return false;
+      if (!identityKey && (emittedUnidentifiedAssistantTextKeys.has(textKey) || emittedIdentifiedAssistantTextKeys.has(textKey))) return false;
+      if (identityKey) {
+        emittedAssistantIdentityKeys.add(identityKey);
+        emittedIdentifiedAssistantTextKeys.add(textKey);
+      } else {
+        emittedUnidentifiedAssistantTextKeys.add(textKey);
+      }
+      return true;
+    }
+    if (isCoveredByAssistant(item)) return false;
+    if (item.kind === 'streaming' && isCoveredByLaterStreaming(item, index)) return false;
     return true;
   });
 }
@@ -803,7 +911,10 @@ export function visibleRetainedLiveTurnItemsForTimeline(
   retainedItems: TimelineItem[],
 ): TimelineItem[] {
   const currentLiveKeys = new Set(currentLiveItems.map(liveCurrentDuplicateKey));
-  return visibleLiveTurnItemsForTimeline(historyItems, retainedItems).filter((item) => !currentLiveKeys.has(liveCurrentDuplicateKey(item)));
+  const currentAssistantItems = currentLiveItems.filter((item): item is Extract<TimelineItem, { kind: 'assistant' }> => item.kind === 'assistant');
+  return visibleLiveTurnItemsForTimeline([...historyItems, ...currentAssistantItems], retainedItems).filter(
+    (item) => !currentLiveKeys.has(liveCurrentDuplicateKey(item)),
+  );
 }
 
 export function pendingUserItemsWithoutHistory<T extends Extract<TimelineItem, { kind: 'user' }>>(historyItems: TimelineItem[], pendingItems: T[]): T[] {
@@ -828,7 +939,8 @@ export function claimedQueuedUserItemsWithoutHistory<T extends Extract<TimelineI
 function liveCurrentDuplicateKey(item: TimelineItem): string {
   const turnId = timelineItemTurnId(item) ?? 'unscoped';
   if (item.kind === 'assistant' || item.kind === 'streaming') {
-    return `${item.kind}:${item.id}:${turnId}:${normalizedMessageBlock(item.text)}`;
+    if (item.sourceId) return `message:${turnId}:source:${item.sourceId}`;
+    return `message:${turnId}:${item.kind}:${item.id}:${normalizedMessageBlock(item.text)}`;
   }
   return `${item.kind}:${item.id}:${turnId}`;
 }
@@ -875,7 +987,9 @@ export function claimedQueuedUserItemsFromQueueTransition(
 
 function liveRetentionKey(item: TimelineItem): string {
   const turnId = timelineItemTurnId(item) ?? 'unscoped';
+  if (item.kind === 'assistant' && item.sourceId) return `assistant:${turnId}:source:${item.sourceId}`;
   if (item.kind === 'assistant') return `assistant:${turnId}:${item.phase ?? ''}:${normalizedMessageBlock(item.text)}`;
+  if (item.kind === 'streaming' && item.sourceId) return `streaming:${turnId}:source:${item.sourceId}`;
   if (item.kind === 'streaming') return `streaming:${turnId}:${normalizedMessageBlock(item.text)}`;
   return `${item.kind}:${item.id}`;
 }
@@ -901,24 +1015,32 @@ export function mergeRetainedLiveTurnItems(
     merged.push(item);
   }
 
-  return trimTimelineWindow(merged, limit);
+  return trimTimelineWindow(visibleLiveTurnItemsForTimeline(historyItems, merged), limit);
 }
 
 export function timelineItemsWithLiveTurnOverlay(items: TimelineItem[], liveItems: TimelineItem[], activeTurnId: string | null | undefined): TimelineItem[] {
   if (!activeTurnId || liveItems.length === 0) return items;
 
   const liveIds = new Set(liveItems.map((item) => item.id));
-  const liveAssistantTexts = new Set(
-    liveItems
-      .filter((item): item is Extract<TimelineItem, { kind: 'assistant' }> => item.kind === 'assistant')
-      .map((item) => normalizedMessageBlock(item.text))
-      .filter(Boolean),
-  );
+  const liveAssistantSourceIds = new Set<string>();
+  const liveUnidentifiedAssistantTexts = new Set<string>();
+  for (const item of liveItems) {
+    if (item.kind !== 'assistant') continue;
+    if (item.sourceId) {
+      liveAssistantSourceIds.add(item.sourceId);
+      continue;
+    }
+    const text = normalizedMessageBlock(item.text);
+    if (text) liveUnidentifiedAssistantTexts.add(text);
+  }
 
   return items.filter((item) => {
     if (timelineItemTurnId(item) !== activeTurnId) return true;
     if (liveIds.has(item.id)) return false;
-    if (item.kind === 'assistant' && liveAssistantTexts.has(normalizedMessageBlock(item.text))) return false;
+    if (item.kind === 'assistant') {
+      if (item.sourceId && liveAssistantSourceIds.has(item.sourceId)) return false;
+      if (!item.sourceId && liveUnidentifiedAssistantTexts.has(normalizedMessageBlock(item.text))) return false;
+    }
     return true;
   });
 }

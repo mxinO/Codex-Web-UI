@@ -424,6 +424,17 @@ describe('timeline', () => {
     });
   });
 
+  it('does not create an empty waiting chat item for an active turn with no assistant text', () => {
+    expect(
+      liveTurnItemsFromNotifications(
+        [],
+        { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+        true,
+        100,
+      ),
+    ).toEqual([]);
+  });
+
   it('starts a pending submit window without attributing new unscoped output to the previous turn', () => {
     const completedWindow = { activeThreadId: 'thread-1', activeTurnId: 'turn-previous', startCount: 10 };
 
@@ -454,7 +465,7 @@ describe('timeline', () => {
     expect(shouldShowLiveStreamingItem(staleHistory, null)).toBe(false);
   });
 
-  it('does not hide completed streaming output behind a different same-turn final answer', () => {
+  it('hides inactive streaming output once a same-turn final answer is available', () => {
     const liveItem: TimelineItem = {
       id: 'live:streaming:turn-1:1',
       kind: 'streaming',
@@ -467,7 +478,488 @@ describe('timeline', () => {
       { id: 'turn-1:a1', kind: 'assistant', timestamp: 100, text: 'A partial final answer.', phase: 'final_answer', turnId: 'turn-1' },
     ];
 
-    expect(visibleLiveTurnItemsForTimeline(partialFinalHistory, [liveItem])).toEqual([liveItem]);
+    expect(visibleLiveTurnItemsForTimeline(partialFinalHistory, [liveItem])).toEqual([]);
+  });
+
+  it('hides a completed latest-response snapshot when a live finalized assistant covers it', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'Created the fi' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'a1', text: 'Created the file.', phase: 'final_answer' },
+          },
+        },
+        { method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-1' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      100,
+    );
+
+    expect(liveItems.map((item) => item.kind)).toEqual(['streaming', 'assistant']);
+    expect(visibleLiveTurnItemsForTimeline([], liveItems).map((item) => item.kind)).toEqual(['assistant']);
+  });
+
+  it('replaces a split streaming card with its finalized message across intervening activity', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'a1', delta: 'First part ' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: {
+              type: 'commandExecution',
+              id: 'cmd-1',
+              command: 'pwd',
+              cwd: '/repo',
+              status: 'completed',
+              aggregatedOutput: '/repo\n',
+              exitCode: 0,
+            },
+          },
+        },
+        { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'a1', delta: 'and rest' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'a1', text: 'First part and rest', phase: 'final_answer' },
+          },
+        },
+        { method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-1' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      100,
+    );
+
+    expect(liveItems.map((item) => item.kind)).toEqual(['assistant', 'command']);
+    expect(liveItems.map((item) => (item.kind === 'assistant' ? item.text : item.id))).toEqual(['First part and rest', 'turn-1:cmd-1']);
+    expect(visibleLiveTurnItemsForTimeline([], liveItems).map((item) => item.kind)).toEqual(['assistant', 'command']);
+  });
+
+  it('keeps separate streaming messages from being combined into one response', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'a1', delta: 'First message' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'a1', text: 'First message', phase: 'commentary' },
+          },
+        },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: {
+              type: 'commandExecution',
+              id: 'cmd-1',
+              command: 'pwd',
+              cwd: '/repo',
+              status: 'completed',
+              aggregatedOutput: '/repo\n',
+              exitCode: 0,
+            },
+          },
+        },
+        { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'a2', delta: 'Second message' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'a2', text: 'Second message', phase: 'final_answer' },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      100,
+    );
+
+    expect(liveItems.map((item) => item.kind)).toEqual(['assistant', 'command', 'assistant']);
+    expect(liveItems.map((item) => (item.kind === 'assistant' ? item.text : item.id))).toEqual([
+      'First message',
+      'turn-1:cmd-1',
+      'Second message',
+    ]);
+  });
+
+  it('does not hide a sourced streaming message behind a different finalized message in the same turn', () => {
+    const streaming: TimelineItem = {
+      id: 'turn-1:a1',
+      kind: 'streaming',
+      timestamp: 200,
+      text: 'First message still streaming',
+      active: false,
+      turnId: 'turn-1',
+      sourceId: 'a1',
+    };
+    const history: TimelineItem[] = [
+      { id: 'turn-1:a2', kind: 'assistant', timestamp: 100, text: 'Second message final.', phase: 'final_answer', turnId: 'turn-1', sourceId: 'a2' },
+    ];
+
+    expect(visibleLiveTurnItemsForTimeline(history, [streaming])).toEqual([streaming]);
+  });
+
+  it('keeps identical finalized assistant text when the message ids are different', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'a1', text: 'Done.', phase: 'commentary' },
+          },
+        },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'a2', text: 'Done.', phase: 'commentary' },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      100,
+    );
+
+    expect(liveItems.map((item) => item.id)).toEqual(['turn-1:a1', 'turn-1:a2']);
+    expect(visibleLiveTurnItemsForTimeline([], liveItems).map((item) => item.id)).toEqual(['turn-1:a1', 'turn-1:a2']);
+  });
+
+  it('only removes retained streaming for the matching persisted message source id', () => {
+    const history = turnToTimelineItems({
+      id: 'turn-1',
+      status: 'completed',
+      startedAt: 1,
+      completedAt: 2,
+      items: [{ type: 'agentMessage', id: 'a1', text: 'Same text.', phase: 'final_answer' }],
+    });
+    const matching: TimelineItem = {
+      id: 'turn-1:a1',
+      kind: 'streaming',
+      timestamp: 2000,
+      text: 'Same text.',
+      active: false,
+      turnId: 'turn-1',
+      sourceId: 'a1',
+    };
+    const different: TimelineItem = {
+      id: 'turn-1:a2',
+      kind: 'streaming',
+      timestamp: 2001,
+      text: 'Same text.',
+      active: false,
+      turnId: 'turn-1',
+      sourceId: 'a2',
+    };
+
+    expect(visibleLiveTurnItemsForTimeline(history, [matching, different])).toEqual([different]);
+  });
+
+  it('starts a new no-id streaming segment after intervening activity', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'First message' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: {
+              type: 'commandExecution',
+              id: 'cmd-1',
+              command: 'pwd',
+              cwd: '/repo',
+              status: 'completed',
+              aggregatedOutput: '/repo\n',
+              exitCode: 0,
+            },
+          },
+        },
+        { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'Second message' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      100,
+    );
+
+    expect(liveItems.map((item) => item.kind)).toEqual(['streaming', 'command', 'streaming']);
+    expect(liveItems.map((item) => (item.kind === 'streaming' ? item.text : item.id))).toEqual([
+      'First message',
+      'turn-1:cmd-1',
+      'Second message',
+    ]);
+  });
+
+  it('replaces event message snapshots with the completed item when the source id matches', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', id: 'a1', message: 'Draft', phase: 'commentary', turn_id: 'turn-1' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: {
+              type: 'commandExecution',
+              id: 'cmd-1',
+              command: 'pwd',
+              cwd: '/repo',
+              status: 'completed',
+              aggregatedOutput: '/repo\n',
+              exitCode: 0,
+            },
+          },
+        },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'a1', text: 'Final', phase: 'commentary' },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      100,
+    );
+
+    expect(liveItems.map((item) => item.kind)).toEqual(['assistant', 'command']);
+    expect(liveItems.map((item) => (item.kind === 'assistant' ? item.text : item.id))).toEqual(['Final', 'turn-1:cmd-1']);
+  });
+
+  it('does not hide active-turn history for a different assistant source with the same text', () => {
+    const history: TimelineItem[] = [
+      { id: 'turn-1:a1', kind: 'assistant', timestamp: 100, text: 'Done.', phase: 'commentary', turnId: 'turn-1', sourceId: 'a1' },
+      { id: 'turn-1:a2', kind: 'assistant', timestamp: 100, text: 'Done.', phase: 'commentary', turnId: 'turn-1', sourceId: 'a2' },
+    ];
+    const live: TimelineItem[] = [
+      { id: 'turn-1:a1', kind: 'assistant', timestamp: 200, text: 'Done.', phase: 'commentary', turnId: 'turn-1', sourceId: 'a1' },
+    ];
+
+    expect(timelineItemsWithLiveTurnOverlay(history, live, 'turn-1').map((item) => item.id)).toEqual(['turn-1:a2']);
+  });
+
+  it('hides retained streaming once the current live item has finalized for the same source id', () => {
+    const retained: TimelineItem[] = [
+      {
+        id: 'turn-1:a1',
+        kind: 'streaming',
+        timestamp: 100,
+        text: 'Created the fi',
+        active: false,
+        turnId: 'turn-1',
+        sourceId: 'a1',
+      },
+    ];
+    const current: TimelineItem[] = [
+      {
+        id: 'turn-1:a1',
+        kind: 'assistant',
+        timestamp: 200,
+        text: 'Created the file.',
+        phase: 'final_answer',
+        turnId: 'turn-1',
+        sourceId: 'a1',
+      },
+    ];
+
+    expect(visibleRetainedLiveTurnItemsForTimeline([], current, retained)).toEqual([]);
+  });
+
+  it('hides retained source-less streaming when a current live final assistant covers it', () => {
+    const retained: TimelineItem[] = [
+      {
+        id: 'live:streaming:turn-1:1',
+        kind: 'streaming',
+        timestamp: 100,
+        text: 'Created the fi',
+        active: false,
+        turnId: 'turn-1',
+      },
+    ];
+    const current: TimelineItem[] = [
+      {
+        id: 'turn-1:a1',
+        kind: 'assistant',
+        timestamp: 200,
+        text: 'Created the file.',
+        phase: 'final_answer',
+        turnId: 'turn-1',
+        sourceId: 'a1',
+      },
+    ];
+
+    expect(visibleRetainedLiveTurnItemsForTimeline([], current, retained)).toEqual([]);
+  });
+
+  it('hides a latest-response snapshot when persisted history has a same-turn finalized prefix match', () => {
+    const liveItem: TimelineItem = {
+      id: 'live:streaming:turn-1:1',
+      kind: 'streaming',
+      timestamp: 200,
+      text: 'Created the fi',
+      active: false,
+      turnId: 'turn-1',
+    };
+    const history: TimelineItem[] = [
+      { id: 'turn-1:a1', kind: 'assistant', timestamp: 100, text: 'Created the file.', phase: 'final_answer', turnId: 'turn-1' },
+    ];
+
+    expect(visibleLiveTurnItemsForTimeline(history, [liveItem])).toEqual([]);
+  });
+
+  it('hides retained streaming output for persisted assistant history whose turn id contains a colon', () => {
+    const history = turnToTimelineItems({
+      id: 'turn:1',
+      status: 'completed',
+      startedAt: 1,
+      completedAt: 2,
+      items: [{ type: 'agentMessage', id: 'a1', text: 'Finished with colon turn id.', phase: 'final_answer' }],
+    });
+    const liveItem: TimelineItem = {
+      id: 'live:streaming:turn:1:1',
+      kind: 'streaming',
+      timestamp: 2000,
+      text: 'Finished with colon',
+      active: false,
+      turnId: 'turn:1',
+    };
+
+    expect(visibleLiveTurnItemsForTimeline(history, [liveItem])).toEqual([]);
+  });
+
+  it('collapses repeated prefix streaming snapshots to the latest same-turn snapshot', () => {
+    const first: TimelineItem = {
+      id: 'live:streaming:turn-1:1',
+      kind: 'streaming',
+      timestamp: 100,
+      text: 'Starting with a detailed plan',
+      active: false,
+      turnId: 'turn-1',
+    };
+    const second: TimelineItem = {
+      id: 'live:streaming:turn-1:2',
+      kind: 'streaming',
+      timestamp: 200,
+      text: 'Starting with a detailed plan and then running tests',
+      active: false,
+      turnId: 'turn-1',
+    };
+
+    expect(visibleLiveTurnItemsForTimeline([], [first, second])).toEqual([second]);
+  });
+
+  it('keeps distinct same-turn assistant messages that share a prefix', () => {
+    const items = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', message: 'Done', phase: 'commentary', turn_id: 'turn-1' } },
+        { method: 'event_msg', params: { type: 'agent_message', message: 'Done, now testing.', phase: 'commentary', turn_id: 'turn-1' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      100,
+    );
+
+    expect(visibleLiveTurnItemsForTimeline([], items).map((item) => (item.kind === 'assistant' ? item.text : item.id))).toEqual([
+      'Done',
+      'Done, now testing.',
+    ]);
+  });
+
+  it('keeps longer streaming output when persisted commentary is only a prefix', () => {
+    const streaming: TimelineItem = {
+      id: 'live:streaming:turn-1:1',
+      kind: 'streaming',
+      timestamp: 200,
+      text: 'Starting with a detailed plan and continuing to run tests',
+      active: false,
+      turnId: 'turn-1',
+    };
+    const history: TimelineItem[] = [
+      { id: 'turn-1:a1', kind: 'assistant', timestamp: 100, text: 'Starting with a detailed plan', phase: 'commentary', turnId: 'turn-1' },
+    ];
+
+    expect(visibleLiveTurnItemsForTimeline(history, [streaming])).toEqual([streaming]);
+  });
+
+  it('keeps one live assistant when event and completed notifications have identical text', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', message: 'Done.', phase: 'final_answer', turn_id: 'turn-1' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: {
+              type: 'commandExecution',
+              id: 'cmd-1',
+              command: 'pwd',
+              cwd: '/repo',
+              status: 'completed',
+              aggregatedOutput: '/repo\n',
+              exitCode: 0,
+            },
+          },
+        },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'a1', text: 'Done.', phase: 'final_answer' },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      100,
+    );
+
+    const visible = visibleLiveTurnItemsForTimeline([], liveItems);
+    expect(visible.map((item) => item.kind)).toEqual(['assistant', 'command']);
+    expect(visible.filter((item) => item.kind === 'assistant')).toHaveLength(1);
+  });
+
+  it('dedupes exact final live assistant text across final-equivalent phases', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', message: 'Done.', phase: 'final_answer', turn_id: 'turn-1' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'a1', text: 'Done.', phase: null },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      100,
+    );
+
+    const visible = visibleLiveTurnItemsForTimeline([], liveItems);
+    expect(visible.filter((item) => item.kind === 'assistant')).toHaveLength(1);
+    expect(visible.map((item) => (item.kind === 'assistant' ? item.text : item.id))).toEqual(['Done.']);
   });
 
   it('retains completed live items across a pending next user message until history catches up', () => {
