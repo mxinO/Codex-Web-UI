@@ -238,4 +238,68 @@ describe('ChatTimeline', () => {
 
     expect(onOpenFileSummary).toHaveBeenCalledWith('turn-1', '/repo/a.txt', 2);
   });
+
+  it('appends a running row to the current activity block', () => {
+    const command: TimelineItem = {
+      id: 'cmd-1',
+      kind: 'command',
+      timestamp: 1,
+      command: 'npm test',
+      cwd: '/repo',
+      output: '',
+      status: 'running',
+      exitCode: null,
+    };
+
+    render(<ChatTimeline {...baseProps} items={[command]} showActivityRunning />);
+
+    const block = document.querySelector('.activity-block');
+    expect(block?.classList.contains('activity-block--running')).toBe(true);
+    expect(document.querySelector('.activity-block__header')?.textContent).toContain('1 event · running');
+    const rows = Array.from(document.querySelectorAll('.activity-card'));
+    expect(rows).toHaveLength(2);
+    expect(rows[0].textContent).toContain('$ npm test');
+    expect(rows[1].textContent).toContain('Running');
+    expect(rows[1].classList.contains('activity-card--running')).toBe(true);
+  });
+
+  it('ignores empty streaming placeholders when appending a running row to activity', () => {
+    const command: TimelineItem = {
+      id: 'cmd-1',
+      kind: 'command',
+      timestamp: 1,
+      command: 'npm test',
+      cwd: '/repo',
+      output: '',
+      status: 'running',
+      exitCode: null,
+    };
+    const emptyStreaming: TimelineItem = {
+      id: 'streaming-empty',
+      kind: 'streaming',
+      timestamp: 2,
+      text: '',
+      active: true,
+      turnId: 'turn-1',
+    };
+
+    render(<ChatTimeline {...baseProps} items={[command, emptyStreaming]} showActivityRunning />);
+
+    expect(document.querySelectorAll('.activity-block')).toHaveLength(1);
+    const rows = Array.from(document.querySelectorAll('.activity-card'));
+    expect(rows).toHaveLength(2);
+    expect(rows[0].textContent).toContain('$ npm test');
+    expect(rows[1].textContent).toContain('Running');
+  });
+
+  it('shows a standalone running activity block when there is no current activity group', () => {
+    const assistant: TimelineItem = { id: 'a1', kind: 'assistant', timestamp: 1, text: 'I will check that.', phase: null };
+
+    render(<ChatTimeline {...baseProps} items={[assistant]} showActivityRunning />);
+
+    const children = Array.from(document.querySelector('.chat-column')?.children ?? []);
+    expect(children.map((node) => (node as HTMLElement).className)).toEqual(['chat-row chat-row--assistant', 'activity-block activity-block--running']);
+    expect(document.querySelector('.activity-block__header')?.textContent).toContain('running');
+    expect(document.querySelector('.activity-card--running')?.textContent).toContain('Running');
+  });
 });

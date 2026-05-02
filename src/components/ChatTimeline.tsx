@@ -9,6 +9,7 @@ interface ChatTimelineProps {
   onJumpToLatest: () => void;
   hasOlder: boolean;
   showJumpToLatest: boolean;
+  showActivityRunning?: boolean;
   loading?: boolean;
   onOpenDetail: (item: TimelineItem) => void;
   onApprovalDecision: (item: Extract<TimelineItem, { kind: 'approval' }>, decision: unknown) => Promise<void>;
@@ -36,6 +37,7 @@ function groupTimelineItems(items: TimelineItem[]): Array<TimelineItem | Timelin
   let activityRun: TimelineItem[] = [];
 
   for (const item of items) {
+    if (item.kind === 'streaming' && item.text.trim().length === 0) continue;
     if (isActivityItem(item)) {
       activityRun.push(item);
       continue;
@@ -61,6 +63,7 @@ export default function ChatTimeline({
   onJumpToLatest,
   hasOlder,
   showJumpToLatest,
+  showActivityRunning = false,
   loading = false,
   onOpenDetail,
   onApprovalDecision,
@@ -77,7 +80,7 @@ export default function ChatTimeline({
     const scroller = scrollerRef.current;
     if (!scroller || showJumpToLatest || !stickToBottomRef.current) return;
     scrollToBottom(scroller);
-  }, [items, showJumpToLatest]);
+  }, [items, showActivityRunning, showJumpToLatest]);
 
   useEffect(() => {
     const scroller = scrollerRef.current;
@@ -105,6 +108,9 @@ export default function ChatTimeline({
     stickToBottomRef.current = true;
     onJumpToLatest();
   };
+  const groups = groupTimelineItems(items);
+  const lastGroupIndex = groups.length - 1;
+  const runningAppendsToLastActivity = showActivityRunning && lastGroupIndex >= 0 && Array.isArray(groups[lastGroupIndex]);
 
   return (
     <div ref={scrollerRef} className="chat-scroll" onScroll={handleScroll}>
@@ -123,11 +129,12 @@ export default function ChatTimeline({
             )}
           </div>
         )}
-        {groupTimelineItems(items).map((entry) =>
+        {groups.map((entry, index) =>
           Array.isArray(entry) ? (
             <ActivityBlock
-              key={`activity:${entry.map((item) => item.id).join('|')}`}
+              key={`activity:${entry.map((item) => item.id).join('|')}${runningAppendsToLastActivity && index === lastGroupIndex ? ':running' : ''}`}
               items={entry}
+              running={runningAppendsToLastActivity && index === lastGroupIndex}
               onOpenDetail={onOpenDetail}
             />
           ) : (
@@ -143,7 +150,10 @@ export default function ChatTimeline({
             />
           ),
         )}
-        {items.length === 0 && <div className="chat-empty">{loading ? 'Loading messages...' : 'No messages loaded.'}</div>}
+        {showActivityRunning && !runningAppendsToLastActivity && (
+          <ActivityBlock key="activity:running" items={[]} running onOpenDetail={onOpenDetail} />
+        )}
+        {items.length === 0 && !showActivityRunning && <div className="chat-empty">{loading ? 'Loading messages...' : 'No messages loaded.'}</div>}
       </div>
     </div>
   );

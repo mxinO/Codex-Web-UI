@@ -1,8 +1,9 @@
-import { AlertTriangle, FileDiff, Info, Terminal, Wrench, XCircle } from 'lucide-react';
+import { AlertTriangle, FileDiff, Info, LoaderCircle, Terminal, Wrench, XCircle } from 'lucide-react';
 import type { TimelineItem } from '../lib/timeline';
 
 interface ActivityBlockProps {
   items: TimelineItem[];
+  running?: boolean;
   onOpenDetail: (item: TimelineItem) => void;
 }
 
@@ -121,18 +122,36 @@ function ActivityRow({ item, onOpenDetail }: ActivityRowProps) {
   return <div className={rowClass}>{body}</div>;
 }
 
-export default function ActivityBlock({ items, onOpenDetail }: ActivityBlockProps) {
-  const label = items.length === 1 ? 'Activity' : 'Activity';
+function RunningActivityRow() {
   return (
-    <div className="activity-block">
+    <div className="activity-card activity-card--running" role="status" aria-live="polite">
+      <span className="activity-card__icon activity-card__icon--running">
+        <LoaderCircle size={15} aria-hidden="true" />
+      </span>
+      <span className="activity-card__body">
+        <strong>Running</strong>
+        <small>Codex is working</small>
+      </span>
+      <span className="activity-card__badge activity-card__badge--running">active</span>
+    </div>
+  );
+}
+
+export default function ActivityBlock({ items, running = false, onOpenDetail }: ActivityBlockProps) {
+  const label = items.length === 1 ? 'Activity' : 'Activity';
+  const eventCount = items.length === 1 ? '1 event' : `${items.length} events`;
+  const headerMeta = running ? (items.length > 0 ? `${eventCount} · running` : 'running') : eventCount;
+  return (
+    <div className={`activity-block${running ? ' activity-block--running' : ''}`}>
       <div className="activity-block__header">
         <span>{label}</span>
-        <small>{items.length === 1 ? '1 event' : `${items.length} events`}</small>
+        <small>{headerMeta}</small>
       </div>
       <div className="activity-block__list">
         {items.map((item) => (
           <ActivityRow key={item.id} item={item} onOpenDetail={onOpenDetail} />
         ))}
+        {running && <RunningActivityRow />}
       </div>
     </div>
   );

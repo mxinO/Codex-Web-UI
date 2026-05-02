@@ -359,7 +359,7 @@ export default function App() {
     () => visibleLiveTurnItems.some((item) => item.kind === 'streaming' && item.active && item.text.trim().length > 0),
     [visibleLiveTurnItems],
   );
-  const showRunningIndicator = isRunning && !hasActiveStreamingText;
+  const showActivityRunning = isRunning && !hasActiveStreamingText;
 
   const updateRetainedLiveTurnItems = useCallback((historyItems: TimelineItem[], additions: TimelineItem[] = []) => {
     setRetainedLiveTurnItems((current) => {
@@ -945,6 +945,7 @@ export default function App() {
                   onJumpToLatest={timeline.jumpToLatest}
                   hasOlder={timeline.hasOlder}
                   showJumpToLatest={!timeline.isViewingLatest}
+                  showActivityRunning={timeline.isViewingLatest && showActivityRunning}
                   loading={timeline.loading}
                   onOpenDetail={openDetailItem}
                   onApprovalDecision={respondToApproval}
@@ -958,12 +959,6 @@ export default function App() {
               )}
             </div>
             {activeFileSummary && <FileChangeTray summary={activeFileSummary} onOpenDiff={openFileSummaryDiff} />}
-            {showRunningIndicator && (
-              <div className="running-indicator" role="status" aria-live="polite">
-                <span className="running-indicator__mark" aria-hidden="true">*</span>
-                <span>Running ...</span>
-              </div>
-            )}
             <InputBox
               rpc={socket.rpc}
               threadId={activeThreadId}
