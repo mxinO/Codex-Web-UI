@@ -5,7 +5,16 @@ type TimelineItemOrder = { sortOrder?: number | null };
 
 export type TimelineItem = TimelineItemOrder & (
   | { id: string; kind: 'user'; timestamp: number; text: string }
-  | { id: string; kind: 'assistant'; timestamp: number; text: string; phase: string | null; turnId?: string | null; sourceId?: string | null }
+  | {
+      id: string;
+      kind: 'assistant';
+      timestamp: number;
+      text: string;
+      phase: string | null;
+      turnId?: string | null;
+      sourceId?: string | null;
+      liveSource?: 'event_msg' | 'item_completed';
+    }
   | { id: string; kind: 'command'; timestamp: number; command: string; cwd: string; output: string; status: string; exitCode: number | null }
   | { id: string; kind: 'bangCommand'; timestamp: number; command: string; cwd: string; output: string; status: string; exitCode: number | null }
   | {
@@ -53,6 +62,10 @@ export interface LiveNotificationWindow {
   activeThreadId: string | null;
   activeTurnId: string | null;
   startCount: number;
+}
+
+interface VisibleLiveTurnOptions {
+  allowAssistantTextMatchAcrossSources?: boolean;
 }
 
 export interface TimelineNotificationMeta {
@@ -654,6 +667,10 @@ function assistantTextKey(turnId: string, phase: string | null, text: string): s
   return `${turnId}\0${assistantPhaseGroup(phase)}\0${text}`;
 }
 
+function persistedAssistantTextKey(turnId: string, text: string): string {
+  return `${turnId}\0${text}`;
+}
+
 function liveAssistantItemId(turnId: string | null, sourceId: string | null, sequence: number): string {
   return sourceId && turnId ? `${turnId}:${sourceId}` : `live:assistant:${turnId ?? 'unscoped'}:${sequence}`;
 }
@@ -696,12 +713,13 @@ export function liveTurnItemsFromNotifications(
     phase: string | null,
     turnId: string | null,
     sourceId: string | null = null,
+    liveSource: Extract<TimelineItem, { kind: 'assistant' }>['liveSource'] = undefined,
     timestamp = now,
     sortOrder: number | null = null,
   ) => {
     const previous = items.at(-1);
     if (previous?.kind === 'assistant' && shouldReplaceLiveAssistantSnapshot(previous, text, phase, turnId, sourceId)) {
-      items[items.length - 1] = { ...previous, text, phase, turnId, sourceId };
+      items[items.length - 1] = { ...previous, text, phase, turnId, sourceId, liveSource };
       return;
     }
 
@@ -716,6 +734,7 @@ export function liveTurnItemsFromNotifications(
       phase,
       turnId,
       sourceId,
+      liveSource,
     });
     if (sourceId) streamingIndexes.delete(liveStreamingMessageKey(turnId, sourceId));
     if (deltaIndex === index) deltaIndex = null;
@@ -789,6 +808,7 @@ export function liveTurnItemsFromNotifications(
           notificationMessagePhase(notification),
           notificationTurnId(notification) ?? scope.activeTurnId,
           notificationMessageSourceId(notification),
+          'event_msg',
           timestamp,
           sortOrder,
         );
@@ -807,6 +827,7 @@ export function liveTurnItemsFromNotifications(
           nullableStringField(agentMessage, 'phase'),
           notificationTurnId(notification) ?? scope.activeTurnId,
           typeof agentMessage.id === 'string' ? agentMessage.id : null,
+          'item_completed',
           timestamp,
           sortOrder,
         );
@@ -835,21 +856,69 @@ export function liveTurnItemsFromNotifications(
   return items;
 }
 
-export function visibleLiveTurnItemsForTimeline(items: TimelineItem[], liveItems: TimelineItem[]): TimelineItem[] {
+export function visibleLiveTurnItemsForTimeline(
+  items: TimelineItem[],
+  liveItems: TimelineItem[],
+  options: VisibleLiveTurnOptions = {},
+): TimelineItem[] {
   const persistedIds = new Set(items.map((item) => item.id));
   const persistedAssistantsByTurn = assistantItemsByTurn(items);
   const liveAssistantsByTurn = assistantItemsByTurn(liveItems);
+  const persistedAssistantTextCounts = new Map<string, number>();
+  for (const [turnId, assistants] of persistedAssistantsByTurn) {
+    for (const assistant of assistants) {
+      const text = normalizedMessageBlock(assistant.text);
+      if (!text) continue;
+      const key = persistedAssistantTextKey(turnId, text);
+      persistedAssistantTextCounts.set(key, (persistedAssistantTextCounts.get(key) ?? 0) + 1);
+    }
+  }
+  const consumedPersistedAssistantTextCounts = new Map<string, number>();
   const emittedAssistantIdentityKeys = new Set<string>();
   const emittedUnidentifiedAssistantTextKeys = new Set<string>();
-  const emittedIdentifiedAssistantTextKeys = new Set<string>();
+  const emittedIdentifiedAssistantTextSourceCounts = new Map<string, Map<string, number>>();
+  const consumedIdentifiedAssistantTextSourceCounts = new Map<string, Map<string, number>>();
+
+  const consumePersistedAssistantTextMatch = (turnId: string, text: string): boolean => {
+    const key = persistedAssistantTextKey(turnId, text);
+    const count = persistedAssistantTextCounts.get(key) ?? 0;
+    const consumed = consumedPersistedAssistantTextCounts.get(key) ?? 0;
+    if (consumed >= count) return false;
+    consumedPersistedAssistantTextCounts.set(key, consumed + 1);
+    return true;
+  };
 
   const isPersistedAssistantMatch = (item: Extract<TimelineItem, { kind: 'assistant' | 'streaming' }>, turnId: string, text: string): boolean => {
     const persisted = persistedAssistantsByTurn.get(turnId) ?? [];
-    return persisted.some((assistant) => {
+    const exactOrCompatibleSource = persisted.some((assistant) => {
       if (normalizedMessageBlock(assistant.text) !== text) return false;
       if (item.sourceId && assistant.sourceId && item.sourceId !== assistant.sourceId) return false;
       return true;
     });
+    if (exactOrCompatibleSource) return consumePersistedAssistantTextMatch(turnId, text);
+    if (!options.allowAssistantTextMatchAcrossSources) return false;
+    return persisted.some((assistant) => normalizedMessageBlock(assistant.text) === text) && consumePersistedAssistantTextMatch(turnId, text);
+  };
+
+  const addIdentifiedAssistantTextSource = (textKey: string, source: string) => {
+    const counts = emittedIdentifiedAssistantTextSourceCounts.get(textKey) ?? new Map<string, number>();
+    counts.set(source, (counts.get(source) ?? 0) + 1);
+    emittedIdentifiedAssistantTextSourceCounts.set(textKey, counts);
+  };
+
+  const consumeIdentifiedAssistantTextFromOtherSource = (textKey: string, source: string): boolean => {
+    const emittedCounts = emittedIdentifiedAssistantTextSourceCounts.get(textKey);
+    if (!emittedCounts) return false;
+    const consumedCounts = consumedIdentifiedAssistantTextSourceCounts.get(textKey) ?? new Map<string, number>();
+    for (const [otherSource, emittedCount] of emittedCounts) {
+      if (otherSource === source) continue;
+      const consumedCount = consumedCounts.get(otherSource) ?? 0;
+      if (consumedCount >= emittedCount) continue;
+      consumedCounts.set(otherSource, consumedCount + 1);
+      consumedIdentifiedAssistantTextSourceCounts.set(textKey, consumedCounts);
+      return true;
+    }
+    return false;
   };
 
   const isCoveredByAssistant = (item: Extract<TimelineItem, { kind: 'streaming' }>): boolean => {
@@ -890,10 +959,18 @@ export function visibleLiveTurnItemsForTimeline(items: TimelineItem[], liveItems
       const textKey = assistantTextKey(turnId, item.phase, text);
       if (identityKey && emittedAssistantIdentityKeys.has(identityKey)) return false;
       if (identityKey && emittedUnidentifiedAssistantTextKeys.has(textKey)) return false;
-      if (!identityKey && (emittedUnidentifiedAssistantTextKeys.has(textKey) || emittedIdentifiedAssistantTextKeys.has(textKey))) return false;
+      if (
+        identityKey &&
+        item.liveSource &&
+        options.allowAssistantTextMatchAcrossSources &&
+        consumeIdentifiedAssistantTextFromOtherSource(textKey, item.liveSource)
+      ) {
+        return false;
+      }
+      if (!identityKey && (emittedUnidentifiedAssistantTextKeys.has(textKey) || emittedIdentifiedAssistantTextSourceCounts.has(textKey))) return false;
       if (identityKey) {
         emittedAssistantIdentityKeys.add(identityKey);
-        emittedIdentifiedAssistantTextKeys.add(textKey);
+        if (item.liveSource) addIdentifiedAssistantTextSource(textKey, item.liveSource);
       } else {
         emittedUnidentifiedAssistantTextKeys.add(textKey);
       }
@@ -912,9 +989,9 @@ export function visibleRetainedLiveTurnItemsForTimeline(
 ): TimelineItem[] {
   const currentLiveKeys = new Set(currentLiveItems.map(liveCurrentDuplicateKey));
   const currentAssistantItems = currentLiveItems.filter((item): item is Extract<TimelineItem, { kind: 'assistant' }> => item.kind === 'assistant');
-  return visibleLiveTurnItemsForTimeline([...historyItems, ...currentAssistantItems], retainedItems).filter(
-    (item) => !currentLiveKeys.has(liveCurrentDuplicateKey(item)),
-  );
+  return visibleLiveTurnItemsForTimeline([...historyItems, ...currentAssistantItems], retainedItems, {
+    allowAssistantTextMatchAcrossSources: true,
+  }).filter((item) => !currentLiveKeys.has(liveCurrentDuplicateKey(item)));
 }
 
 export function pendingUserItemsWithoutHistory<T extends Extract<TimelineItem, { kind: 'user' }>>(historyItems: TimelineItem[], pendingItems: T[]): T[] {
@@ -1000,8 +1077,8 @@ export function mergeRetainedLiveTurnItems(
   additions: TimelineItem[],
   limit = 200,
 ): TimelineItem[] {
-  const retained = visibleLiveTurnItemsForTimeline(historyItems, retainedItems);
-  const visibleAdditions = visibleLiveTurnItemsForTimeline(historyItems, additions).filter(
+  const retained = visibleLiveTurnItemsForTimeline(historyItems, retainedItems, { allowAssistantTextMatchAcrossSources: true });
+  const visibleAdditions = visibleLiveTurnItemsForTimeline(historyItems, additions, { allowAssistantTextMatchAcrossSources: true }).filter(
     (item) => !(item.kind === 'streaming' && item.active),
   );
   if (retained.length === 0 && visibleAdditions.length === 0) return [];
@@ -1015,7 +1092,7 @@ export function mergeRetainedLiveTurnItems(
     merged.push(item);
   }
 
-  return trimTimelineWindow(visibleLiveTurnItemsForTimeline(historyItems, merged), limit);
+  return trimTimelineWindow(visibleLiveTurnItemsForTimeline(historyItems, merged, { allowAssistantTextMatchAcrossSources: true }), limit);
 }
 
 export function timelineItemsWithLiveTurnOverlay(items: TimelineItem[], liveItems: TimelineItem[], activeTurnId: string | null | undefined): TimelineItem[] {

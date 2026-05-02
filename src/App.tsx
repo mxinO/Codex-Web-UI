@@ -21,6 +21,7 @@ import {
   REASONING_EFFORTS,
   SANDBOX_MODES,
   effectiveMode,
+  displayRuntimeValue,
   legacySandboxFromMode,
   sanitizeStoredEffort,
   sanitizeStoredMode,
@@ -300,8 +301,8 @@ export default function App() {
     [activeThreadId, liveNotificationActiveTurnId, liveNotifications, socket.notificationCount],
   );
   const visibleLiveTurnItems = useMemo(
-    () => visibleLiveTurnItemsForTimeline(timelineItemsForChat, liveTurnItems),
-    [liveTurnItems, timelineItemsForChat],
+    () => visibleLiveTurnItemsForTimeline(timelineItemsForChat, liveTurnItems, { allowAssistantTextMatchAcrossSources: !state?.activeTurnId }),
+    [liveTurnItems, state?.activeTurnId, timelineItemsForChat],
   );
   const visibleRetainedLiveTurnItems = useMemo(
     () => visibleRetainedLiveTurnItemsForTimeline(timelineItemsForChat, visibleLiveTurnItems, retainedLiveTurnItems),
@@ -354,6 +355,14 @@ export default function App() {
     ]);
   }, [approvalItems, claimedQueuedUserItems, ephemeralItems, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items, timelineItemsForChat, visibleLiveTurnItems, visibleRetainedFileSummaryItems, visibleRetainedLiveTurnItems]);
   const runOptions = useMemo<CodexRunOptions>(() => ({ model, mode: effectiveMode(mode, model), effort, sandbox }), [effort, mode, model, sandbox]);
+  const serverModel = sanitizeStoredModel(state?.model ?? null);
+  const serverEffort = sanitizeStoredEffort(state?.effort ?? null);
+  const serverMode = sanitizeStoredMode(state?.mode ?? null);
+  const serverSandbox = sanitizeStoredSandbox(state?.sandbox ?? null);
+  const displayModel = displayRuntimeValue(activeThreadId, serverModel, model);
+  const displayEffort = displayRuntimeValue(activeThreadId, serverEffort, effort);
+  const displayMode = displayRuntimeValue(activeThreadId, serverMode, mode);
+  const displaySandbox = displayRuntimeValue(activeThreadId, serverSandbox, sandbox);
   const isRunning = Boolean(state?.activeTurnId || (pendingCompactionThreadId && pendingCompactionThreadId === activeThreadId));
   const hasActiveStreamingText = useMemo(
     () => visibleLiveTurnItems.some((item) => item.kind === 'streaming' && item.active && item.text.trim().length > 0),
@@ -729,7 +738,7 @@ export default function App() {
       }
       if (command === '/status') {
         setSessionError(
-          `Host ${socket.hello?.hostname ?? 'unknown'}; session ${activeThreadId ?? 'none'}; cwd ${state?.activeCwd ?? 'none'}; model ${model ?? 'default'}; effort ${effort ?? 'default'}; mode ${mode ?? 'default'}; sandbox ${sandbox ?? 'default'}; connection ${socket.connectionState}`,
+          `Host ${socket.hello?.hostname ?? 'unknown'}; session ${activeThreadId ?? 'none'}; cwd ${state?.activeCwd ?? 'none'}; model ${displayModel ?? 'default'}; effort ${displayEffort ?? 'default'}; mode ${displayMode ?? 'default'}; sandbox ${displaySandbox ?? 'default'}; connection ${socket.connectionState}`,
         );
         return;
       }
@@ -824,7 +833,7 @@ export default function App() {
 
     window.addEventListener('webui-slash-command', handleSlashCommand);
     return () => window.removeEventListener('webui-slash-command', handleSlashCommand);
-  }, [activeThreadId, effort, loadSessions, mode, model, resumeSession, sandbox, setEffort, setMode, setModel, setSandbox, socket.connectionState, socket.hello?.hostname, socket.rpc, state?.activeCwd]);
+  }, [activeThreadId, displayEffort, displayMode, displayModel, displaySandbox, loadSessions, mode, model, resumeSession, setEffort, setMode, setModel, setSandbox, socket.connectionState, socket.hello?.hostname, socket.rpc, state?.activeCwd]);
 
   const editQueued = async (message: ClientQueuedMessage) => {
     setSessionError(null);
@@ -910,10 +919,10 @@ export default function App() {
         connectionState={socket.connectionState}
         activeThreadId={state?.activeThreadId ?? null}
         cwd={state?.activeCwd ?? null}
-        model={model}
-        mode={mode}
-        effort={effort}
-        sandbox={sandbox}
+        model={displayModel}
+        mode={displayMode}
+        effort={displayEffort}
+        sandbox={displaySandbox}
         appServerHealth={socket.hello?.appServerHealth ?? null}
         theme={theme}
         onToggleTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')}

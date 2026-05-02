@@ -22,6 +22,10 @@ export interface HostRuntimeState {
   activeThreadPath: string | null;
   activeTurnId: string | null;
   activeCwd: string | null;
+  model: string | null;
+  effort: CodexReasoningEffort | null;
+  mode: CodexCollaborationMode | null;
+  sandbox: CodexSandboxMode | null;
   authTokenHash: string | null;
   appServerUrl: string | null;
   appServerPid: number | null;

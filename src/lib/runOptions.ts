@@ -38,3 +38,7 @@ export function legacySandboxFromMode(value: string | null): string | null {
 export function effectiveMode(mode: string | null, model: string | null): string | null {
   return model ? sanitizeStoredMode(mode) : null;
 }
+
+export function displayRuntimeValue(activeThreadId: string | null | undefined, serverValue: string | null, localValue: string | null): string | null {
+  return activeThreadId ? serverValue : localValue ?? serverValue;
+}

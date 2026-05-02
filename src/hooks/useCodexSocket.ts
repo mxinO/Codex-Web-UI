@@ -23,6 +23,10 @@ interface ServerHello {
     activeThreadPath: string | null;
     activeTurnId: string | null;
     activeCwd: string | null;
+    model: string | null;
+    effort: string | null;
+    mode: string | null;
+    sandbox: string | null;
     theme: 'dark' | 'light';
     queue: Array<{ id: string; text: string; createdAt: number; options?: Partial<CodexRunOptions> }>;
   };

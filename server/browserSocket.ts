@@ -218,6 +218,59 @@ function getStringPath(value: unknown, path: string[]): string | null {
   return typeof current === 'string' && current.trim() ? current.trim() : null;
 }
 
+function getValuePath(value: unknown, path: string[]): unknown {
+  let current = value;
+  for (const key of path) {
+    if (!isRecord(current)) return undefined;
+    current = current[key];
+  }
+  return current;
+}
+
+function enumValue<T extends string>(value: unknown, allowed: Set<T>): T | null {
+  return typeof value === 'string' && allowed.has(value as T) ? (value as T) : null;
+}
+
+function sandboxModeFromPolicy(value: unknown): CodexSandboxMode | null {
+  const type = getStringPath(value, ['type']);
+  if (type === 'dangerFullAccess') return 'danger-full-access';
+  if (type === 'readOnly') return 'read-only';
+  if (type === 'workspaceWrite') return 'workspace-write';
+  return enumValue(value, SANDBOX_MODES);
+}
+
+function runtimeStatusFromThreadResult(result: unknown, fallback?: CodexRunOptions): Pick<HostRuntimeState, 'model' | 'effort' | 'mode' | 'sandbox'> {
+  const model = getStringPath(result, ['model']) ?? getStringPath(result, ['data', 'model']) ?? fallback?.model ?? null;
+  const effort =
+    enumValue(getValuePath(result, ['reasoningEffort']), REASONING_EFFORTS) ??
+    enumValue(getValuePath(result, ['reasoning_effort']), REASONING_EFFORTS) ??
+    enumValue(getValuePath(result, ['effort']), REASONING_EFFORTS) ??
+    fallback?.effort ??
+    null;
+  const sandbox =
+    sandboxModeFromPolicy(getValuePath(result, ['sandbox'])) ??
+    sandboxModeFromPolicy(getValuePath(result, ['data', 'sandbox'])) ??
+    fallback?.sandbox ??
+    null;
+  return {
+    model,
+    effort,
+    mode: fallback?.mode ?? null,
+    sandbox,
+  };
+}
+
+function applyRunOptionsToRuntimeState(state: HostRuntimeState, options?: CodexRunOptions): HostRuntimeState {
+  if (!options) return state;
+  return {
+    ...state,
+    model: options.model ?? state.model,
+    effort: options.effort ?? state.effort,
+    mode: options.mode ?? state.mode,
+    sandbox: options.sandbox ?? state.sandbox,
+  };
+}
+
 function notificationPayload(message: { params?: unknown; payload?: unknown }): unknown {
   if (isRecord(message.params) && isRecord(message.params.payload)) return message.params.payload;
   if (isRecord(message.payload)) return message.payload;
@@ -1679,6 +1732,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         activeThreadId: null,
         activeThreadPath: null,
         activeTurnId: null,
+        model: null,
+        effort: null,
+        mode: null,
+        sandbox: null,
       };
     });
     logWarn('Cleared missing active Codex thread', {
@@ -1738,19 +1795,21 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       .then((result) => {
         const activeCwd = extractThreadCwd(result);
         const activeThreadPath = extractThreadPath(result);
+        const runtimeStatus = runtimeStatusFromThreadResult(result);
         rememberKnownThreadPath(threadId, activeThreadPath);
-        if (activeCwd || activeThreadPath) {
-          deps.stateStore.update((state) =>
-            state.activeThreadId === threadId
-              ? {
-                  ...state,
-                  activeCwd: activeCwd ?? state.activeCwd,
-                  activeThreadPath: activeThreadPath ?? state.activeThreadPath,
-                  recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
-                }
-              : state,
-          );
-        }
+        let updatedActiveThread = false;
+        const nextState = deps.stateStore.update((state) => {
+          if (state.activeThreadId !== threadId) return state;
+          updatedActiveThread = true;
+          return {
+            ...state,
+            activeCwd: activeCwd ?? state.activeCwd,
+            activeThreadPath: activeThreadPath ?? state.activeThreadPath,
+            recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
+            ...runtimeStatus,
+          };
+        });
+        if (updatedActiveThread) broadcastHello(nextState);
         resumedThreadIds.add(threadId);
       })
       .catch((error) => {
@@ -1880,7 +1939,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
       claim.threadId = current.activeThreadId;
       claim.queuedMessage = shifted.next;
-      return { ...current, activeTurnId: pendingTurnStartTurnId(current.activeThreadId), queue: shifted.queue };
+      return applyRunOptionsToRuntimeState(
+        { ...current, activeTurnId: pendingTurnStartTurnId(current.activeThreadId), queue: shifted.queue },
+        shifted.next.options,
+      );
     });
     broadcastHello(claimed);
 
@@ -1911,10 +1973,12 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       const next = deps.stateStore.update((current) => {
         if (current.activeThreadId !== threadId) return current;
         if (alreadyCompleted && (current.activeTurnId === nextTurnId || isPendingTurnStartForThread(current.activeTurnId, threadId))) {
-          return { ...current, activeTurnId: null };
+          return applyRunOptionsToRuntimeState({ ...current, activeTurnId: null }, queuedMessage.options);
         }
-        if (current.activeTurnId === nextTurnId) return current;
-        if (isPendingTurnStartForThread(current.activeTurnId, threadId)) return { ...current, activeTurnId: nextTurnId };
+        if (current.activeTurnId === nextTurnId) return applyRunOptionsToRuntimeState(current, queuedMessage.options);
+        if (isPendingTurnStartForThread(current.activeTurnId, threadId)) {
+          return applyRunOptionsToRuntimeState({ ...current, activeTurnId: nextTurnId }, queuedMessage.options);
+        }
         return current;
       });
       if (next.activeThreadId === threadId) {
@@ -2115,15 +2179,17 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
+          const options = runOptionsFromParams(request.params);
           const params = applyThreadRunOptions<SessionStartParams & { experimentalRawEvents: boolean; persistExtendedHistory: boolean; [key: string]: unknown }>({
             cwd,
             experimentalRawEvents: true,
             persistExtendedHistory: true,
-          }, runOptionsFromParams(request.params));
+          }, options);
           const result = await requestCodex('thread/start', params);
           const activeCwd = extractThreadCwd(result) ?? cwd;
           const activeThreadId = extractThreadId(result);
           const activeThreadPath = extractThreadPath(result);
+          const runtimeStatus = runtimeStatusFromThreadResult(result, options);
           rememberKnownThreadPath(activeThreadId, activeThreadPath);
           if (activeThreadId) resumedThreadIds.add(activeThreadId);
           const state = deps.stateStore.update((state) => ({
@@ -2132,6 +2198,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             activeThreadPath,
             activeTurnId: null,
             activeCwd,
+            ...runtimeStatus,
             recentCwds: rememberCwd(state.recentCwds, activeCwd),
           }));
           send(ws, { type: 'rpc/result', id: request.id, result });
@@ -2147,11 +2214,12 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
           const requestedThreadPath = getOptionalString(request.params, 'threadPath');
 
+          const options = runOptionsFromParams(request.params);
           const params = applyThreadRunOptions<SessionResumeParams & { experimentalRawEvents: boolean; persistExtendedHistory: boolean; [key: string]: unknown }>({
             threadId,
             experimentalRawEvents: true,
             persistExtendedHistory: true,
-          }, runOptionsFromParams(request.params));
+          }, options);
           const result = await requestCodex('thread/resume', params).catch((error) => {
             if (isMissingThreadError(error)) clearMissingActiveThread(threadId, error);
             throw error;
@@ -2161,6 +2229,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           const resultThreadPath = extractThreadPath(result);
           const activeThreadPath =
             resultThreadPath ?? (requestedThreadPath && knownThreadPaths.get(threadId) === requestedThreadPath ? requestedThreadPath : null);
+          const runtimeStatus = runtimeStatusFromThreadResult(result, options);
           rememberKnownThreadPath(threadId, activeThreadPath);
           const state = deps.stateStore.update((state) => ({
             ...state,
@@ -2168,6 +2237,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             activeThreadPath,
             activeTurnId: null,
             activeCwd,
+            ...runtimeStatus,
             recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
           }));
           send(ws, { type: 'rpc/result', id: request.id, result: sanitizeThreadHistory(result) });
@@ -2473,9 +2543,12 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
+          const options = runOptionsFromParams(request.params);
           const pendingTurnId = pendingTurnStartTurnId(threadId);
           const pendingState = deps.stateStore.update((current) =>
-            current.activeThreadId === threadId && !current.activeTurnId ? { ...current, activeTurnId: pendingTurnId } : current,
+            current.activeThreadId === threadId && !current.activeTurnId
+              ? applyRunOptionsToRuntimeState({ ...current, activeTurnId: pendingTurnId }, options)
+              : current,
           );
           if (pendingState.activeThreadId === threadId && pendingState.activeTurnId === pendingTurnId) {
             rememberTurnThreadPath(threadId, pendingTurnId, pendingState.activeThreadPath);
@@ -2485,7 +2558,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
           let result: { turn: { id: string } };
           try {
-            result = await startTurn({ threadId, text, options: runOptionsFromParams(request.params) });
+            result = await startTurn({ threadId, text, options });
           } catch (error) {
             if (!isTurnStartTimeout(error)) {
               const cleared = clearActiveTurn({ threadId, turnId: pendingTurnId }, { broadcast: false });
@@ -2499,10 +2572,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           const state = deps.stateStore.update((current) => {
             if (current.activeThreadId !== threadId) return current;
             if (alreadyCompleted && (current.activeTurnId === nextTurnId || current.activeTurnId === pendingTurnId)) {
-              return { ...current, activeTurnId: null };
+              return applyRunOptionsToRuntimeState({ ...current, activeTurnId: null }, options);
             }
-            if (current.activeTurnId === nextTurnId) return current;
-            if (current.activeTurnId === pendingTurnId) return { ...current, activeTurnId: nextTurnId };
+            if (current.activeTurnId === nextTurnId) return applyRunOptionsToRuntimeState(current, options);
+            if (current.activeTurnId === pendingTurnId) return applyRunOptionsToRuntimeState({ ...current, activeTurnId: nextTurnId }, options);
             return current;
           });
           if (state.activeThreadId === threadId && state.activeTurnId === nextTurnId) {

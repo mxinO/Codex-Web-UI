@@ -235,6 +235,34 @@ describe('attachBrowserSocket session RPCs', () => {
     });
   });
 
+  it('records app-server runtime status when starting sessions', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({
+      thread: { id: 'thread-1', cwd: '/work/project' },
+      model: 'gpt-5.5',
+      reasoningEffort: 'xhigh',
+      sandbox: { type: 'workspaceWrite', writableRoots: ['/work/project'], readOnlyAccess: { type: 'fullAccess' }, networkAccess: false, excludeTmpdirEnvVar: false, excludeSlashTmp: false },
+    });
+    const { ws, stateStore } = await makeHarness(request);
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 23,
+        method: 'webui/session/start',
+        params: { cwd: '/work/project', options: { model: 'gpt-5.5', effort: 'high', mode: 'plan' } },
+      }),
+    );
+    await nextRpcResponse(ws, 23);
+
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      model: 'gpt-5.5',
+      effort: 'xhigh',
+      mode: 'plan',
+      sandbox: 'workspace-write',
+    });
+  });
+
   it('forwards effort-only options as session config overrides', async () => {
     const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ thread: { id: 'thread-1', cwd: '/work/project' } });
     const { ws } = await makeHarness(request);
@@ -359,6 +387,26 @@ describe('attachBrowserSocket session RPCs', () => {
       model: 'gpt-5.5',
       sandbox: 'danger-full-access',
       config: { model_reasoning_effort: 'xhigh' },
+    });
+  });
+
+  it('records app-server runtime status when resuming sessions', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({
+      thread: { id: 'thread-2', cwd: '/work/resumed', turns: [] },
+      model: 'gpt-5.4',
+      reasoningEffort: 'medium',
+      sandbox: { type: 'dangerFullAccess' },
+    });
+    const { ws, stateStore } = await makeHarness(request);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 24, method: 'webui/session/resume', params: { threadId: 'thread-2' } }));
+    await nextRpcResponse(ws, 24);
+
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-2',
+      model: 'gpt-5.4',
+      effort: 'medium',
+      sandbox: 'danger-full-access',
     });
   });
 
@@ -2474,6 +2522,71 @@ describe('attachBrowserSocket app-server lifecycle', () => {
     expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'thread/turns/list']);
   });
 
+  it('broadcasts app-server runtime status after resuming a persisted active thread', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method: string) => {
+      if (method === 'thread/resume') {
+        return {
+          thread: { id: 'thread-1', cwd: '/work/project' },
+          model: 'gpt-5.5',
+          reasoningEffort: 'high',
+          sandbox: { type: 'readOnly', access: { type: 'fullAccess' }, networkAccess: false },
+        };
+      }
+      return { data: [] };
+    });
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1' });
+
+    const messages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 410, method: 'thread/turns/list', params: { threadId: 'thread-1' } }));
+    const [hello, response] = await messages;
+
+    expect(hello).toMatchObject({
+      type: 'server/hello',
+      state: {
+        activeThreadId: 'thread-1',
+        activeCwd: '/work/project',
+        model: 'gpt-5.5',
+        effort: 'high',
+        sandbox: 'read-only',
+      },
+    });
+    expect(response).toEqual({ type: 'rpc/result', id: 410, result: { data: [] } });
+  });
+
+  it('clears stale runtime status after an implicit resume omits app-server runtime fields', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project' }, reasoningEffort: null };
+      return { data: [] };
+    });
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      model: 'stale-model',
+      effort: 'high',
+      mode: 'plan',
+      sandbox: 'danger-full-access',
+    });
+
+    const messages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 411, method: 'thread/turns/list', params: { threadId: 'thread-1' } }));
+    const [hello, response] = await messages;
+
+    expect(hello).toMatchObject({
+      type: 'server/hello',
+      state: {
+        activeThreadId: 'thread-1',
+        activeCwd: '/work/project',
+        model: null,
+        effort: null,
+        mode: null,
+        sandbox: null,
+      },
+    });
+    expect(response).toEqual({ type: 'rpc/result', id: 411, result: { data: [] } });
+  });
+
   it('adds stored file summaries to terminal turn history responses', async () => {
     const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
     const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
@@ -3122,6 +3235,11 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       effort: 'high',
       sandboxPolicy: { type: 'dangerFullAccess' },
     }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({
+      model: 'gpt-5.5',
+      effort: 'high',
+      sandbox: 'danger-full-access',
+    });
   });
 
   it('forwards collaboration mode when starting direct turns', async () => {

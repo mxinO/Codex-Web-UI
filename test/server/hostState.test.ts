@@ -27,6 +27,8 @@ describe('HostStateStore', () => {
       expect(store.read()).toMatchObject({
         hostname: 'login-node',
         activeThreadId: null,
+        model: null,
+        effort: null,
         queue: [],
       });
     } finally {
@@ -61,6 +63,30 @@ describe('HostStateStore', () => {
       expect(state.recentCwds).toHaveLength(20);
       expect(state.recentCwds[0]).toBe('/work/5');
       expect(state.recentCwds[19]).toBe('/work/24');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('sanitizes persisted runtime status fields', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codex-webui-state-'));
+    try {
+      writeFileSync(
+        join(dir, 'login-node.runtime.json'),
+        JSON.stringify({
+          model: ' gpt-5.5 ',
+          effort: 'xhigh',
+          mode: 'plan',
+          sandbox: 'danger-full-access',
+        }),
+      );
+
+      expect(new HostStateStore(dir, 'login-node').read()).toMatchObject({
+        model: 'gpt-5.5',
+        effort: 'xhigh',
+        mode: 'plan',
+        sandbox: 'danger-full-access',
+      });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

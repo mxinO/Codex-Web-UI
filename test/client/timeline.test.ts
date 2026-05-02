@@ -640,6 +640,116 @@ describe('timeline', () => {
 
     expect(liveItems.map((item) => item.id)).toEqual(['turn-1:a1', 'turn-1:a2']);
     expect(visibleLiveTurnItemsForTimeline([], liveItems).map((item) => item.id)).toEqual(['turn-1:a1', 'turn-1:a2']);
+    expect(visibleLiveTurnItemsForTimeline([], liveItems, { allowAssistantTextMatchAcrossSources: true }).map((item) => item.id)).toEqual([
+      'turn-1:a1',
+      'turn-1:a2',
+    ]);
+  });
+
+  it('hides completed live assistant snapshots with different transport ids after history catches up', () => {
+    const history = turnToTimelineItems({
+      id: 'turn-1',
+      status: 'completed',
+      startedAt: 1,
+      completedAt: 2,
+      items: [
+        { type: 'agentMessage', id: 'persisted-1', text: 'I will inspect the file.', phase: 'commentary' },
+        { type: 'agentMessage', id: 'persisted-2', text: 'Now I will patch it.', phase: 'commentary' },
+      ],
+    });
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', id: 'transport-1', message: 'I will inspect the file.', phase: 'commentary', turn_id: 'turn-1' } },
+        { method: 'event_msg', params: { type: 'agent_message', id: 'transport-2', message: 'Now I will patch it.', phase: 'commentary', turn_id: 'turn-1' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      100,
+    );
+
+    expect(visibleLiveTurnItemsForTimeline(history, liveItems).map((item) => item.id)).toEqual(['turn-1:transport-1', 'turn-1:transport-2']);
+    expect(visibleLiveTurnItemsForTimeline(history, liveItems, { allowAssistantTextMatchAcrossSources: true })).toEqual([]);
+  });
+
+  it('keeps extra same-text live assistant snapshots beyond the persisted history count', () => {
+    const history = turnToTimelineItems({
+      id: 'turn-1',
+      status: 'completed',
+      startedAt: 1,
+      completedAt: 2,
+      items: [{ type: 'agentMessage', id: 'persisted-1', text: 'Done.', phase: 'commentary' }],
+    });
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', id: 'transport-1', message: 'Done.', phase: 'commentary', turn_id: 'turn-1' } },
+        { method: 'event_msg', params: { type: 'agent_message', id: 'transport-2', message: 'Done.', phase: 'commentary', turn_id: 'turn-1' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      100,
+    );
+
+    expect(visibleLiveTurnItemsForTimeline(history, liveItems, { allowAssistantTextMatchAcrossSources: true }).map((item) => item.id)).toEqual([
+      'turn-1:transport-2',
+    ]);
+  });
+
+  it('dedupes event-message and completed-message assistant snapshots with different transport ids after completion', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', id: 'transport-1', message: 'Done.', phase: 'commentary', turn_id: 'turn-1' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'persisted-1', text: 'Done.', phase: 'commentary' },
+          },
+        },
+        { method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-1' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      100,
+    );
+
+    expect(visibleLiveTurnItemsForTimeline([], liveItems).map((item) => item.id)).toEqual(['turn-1:transport-1', 'turn-1:persisted-1']);
+    expect(visibleLiveTurnItemsForTimeline([], liveItems, { allowAssistantTextMatchAcrossSources: true }).map((item) => item.id)).toEqual([
+      'turn-1:transport-1',
+    ]);
+  });
+
+  it('dedupes repeated event/completed assistant pairs without collapsing legitimate repeated text', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', id: 'transport-1', message: 'Done.', phase: 'commentary', turn_id: 'turn-1' } },
+        { method: 'event_msg', params: { type: 'agent_message', id: 'transport-2', message: 'Done.', phase: 'commentary', turn_id: 'turn-1' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'persisted-1', text: 'Done.', phase: 'commentary' },
+          },
+        },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'persisted-2', text: 'Done.', phase: 'commentary' },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      100,
+    );
+
+    expect(visibleLiveTurnItemsForTimeline([], liveItems, { allowAssistantTextMatchAcrossSources: true }).map((item) => item.id)).toEqual([
+      'turn-1:transport-1',
+      'turn-1:transport-2',
+    ]);
   });
 
   it('only removes retained streaming for the matching persisted message source id', () => {

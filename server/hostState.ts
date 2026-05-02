@@ -26,6 +26,10 @@ function defaultState(hostname: string): HostRuntimeState {
     activeThreadPath: null,
     activeTurnId: null,
     activeCwd: null,
+    model: null,
+    effort: null,
+    mode: null,
+    sandbox: null,
     authTokenHash: null,
     appServerUrl: null,
     appServerPid: null,
@@ -91,12 +95,17 @@ function sanitizeState(
   const base = defaultState(hostname);
   if (!value || typeof value !== 'object') return base;
   const candidate = value as Partial<HostRuntimeState>;
+  const model = typeof candidate.model === 'string' && candidate.model.trim() ? candidate.model.trim() : null;
 
   return {
     ...base,
     ...candidate,
     hostname,
     activeThreadPath: typeof candidate.activeThreadPath === 'string' && candidate.activeThreadPath.trim() ? candidate.activeThreadPath : null,
+    model,
+    effort: (optionalEnum(candidate.effort, REASONING_EFFORTS) as HostRuntimeState['effort']) ?? null,
+    mode: model ? ((optionalEnum(candidate.mode, COLLABORATION_MODES) as HostRuntimeState['mode']) ?? null) : null,
+    sandbox: (optionalEnum(candidate.sandbox, SANDBOX_MODES) as HostRuntimeState['sandbox']) ?? null,
     queue: Array.isArray(candidate.queue)
       ? candidate.queue
           .map(sanitizeQueuedMessage)
