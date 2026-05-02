@@ -1791,7 +1791,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     if (existing) return existing;
 
     let resumePromise: Promise<void>;
-    resumePromise = requestCodex('thread/resume', { threadId, experimentalRawEvents: true, persistExtendedHistory: true })
+    resumePromise = requestCodex('thread/resume', { threadId, experimentalRawEvents: true, persistExtendedHistory: true, excludeTurns: true })
       .then((result) => {
         const activeCwd = extractThreadCwd(result);
         const activeThreadPath = extractThreadPath(result);
@@ -2219,6 +2219,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             threadId,
             experimentalRawEvents: true,
             persistExtendedHistory: true,
+            excludeTurns: true,
           }, options);
           const result = await requestCodex('thread/resume', params).catch((error) => {
             if (isMissingThreadError(error)) clearMissingActiveThread(threadId, error);

@@ -302,6 +302,7 @@ describe('attachBrowserSocket session RPCs', () => {
       threadId: 'thread-2',
       experimentalRawEvents: true,
       persistExtendedHistory: true,
+      excludeTurns: true,
     });
     expect(response).toEqual({
       type: 'rpc/result',
@@ -384,6 +385,7 @@ describe('attachBrowserSocket session RPCs', () => {
       threadId: 'thread-2',
       experimentalRawEvents: true,
       persistExtendedHistory: true,
+      excludeTurns: true,
       model: 'gpt-5.5',
       sandbox: 'danger-full-access',
       config: { model_reasoning_effort: 'xhigh' },
@@ -438,6 +440,7 @@ describe('attachBrowserSocket session RPCs', () => {
       threadId: 'thread-1',
       experimentalRawEvents: true,
       persistExtendedHistory: true,
+      excludeTurns: true,
     });
     expect(request).toHaveBeenCalledWith('thread/compact/start', { threadId: 'thread-1' });
     expect(response).toEqual({ type: 'rpc/result', id: 41, result: {} });
@@ -2492,6 +2495,12 @@ describe('attachBrowserSocket app-server lifecycle', () => {
     expect(response).toEqual({ type: 'rpc/result', id: 40, result: { data: [] } });
     expect(start).toHaveBeenCalledTimes(1);
     expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'thread/turns/list']);
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', {
+      threadId: 'thread-1',
+      experimentalRawEvents: true,
+      persistExtendedHistory: true,
+      excludeTurns: true,
+    });
     expect(start.mock.invocationCallOrder[0]).toBeLessThan(request.mock.invocationCallOrder[0]);
   });
 
@@ -3047,7 +3056,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       id: 17,
       result: { ok: false, cleared: true, error: 'thread not found' },
     });
-    expect(request).toHaveBeenCalledWith('thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true });
+    expect(request).toHaveBeenCalledWith('thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true, excludeTurns: true });
     expect(stateStore.read()).toMatchObject({ activeThreadId: null, activeThreadPath: null, activeTurnId: null, activeCwd: '/work/project' });
   });
 
@@ -3295,7 +3304,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     await waitForRequestCalls(request, 2);
 
     expect(request).toHaveBeenCalledTimes(2);
-    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true });
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true, excludeTurns: true });
     expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'next', text_elements: [] }],
@@ -3509,7 +3518,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     notify('event_msg', { payload: { type: 'task_complete', thread_id: 'thread-1', turn_id: 'turn-old' } });
     await waitForRequestCalls(request, 2);
 
-    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true });
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true, excludeTurns: true });
     expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'next', text_elements: [] }],
@@ -3608,7 +3617,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     await waitForRequestCalls(request, 2);
 
     expect(request).toHaveBeenCalledTimes(2);
-    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true });
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true, excludeTurns: true });
     expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'first', text_elements: [] }],
