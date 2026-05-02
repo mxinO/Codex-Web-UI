@@ -835,7 +835,7 @@ export default function App() {
     return () => window.removeEventListener('webui-slash-command', handleSlashCommand);
   }, [activeThreadId, displayEffort, displayMode, displayModel, displaySandbox, loadSessions, mode, model, resumeSession, setEffort, setMode, setModel, setSandbox, socket.connectionState, socket.hello?.hostname, socket.rpc, state?.activeCwd]);
 
-  const editQueued = async (message: ClientQueuedMessage) => {
+  const editQueued = useCallback(async (message: ClientQueuedMessage) => {
     setSessionError(null);
     try {
       await removeFromQueue(message.id);
@@ -843,18 +843,18 @@ export default function App() {
     } catch (error) {
       setSessionError(error instanceof Error ? error.message : String(error));
     }
-  };
+  }, [removeFromQueue]);
 
-  const removeQueued = async (id: string) => {
+  const removeQueued = useCallback(async (id: string) => {
     setSessionError(null);
     try {
       await removeFromQueue(id);
     } catch (error) {
       setSessionError(error instanceof Error ? error.message : String(error));
     }
-  };
+  }, [removeFromQueue]);
 
-  const openFile = async (path: string, readOnly: boolean) => {
+  const openFile = useCallback(async (path: string, readOnly: boolean) => {
     setSessionError(null);
     const normalizedPath = normalizeMentionedFilePath(path);
     if (isImagePath(normalizedPath)) {
@@ -876,7 +876,19 @@ export default function App() {
     } catch (error) {
       setSessionError(error instanceof Error ? error.message : String(error));
     }
-  };
+  }, [socket.rpc]);
+
+  const handleQueuedEdit = useCallback((message: Extract<TimelineItem, { kind: 'queued' }>['message']) => {
+    void editQueued(message as ClientQueuedMessage);
+  }, [editQueued]);
+
+  const handleQueuedRemove = useCallback((id: string) => {
+    void removeQueued(id);
+  }, [removeQueued]);
+
+  const handleOpenMentionedFile = useCallback((path: string) => {
+    void openFile(path, true);
+  }, [openFile]);
 
   const saveFile = async (path: string, content: string) => {
     const currentMetadata = await socket.rpc<unknown>('webui/fs/getMetadata', { path });
@@ -909,7 +921,7 @@ export default function App() {
         return next;
       });
     },
-    [socket],
+    [socket.rpc],
   );
 
   return (
@@ -958,10 +970,10 @@ export default function App() {
                   loading={timeline.loading}
                   onOpenDetail={openDetailItem}
                   onApprovalDecision={respondToApproval}
-                  onQueuedEdit={(message) => void editQueued(message as ClientQueuedMessage)}
-                  onQueuedRemove={(id) => void removeQueued(id)}
+                  onQueuedEdit={handleQueuedEdit}
+                  onQueuedRemove={handleQueuedRemove}
                   onOpenFileSummary={openFileSummaryDiff}
-                  onOpenMentionedFile={(path) => void openFile(path, true)}
+                  onOpenMentionedFile={handleOpenMentionedFile}
                 />
               ) : (
                 <div className="empty-state">No active session loaded.</div>

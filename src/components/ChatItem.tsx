@@ -1,4 +1,4 @@
-import { lazy, Suspense } from 'react';
+import { lazy, memo, Suspense } from 'react';
 import { FileDiff } from 'lucide-react';
 import type { TimelineItem } from '../lib/timeline';
 import ApprovalCard from './ApprovalCard';
@@ -44,7 +44,7 @@ function toolLabel(item: TimelineItem): string {
   return `Tool: ${type}`;
 }
 
-export default function ChatItem({
+function ChatItem({
   item,
   onOpenDetail,
   onApprovalDecision,
@@ -194,3 +194,15 @@ export default function ChatItem({
     </div>
   );
 }
+
+export default memo(ChatItem, (previous, next) => {
+  return (
+    previous.item === next.item &&
+    previous.onOpenDetail === next.onOpenDetail &&
+    previous.onApprovalDecision === next.onApprovalDecision &&
+    previous.onQueuedEdit === next.onQueuedEdit &&
+    previous.onQueuedRemove === next.onQueuedRemove &&
+    previous.onOpenFileSummary === next.onOpenFileSummary &&
+    previous.onOpenMentionedFile === next.onOpenMentionedFile
+  );
+});

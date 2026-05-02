@@ -613,6 +613,56 @@ describe('timeline', () => {
     expect(visibleLiveTurnItemsForTimeline(history, [streaming])).toEqual([streaming]);
   });
 
+  it('hides an inactive partial streaming duplicate after the final text persists with a different source id', () => {
+    const streaming: TimelineItem = {
+      id: 'turn-1:delta-transport',
+      kind: 'streaming',
+      timestamp: 200,
+      text: 'I found the issue',
+      active: false,
+      turnId: 'turn-1',
+      sourceId: 'delta-transport',
+    };
+    const history: TimelineItem[] = [
+      {
+        id: 'turn-1:final-item',
+        kind: 'assistant',
+        timestamp: 300,
+        text: 'I found the issue and fixed it.',
+        phase: 'final_answer',
+        turnId: 'turn-1',
+        sourceId: 'final-item',
+      },
+    ];
+
+    expect(visibleLiveTurnItemsForTimeline(history, [streaming], { allowAssistantTextMatchAcrossSources: true })).toEqual([]);
+  });
+
+  it('keeps an inactive different streaming message after a final assistant with a different source id', () => {
+    const streaming: TimelineItem = {
+      id: 'turn-1:delta-transport',
+      kind: 'streaming',
+      timestamp: 200,
+      text: 'I am inspecting a separate file.',
+      active: false,
+      turnId: 'turn-1',
+      sourceId: 'delta-transport',
+    };
+    const history: TimelineItem[] = [
+      {
+        id: 'turn-1:final-item',
+        kind: 'assistant',
+        timestamp: 300,
+        text: 'The tests are passing.',
+        phase: 'final_answer',
+        turnId: 'turn-1',
+        sourceId: 'final-item',
+      },
+    ];
+
+    expect(visibleLiveTurnItemsForTimeline(history, [streaming], { allowAssistantTextMatchAcrossSources: true })).toEqual([streaming]);
+  });
+
   it('keeps identical finalized assistant text when the message ids are different', () => {
     const liveItems = liveTurnItemsFromNotifications(
       [
@@ -694,6 +744,66 @@ describe('timeline', () => {
     ]);
   });
 
+  it('keeps extra same-text live assistant snapshots after an exact-id persisted duplicate', () => {
+    const history = turnToTimelineItems({
+      id: 'turn-1',
+      status: 'completed',
+      startedAt: 1,
+      completedAt: 2,
+      items: [{ type: 'agentMessage', id: 'persisted-1', text: 'Done.', phase: 'commentary' }],
+    });
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'persisted-1', text: 'Done.', phase: 'commentary' },
+          },
+        },
+        { method: 'event_msg', params: { type: 'agent_message', id: 'transport-2', message: 'Done.', phase: 'commentary', turn_id: 'turn-1' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      100,
+    );
+
+    expect(visibleLiveTurnItemsForTimeline(history, liveItems, { allowAssistantTextMatchAcrossSources: true }).map((item) => item.id)).toEqual([
+      'turn-1:transport-2',
+    ]);
+  });
+
+  it('reserves exact-id persisted duplicates before hiding same-text live assistant snapshots', () => {
+    const history = turnToTimelineItems({
+      id: 'turn-1',
+      status: 'completed',
+      startedAt: 1,
+      completedAt: 2,
+      items: [{ type: 'agentMessage', id: 'persisted-1', text: 'Done.', phase: 'commentary' }],
+    });
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', id: 'transport-2', message: 'Done.', phase: 'commentary', turn_id: 'turn-1' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'persisted-1', text: 'Done.', phase: 'commentary' },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      100,
+    );
+
+    expect(visibleLiveTurnItemsForTimeline(history, liveItems, { allowAssistantTextMatchAcrossSources: true }).map((item) => item.id)).toEqual([
+      'turn-1:transport-2',
+    ]);
+  });
+
   it('dedupes event-message and completed-message assistant snapshots with different transport ids after completion', () => {
     const liveItems = liveTurnItemsFromNotifications(
       [
@@ -752,7 +862,7 @@ describe('timeline', () => {
     ]);
   });
 
-  it('only removes retained streaming for the matching persisted message source id', () => {
+  it('only removes retained streaming for matching or text-covered persisted assistant messages', () => {
     const history = turnToTimelineItems({
       id: 'turn-1',
       status: 'completed',
@@ -780,6 +890,241 @@ describe('timeline', () => {
     };
 
     expect(visibleLiveTurnItemsForTimeline(history, [matching, different])).toEqual([different]);
+    expect(visibleLiveTurnItemsForTimeline(history, [matching, different], { allowAssistantTextMatchAcrossSources: true })).toEqual([different]);
+  });
+
+  it('keeps extra inactive prefix streaming rows beyond the final assistant cover count', () => {
+    const history: TimelineItem[] = [
+      {
+        id: 'turn-1:final-item',
+        kind: 'assistant',
+        timestamp: 300,
+        text: 'I found the issue and fixed it.',
+        phase: 'final_answer',
+        turnId: 'turn-1',
+        sourceId: 'final-item',
+      },
+    ];
+    const first: TimelineItem = {
+      id: 'turn-1:delta-1',
+      kind: 'streaming',
+      timestamp: 200,
+      text: 'I found the issue',
+      active: false,
+      turnId: 'turn-1',
+      sourceId: 'delta-1',
+    };
+    const second: TimelineItem = {
+      id: 'turn-1:delta-2',
+      kind: 'streaming',
+      timestamp: 201,
+      text: 'I found the issue',
+      active: false,
+      turnId: 'turn-1',
+      sourceId: 'delta-2',
+    };
+
+    expect(visibleLiveTurnItemsForTimeline(history, [first, second], { allowAssistantTextMatchAcrossSources: true })).toEqual([second]);
+  });
+
+  it('does not let a hidden duplicate live assistant cover extra streaming rows', () => {
+    const history: TimelineItem[] = [
+      {
+        id: 'turn-1:final-item',
+        kind: 'assistant',
+        timestamp: 300,
+        text: 'I found the issue and fixed it.',
+        phase: 'final_answer',
+        turnId: 'turn-1',
+        sourceId: 'final-item',
+      },
+    ];
+    const duplicateLiveAssistant: TimelineItem = {
+      id: 'turn-1:transport-final',
+      kind: 'assistant',
+      timestamp: 301,
+      text: 'I found the issue and fixed it.',
+      phase: 'final_answer',
+      turnId: 'turn-1',
+      sourceId: 'transport-final',
+      liveSource: 'event_msg',
+    };
+    const first: TimelineItem = {
+      id: 'turn-1:delta-1',
+      kind: 'streaming',
+      timestamp: 200,
+      text: 'I found the issue',
+      active: false,
+      turnId: 'turn-1',
+      sourceId: 'delta-1',
+    };
+    const second: TimelineItem = {
+      id: 'turn-1:delta-2',
+      kind: 'streaming',
+      timestamp: 201,
+      text: 'I found the issue',
+      active: false,
+      turnId: 'turn-1',
+      sourceId: 'delta-2',
+    };
+
+    expect(visibleLiveTurnItemsForTimeline(history, [duplicateLiveAssistant, first, second], { allowAssistantTextMatchAcrossSources: true })).toEqual([
+      second,
+    ]);
+  });
+
+  it('does not let a live-deduped assistant cover extra streaming rows', () => {
+    const visibleAssistant: TimelineItem = {
+      id: 'turn-1:transport-final',
+      kind: 'assistant',
+      timestamp: 300,
+      text: 'I found the issue and fixed it.',
+      phase: 'final_answer',
+      turnId: 'turn-1',
+      sourceId: 'transport-final',
+      liveSource: 'event_msg',
+    };
+    const duplicateAssistant: TimelineItem = {
+      id: 'turn-1:persisted-final',
+      kind: 'assistant',
+      timestamp: 301,
+      text: 'I found the issue and fixed it.',
+      phase: 'final_answer',
+      turnId: 'turn-1',
+      sourceId: 'persisted-final',
+      liveSource: 'item_completed',
+    };
+    const first: TimelineItem = {
+      id: 'turn-1:delta-1',
+      kind: 'streaming',
+      timestamp: 200,
+      text: 'I found the issue',
+      active: false,
+      turnId: 'turn-1',
+      sourceId: 'delta-1',
+    };
+    const second: TimelineItem = {
+      id: 'turn-1:delta-2',
+      kind: 'streaming',
+      timestamp: 201,
+      text: 'I found the issue',
+      active: false,
+      turnId: 'turn-1',
+      sourceId: 'delta-2',
+    };
+
+    expect(visibleLiveTurnItemsForTimeline([], [visibleAssistant, duplicateAssistant, first, second], { allowAssistantTextMatchAcrossSources: true })).toEqual([
+      visibleAssistant,
+      second,
+    ]);
+  });
+
+  it('keeps a repeated no-source streaming segment separated by activity when one final cover exists', () => {
+    const history: TimelineItem[] = [
+      {
+        id: 'turn-1:final-item',
+        kind: 'assistant',
+        timestamp: 300,
+        text: 'Repeat status and finish.',
+        phase: 'final_answer',
+        turnId: 'turn-1',
+        sourceId: 'final-item',
+      },
+    ];
+    const first: TimelineItem = {
+      id: 'live:streaming:turn-1:1',
+      kind: 'streaming',
+      timestamp: 100,
+      text: 'Repeat status',
+      active: false,
+      turnId: 'turn-1',
+    };
+    const command: TimelineItem = {
+      id: 'turn-1:cmd-1',
+      kind: 'command',
+      timestamp: 150,
+      command: 'pwd',
+      cwd: '/repo',
+      output: '/repo\n',
+      status: 'completed',
+      exitCode: 0,
+    };
+    const second: TimelineItem = {
+      id: 'live:streaming:turn-1:2',
+      kind: 'streaming',
+      timestamp: 200,
+      text: 'Repeat status',
+      active: false,
+      turnId: 'turn-1',
+    };
+
+    expect(visibleLiveTurnItemsForTimeline(history, [first, command, second])).toEqual([command, second]);
+  });
+
+  it('hides an unrelated source-less stream without spending the final cover for a sourced stale stream', () => {
+    const history: TimelineItem[] = [
+      {
+        id: 'turn-1:final-item',
+        kind: 'assistant',
+        timestamp: 300,
+        text: 'I found the issue and fixed it.',
+        phase: 'final_answer',
+        turnId: 'turn-1',
+        sourceId: 'final-item',
+      },
+    ];
+    const unrelated: TimelineItem = {
+      id: 'live:streaming:turn-1:1',
+      kind: 'streaming',
+      timestamp: 100,
+      text: 'Running tests now.',
+      active: false,
+      turnId: 'turn-1',
+    };
+    const stale: TimelineItem = {
+      id: 'turn-1:delta-transport',
+      kind: 'streaming',
+      timestamp: 200,
+      text: 'I found the issue',
+      active: false,
+      turnId: 'turn-1',
+      sourceId: 'delta-transport',
+    };
+
+    expect(visibleLiveTurnItemsForTimeline(history, [unrelated, stale], { allowAssistantTextMatchAcrossSources: true })).toEqual([]);
+  });
+
+  it('hides a matching source-less stream without spending the final cover for a sourced stale stream', () => {
+    const history: TimelineItem[] = [
+      {
+        id: 'turn-1:final-item',
+        kind: 'assistant',
+        timestamp: 300,
+        text: 'I found the issue and fixed it.',
+        phase: 'final_answer',
+        turnId: 'turn-1',
+        sourceId: 'final-item',
+      },
+    ];
+    const sourceLess: TimelineItem = {
+      id: 'live:streaming:turn-1:1',
+      kind: 'streaming',
+      timestamp: 100,
+      text: 'I found the issue',
+      active: false,
+      turnId: 'turn-1',
+    };
+    const stale: TimelineItem = {
+      id: 'turn-1:delta-transport',
+      kind: 'streaming',
+      timestamp: 200,
+      text: 'I found the issue',
+      active: false,
+      turnId: 'turn-1',
+      sourceId: 'delta-transport',
+    };
+
+    expect(visibleLiveTurnItemsForTimeline(history, [sourceLess, stale], { allowAssistantTextMatchAcrossSources: true })).toEqual([]);
   });
 
   it('starts a new no-id streaming segment after intervening activity', () => {
@@ -1101,6 +1446,34 @@ describe('timeline', () => {
       ...staleHistory,
       { id: 'turn-1:a1', kind: 'assistant', timestamp: 1000, text: 'Previous answer.', phase: 'final_answer', turnId: 'turn-1' },
     ];
+    expect(mergeRetainedLiveTurnItems(caughtUpHistory, retained, [])).toEqual([]);
+  });
+
+  it('removes retained partial streaming once final history catches up with a different source id', () => {
+    const retained: TimelineItem[] = [
+      {
+        id: 'turn-1:delta-transport',
+        kind: 'streaming',
+        timestamp: 1000,
+        text: 'I found the issue',
+        active: false,
+        turnId: 'turn-1',
+        sourceId: 'delta-transport',
+      },
+    ];
+    const caughtUpHistory: TimelineItem[] = [
+      {
+        id: 'turn-1:final-item',
+        kind: 'assistant',
+        timestamp: 2000,
+        text: 'I found the issue and fixed it.',
+        phase: 'final_answer',
+        turnId: 'turn-1',
+        sourceId: 'final-item',
+      },
+    ];
+
+    expect(visibleRetainedLiveTurnItemsForTimeline(caughtUpHistory, [], retained)).toEqual([]);
     expect(mergeRetainedLiveTurnItems(caughtUpHistory, retained, [])).toEqual([]);
   });
 

@@ -1,4 +1,4 @@
-import { lazy, Suspense } from 'react';
+import { lazy, memo, Suspense } from 'react';
 
 const MarkdownView = lazy(() => import('./MarkdownView'));
 
@@ -8,7 +8,7 @@ interface StreamingCardProps {
   onOpenMentionedFile?: (path: string) => void;
 }
 
-export default function StreamingCard({ text, active, onOpenMentionedFile }: StreamingCardProps) {
+function StreamingCard({ text, active, onOpenMentionedFile }: StreamingCardProps) {
   return (
     <div className={`streaming-card${active ? ' streaming-card--active' : ''}`} aria-live="polite">
       <div className="streaming-card__header">
@@ -28,3 +28,5 @@ export default function StreamingCard({ text, active, onOpenMentionedFile }: Str
     </div>
   );
 }
+
+export default memo(StreamingCard);

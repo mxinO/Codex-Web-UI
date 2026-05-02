@@ -239,6 +239,65 @@ describe('ChatTimeline', () => {
     expect(onOpenFileSummary).toHaveBeenCalledWith('turn-1', '/repo/a.txt', 2);
   });
 
+  it('keeps an existing activity block mounted when activity appends', () => {
+    const firstCommand: TimelineItem = {
+      id: 'cmd-1',
+      kind: 'command',
+      timestamp: 1,
+      command: 'pwd',
+      cwd: '/repo',
+      output: '/repo\n',
+      status: 'completed',
+      exitCode: 0,
+    };
+    const secondCommand: TimelineItem = {
+      id: 'cmd-2',
+      kind: 'command',
+      timestamp: 2,
+      command: 'ls',
+      cwd: '/repo',
+      output: 'README.md\n',
+      status: 'completed',
+      exitCode: 0,
+    };
+
+    render(<ChatTimeline {...baseProps} items={[firstCommand]} />);
+
+    const block = document.querySelector('.activity-block');
+    rerender(<ChatTimeline {...baseProps} items={[firstCommand, secondCommand]} />);
+
+    expect(document.querySelector('.activity-block')).toBe(block);
+    expect(document.querySelector('.activity-block')?.textContent).toContain('$ ls');
+  });
+
+  it('opens latest activity detail when detail-only fields change', () => {
+    const onOpenDetail = vi.fn();
+    const firstCommand: TimelineItem = {
+      id: 'cmd-1',
+      kind: 'command',
+      timestamp: 1,
+      command: 'pwd',
+      cwd: '/old',
+      output: 'old\n',
+      status: 'completed',
+      exitCode: 0,
+    };
+    const updatedCommand: TimelineItem = {
+      ...firstCommand,
+      cwd: '/new',
+      output: 'new\n',
+    };
+
+    render(<ChatTimeline {...baseProps} items={[firstCommand]} onOpenDetail={onOpenDetail} />);
+    rerender(<ChatTimeline {...baseProps} items={[updatedCommand]} onOpenDetail={onOpenDetail} />);
+
+    act(() => {
+      document.querySelector<HTMLButtonElement>('.activity-card')?.click();
+    });
+
+    expect(onOpenDetail).toHaveBeenCalledWith(updatedCommand);
+  });
+
   it('appends a running row to the current activity block', () => {
     const command: TimelineItem = {
       id: 'cmd-1',

@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, type UIEvent } from 'react';
+import { useEffect, useLayoutEffect, useMemo, useRef, type UIEvent } from 'react';
 import type { TimelineItem } from '../lib/timeline';
 import ActivityBlock from './ActivityBlock';
 import ChatItem from './ChatItem';
@@ -108,7 +108,7 @@ export default function ChatTimeline({
     stickToBottomRef.current = true;
     onJumpToLatest();
   };
-  const groups = groupTimelineItems(items);
+  const groups = useMemo(() => groupTimelineItems(items), [items]);
   const lastGroupIndex = groups.length - 1;
   const runningAppendsToLastActivity = showActivityRunning && lastGroupIndex >= 0 && Array.isArray(groups[lastGroupIndex]);
 
@@ -132,7 +132,7 @@ export default function ChatTimeline({
         {groups.map((entry, index) =>
           Array.isArray(entry) ? (
             <ActivityBlock
-              key={`activity:${entry.map((item) => item.id).join('|')}${runningAppendsToLastActivity && index === lastGroupIndex ? ':running' : ''}`}
+              key={`activity:${entry[0]?.id ?? 'empty'}`}
               items={entry}
               running={runningAppendsToLastActivity && index === lastGroupIndex}
               onOpenDetail={onOpenDetail}

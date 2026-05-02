@@ -33,18 +33,74 @@ function itemMergeKey(item: CodexItem, index: number): string {
   return typeof item.id === 'string' && item.id.trim() ? `id:${item.id}` : `index:${index}`;
 }
 
-function mergeTurnItems(current: CodexItem[], latest: CodexItem[], options: { replaceExisting: boolean }): CodexItem[] {
+function isTerminalTurnStatus(status: CodexTurn['status']): boolean {
+  return status === 'completed' || status === 'failed' || status === 'interrupted';
+}
+
+function isAgentMessageItem(item: CodexItem): item is Extract<CodexItem, { type: 'agentMessage' }> {
+  return item.type === 'agentMessage' && typeof (item as { text?: unknown }).text === 'string';
+}
+
+function isFinalAgentMessageItem(item: CodexItem): boolean {
+  if (!isAgentMessageItem(item)) return false;
+  return item.phase === null || item.phase === 'final_answer' || item.phase === 'final';
+}
+
+function normalizedMessageText(text: string): string {
+  return text.trim().replace(/\r\n/g, '\n');
+}
+
+function messageCovers(candidateText: string, coveringText: string): boolean {
+  const candidate = normalizedMessageText(candidateText);
+  const covering = normalizedMessageText(coveringText);
+  if (!candidate || !covering) return false;
+  if (candidate === covering) return true;
+  return covering.length > candidate.length && covering.startsWith(candidate);
+}
+
+function finalAgentMessageCovers(candidate: CodexItem, covering: CodexItem): boolean {
+  if (!isAgentMessageItem(candidate) || !isFinalAgentMessageItem(candidate)) return false;
+  if (!isAgentMessageItem(covering) || !isFinalAgentMessageItem(covering)) return false;
+  return messageCovers(candidate.text, covering.text);
+}
+
+function latestItemCoveredByCurrent(item: CodexItem, current: CodexItem[]): boolean {
+  return current.some((candidate) => finalAgentMessageCovers(item, candidate));
+}
+
+function removeCurrentItemsCoveredByLatest(current: CodexItem[], latest: CodexItem[]): CodexItem[] {
+  const currentKeys = new Set(current.map(itemMergeKey));
+  const consumedLatestIndexes = new Set<number>();
+  return current.filter((item) => {
+    const coveringIndex = latest.findIndex((candidate, index) => {
+      if (consumedLatestIndexes.has(index)) return false;
+      if (currentKeys.has(itemMergeKey(candidate, index))) return false;
+      return finalAgentMessageCovers(item, candidate);
+    });
+    if (coveringIndex < 0) return true;
+    consumedLatestIndexes.add(coveringIndex);
+    return false;
+  });
+}
+
+function mergeTurnItems(
+  current: CodexItem[],
+  latest: CodexItem[],
+  options: { replaceExisting: boolean; removeCurrentCoveredByLatest: boolean; skipLatestCoveredByCurrent: boolean },
+): CodexItem[] {
   if (current.length === 0) return latest;
   if (latest.length === 0) return current;
 
   const indexes = new Map<string, number>();
-  const merged = [...current];
+  const baseCurrent = options.removeCurrentCoveredByLatest ? removeCurrentItemsCoveredByLatest(current, latest) : current;
+  const merged = [...baseCurrent];
   merged.forEach((item, index) => indexes.set(itemMergeKey(item, index), index));
 
   latest.forEach((item, index) => {
     const key = itemMergeKey(item, index);
     const existingIndex = indexes.get(key);
     if (existingIndex === undefined) {
+      if (options.skipLatestCoveredByCurrent && latestItemCoveredByCurrent(item, current)) return;
       indexes.set(key, merged.length);
       merged.push(item);
       return;
@@ -56,7 +112,8 @@ function mergeTurnItems(current: CodexItem[], latest: CodexItem[], options: { re
 }
 
 function mergeTurn(current: CodexTurn, latest: CodexTurn): CodexTurn {
-  const currentIsTerminal = current.status === 'completed' || current.status === 'failed' || current.status === 'interrupted';
+  const currentIsTerminal = isTerminalTurnStatus(current.status);
+  const latestIsTerminal = isTerminalTurnStatus(latest.status);
   const latestRegressedFromTerminal = currentIsTerminal && latest.status === 'inProgress';
   return {
     ...current,
@@ -64,7 +121,11 @@ function mergeTurn(current: CodexTurn, latest: CodexTurn): CodexTurn {
     status: latestRegressedFromTerminal ? current.status : latest.status,
     startedAt: latest.startedAt ?? current.startedAt,
     completedAt: latest.completedAt ?? current.completedAt,
-    items: mergeTurnItems(current.items, latest.items, { replaceExisting: !latestRegressedFromTerminal }),
+    items: mergeTurnItems(current.items, latest.items, {
+      replaceExisting: !latestRegressedFromTerminal,
+      removeCurrentCoveredByLatest: latestIsTerminal,
+      skipLatestCoveredByCurrent: latestRegressedFromTerminal,
+    }),
   };
 }
 

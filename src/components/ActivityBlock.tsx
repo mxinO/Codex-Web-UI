@@ -1,3 +1,4 @@
+import { memo } from 'react';
 import { AlertTriangle, FileDiff, Info, LoaderCircle, Terminal, Wrench, XCircle } from 'lucide-react';
 import type { TimelineItem } from '../lib/timeline';
 
@@ -95,6 +96,11 @@ function activityContent(item: TimelineItem): { title: string; meta: string; bad
   return { title: 'Activity', meta: item.kind, badge: 'details', clickable: false };
 }
 
+function activityItemListEqual(left: TimelineItem[], right: TimelineItem[]): boolean {
+  if (left.length !== right.length) return false;
+  return left.every((item, index) => item === right[index]);
+}
+
 function ActivityRow({ item, onOpenDetail }: ActivityRowProps) {
   const content = activityContent(item);
   const rowClass = `activity-card ${activityClass(item)}`;
@@ -122,6 +128,10 @@ function ActivityRow({ item, onOpenDetail }: ActivityRowProps) {
   return <div className={rowClass}>{body}</div>;
 }
 
+const MemoActivityRow = memo(ActivityRow, (previous, next) => {
+  return previous.onOpenDetail === next.onOpenDetail && previous.item === next.item;
+});
+
 function RunningActivityRow() {
   return (
     <div className="activity-card activity-card--running" role="status" aria-live="polite">
@@ -137,7 +147,7 @@ function RunningActivityRow() {
   );
 }
 
-export default function ActivityBlock({ items, running = false, onOpenDetail }: ActivityBlockProps) {
+function ActivityBlock({ items, running = false, onOpenDetail }: ActivityBlockProps) {
   const label = items.length === 1 ? 'Activity' : 'Activity';
   const eventCount = items.length === 1 ? '1 event' : `${items.length} events`;
   const headerMeta = running ? (items.length > 0 ? `${eventCount} · running` : 'running') : eventCount;
@@ -149,10 +159,14 @@ export default function ActivityBlock({ items, running = false, onOpenDetail }: 
       </div>
       <div className="activity-block__list">
         {items.map((item) => (
-          <ActivityRow key={item.id} item={item} onOpenDetail={onOpenDetail} />
+          <MemoActivityRow key={item.id} item={item} onOpenDetail={onOpenDetail} />
         ))}
         {running && <RunningActivityRow />}
       </div>
     </div>
   );
 }
+
+export default memo(ActivityBlock, (previous, next) => {
+  return previous.running === next.running && previous.onOpenDetail === next.onOpenDetail && activityItemListEqual(previous.items, next.items);
+});

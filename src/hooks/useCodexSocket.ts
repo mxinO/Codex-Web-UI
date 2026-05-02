@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { withTimelineNotificationMeta } from '../lib/timeline';
+import { timelineNotificationMeta, withTimelineNotificationMeta } from '../lib/timeline';
 import type { CodexRunOptions } from '../types/ui';
 
 export type ConnectionState = 'connecting' | 'connected' | 'disconnected' | 'auth-error';
@@ -44,7 +44,7 @@ type ServerMessage =
 
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 const MAX_RETAINED_NOTIFICATIONS = 5000;
-const NOTIFICATION_FLUSH_DELAY_MS = 50;
+const NOTIFICATION_FLUSH_DELAY_MS = 125;
 
 interface PendingRpc {
   resolve: (v: unknown) => void;
@@ -83,6 +83,70 @@ function requestIdOf(request: unknown): string | null {
   if (typeof request !== 'object' || request === null) return null;
   const id = (request as Record<string, unknown>).id;
   return typeof id === 'string' || typeof id === 'number' ? requestKey(id) : null;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function childRecord(value: unknown, key: string): Record<string, unknown> | null {
+  if (!isRecord(value)) return null;
+  const child = value[key];
+  return isRecord(child) ? child : null;
+}
+
+function stringField(value: unknown, key: string): string | null {
+  if (!isRecord(value)) return null;
+  const child = value[key];
+  return typeof child === 'string' ? child : null;
+}
+
+function stringPath(value: unknown, path: string[]): string | null {
+  let current = value;
+  for (const key of path) {
+    if (!isRecord(current)) return null;
+    current = current[key];
+  }
+  return typeof current === 'string' ? current : null;
+}
+
+function deltaNotificationInfo(notification: unknown): { delta: string; key: string; params: Record<string, unknown> } | null {
+  if (!isRecord(notification) || notification.method !== 'item/agentMessage/delta') return null;
+  const params = childRecord(notification, 'params');
+  if (!params) return null;
+  const delta = params.delta;
+  if (typeof delta !== 'string') return null;
+  const threadId = stringField(params, 'threadId') ?? stringField(params, 'thread_id') ?? stringPath(params, ['thread', 'id']) ?? '';
+  const turnId = stringField(params, 'turnId') ?? stringField(params, 'turn_id') ?? stringPath(params, ['turn', 'id']) ?? '';
+  const sourceId =
+    stringField(params, 'id') ??
+    stringField(params, 'itemId') ??
+    stringField(params, 'item_id') ??
+    stringField(params, 'messageId') ??
+    stringField(params, 'message_id') ??
+    null;
+  if (!threadId && !turnId && !sourceId) return null;
+  return { delta, key: `${threadId}\0${turnId}\0${sourceId}`, params };
+}
+
+function coalesceBufferedDeltaNotification(previous: unknown, next: unknown, source: { streamId?: string | null; seq?: number | null }): unknown | null {
+  const previousInfo = deltaNotificationInfo(previous);
+  const nextInfo = deltaNotificationInfo(next);
+  if (!previousInfo || !nextInfo || previousInfo.key !== nextInfo.key) return null;
+  const previousMeta = timelineNotificationMeta(previous);
+  const combined = {
+    ...(previous as Record<string, unknown>),
+    params: {
+      ...previousInfo.params,
+      delta: `${previousInfo.delta}${nextInfo.delta}`,
+    },
+  };
+  return withTimelineNotificationMeta(combined, {
+    order: previousMeta?.order ?? 0,
+    receivedAt: previousMeta?.receivedAt ?? Date.now(),
+    streamId: source.streamId ?? previousMeta?.streamId ?? null,
+    seq: source.seq ?? previousMeta?.seq ?? null,
+  });
 }
 
 interface StoredNotificationReplayState {
@@ -177,6 +241,16 @@ export function useCodexSocket() {
         streamId: source.streamId ?? null,
         seq: source.seq ?? null,
       });
+      const lastIndex = notificationBufferRef.current.length - 1;
+      if (lastIndex >= 0) {
+        const combined = coalesceBufferedDeltaNotification(notificationBufferRef.current[lastIndex], message, source);
+        if (combined) {
+          notificationBufferRef.current[lastIndex] = combined;
+          if (notificationFlushTimerRef.current !== null) return;
+          notificationFlushTimerRef.current = window.setTimeout(flushNotifications, NOTIFICATION_FLUSH_DELAY_MS);
+          return;
+        }
+      }
       notificationBufferRef.current.push(notification);
       if (notificationFlushTimerRef.current !== null) return;
       notificationFlushTimerRef.current = window.setTimeout(flushNotifications, NOTIFICATION_FLUSH_DELAY_MS);

@@ -104,7 +104,7 @@ describe('useCodexSocket', () => {
     const rejection = expect(result).rejects.toThrow('RPC request timed out: slow.method');
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(125);
     });
 
     await rejection;
@@ -191,7 +191,7 @@ describe('useCodexSocket', () => {
       );
     });
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(125);
     });
     expect(currentSocket?.notifications).toHaveLength(1);
     expect(currentSocket?.reconnectEpoch).toBe(0);
@@ -238,7 +238,7 @@ describe('useCodexSocket', () => {
       for (let index = 0; index < 3; index += 1) {
         ws.onmessage?.(
           new MessageEvent('message', {
-            data: JSON.stringify({ type: 'codex/notification', message: { method: 'item/agentMessage/delta', params: { delta: String(index) } } }),
+            data: JSON.stringify({ type: 'codex/notification', message: { method: 'item/agentMessage/delta', params: { itemId: 'a1', delta: String(index) } } }),
           }),
         );
       }
@@ -247,11 +247,84 @@ describe('useCodexSocket', () => {
     expect(currentSocket?.notifications).toEqual([]);
 
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(125);
     });
 
-    expect(currentSocket?.notificationCount).toBe(3);
-    expect(currentSocket?.notifications.map((item) => (item as { params?: { delta?: string } }).params?.delta)).toEqual(['0', '1', '2']);
+    expect(currentSocket?.notificationCount).toBe(1);
+    expect(currentSocket?.notifications.map((item) => (item as { params?: { delta?: string } }).params?.delta)).toEqual(['012']);
+  });
+
+  it('does not coalesce deltas from different assistant message ids', async () => {
+    await renderHook();
+    const ws = MockWebSocket.instances[0];
+    act(() => {
+      ws.open();
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'codex/notification', message: { method: 'item/agentMessage/delta', params: { itemId: 'a1', delta: 'first' } } }),
+        }),
+      );
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'codex/notification', message: { method: 'item/agentMessage/delta', params: { itemId: 'a2', delta: 'second' } } }),
+        }),
+      );
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(125);
+    });
+
+    expect(currentSocket?.notificationCount).toBe(2);
+    expect(currentSocket?.notifications.map((item) => (item as { params?: { delta?: string } }).params?.delta)).toEqual(['first', 'second']);
+  });
+
+  it('does not coalesce adjacent unscoped deltas without a message id', async () => {
+    await renderHook();
+    const ws = MockWebSocket.instances[0];
+    act(() => {
+      ws.open();
+      for (const delta of ['first', 'second']) {
+        ws.onmessage?.(
+          new MessageEvent('message', {
+            data: JSON.stringify({ type: 'codex/notification', message: { method: 'item/agentMessage/delta', params: { delta } } }),
+          }),
+        );
+      }
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(125);
+    });
+
+    expect(currentSocket?.notificationCount).toBe(2);
+    expect(currentSocket?.notifications.map((item) => (item as { params?: { delta?: string } }).params?.delta)).toEqual(['first', 'second']);
+  });
+
+  it('keeps the latest sequence metadata when coalescing deltas', async () => {
+    await renderHook();
+    const ws = MockWebSocket.instances[0];
+    act(() => {
+      ws.open();
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'codex/notification', streamId: 'stream-1', seq: 3, message: { method: 'item/agentMessage/delta', params: { itemId: 'a1', delta: 'Hel' } } }),
+        }),
+      );
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'codex/notification', streamId: 'stream-1', seq: 4, message: { method: 'item/agentMessage/delta', params: { itemId: 'a1', delta: 'lo' } } }),
+        }),
+      );
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(125);
+    });
+
+    expect(currentSocket?.notifications.map((item) => (item as { params?: { delta?: string } }).params?.delta)).toEqual(['Hello']);
+    expect(timelineNotificationMeta(currentSocket?.notifications[0])).toMatchObject({ order: 1, streamId: 'stream-1', seq: 4 });
+    expect(window.localStorage.getItem(`codex-web-ui:notificationReplay:${window.location.host}`)).toBe(JSON.stringify({ streamId: 'stream-1', seq: 4 }));
   });
 
   it('sends the last notification sequence on reconnect and ignores replay duplicates', async () => {
@@ -266,7 +339,7 @@ describe('useCodexSocket', () => {
       );
     });
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(125);
     });
 
     act(() => {
@@ -292,7 +365,7 @@ describe('useCodexSocket', () => {
       );
     });
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(125);
     });
 
     expect(second.sent[0]).toBe(JSON.stringify({ type: 'client/hello', params: { lastNotificationStreamId: 'stream-1', lastNotificationSeq: 7 } }));
@@ -323,7 +396,7 @@ describe('useCodexSocket', () => {
       );
     });
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(50);
+      await vi.advanceTimersByTimeAsync(125);
     });
 
     expect(ws.sent[0]).toBe(JSON.stringify({ type: 'client/hello', params: { lastNotificationStreamId: 'old-stream', lastNotificationSeq: 100 } }));

@@ -667,10 +667,6 @@ function assistantTextKey(turnId: string, phase: string | null, text: string): s
   return `${turnId}\0${assistantPhaseGroup(phase)}\0${text}`;
 }
 
-function persistedAssistantTextKey(turnId: string, text: string): string {
-  return `${turnId}\0${text}`;
-}
-
 function liveAssistantItemId(turnId: string | null, sourceId: string | null, sequence: number): string {
   return sourceId && turnId ? `${turnId}:${sourceId}` : `live:assistant:${turnId ?? 'unscoped'}:${sequence}`;
 }
@@ -861,44 +857,77 @@ export function visibleLiveTurnItemsForTimeline(
   liveItems: TimelineItem[],
   options: VisibleLiveTurnOptions = {},
 ): TimelineItem[] {
+  type AssistantTimelineItem = Extract<TimelineItem, { kind: 'assistant' }>;
+  type StreamingTimelineItem = Extract<TimelineItem, { kind: 'streaming' }>;
+  type PersistedAssistantEntry = {
+    assistant: AssistantTimelineItem;
+    key: string;
+    text: string;
+    turnId: string;
+  };
+
   const persistedIds = new Set(items.map((item) => item.id));
   const persistedAssistantsByTurn = assistantItemsByTurn(items);
-  const liveAssistantsByTurn = assistantItemsByTurn(liveItems);
-  const persistedAssistantTextCounts = new Map<string, number>();
+  const persistedAssistantEntriesByTurn = new Map<string, PersistedAssistantEntry[]>();
+  let persistedAssistantEntryIndex = 0;
   for (const [turnId, assistants] of persistedAssistantsByTurn) {
     for (const assistant of assistants) {
       const text = normalizedMessageBlock(assistant.text);
       if (!text) continue;
-      const key = persistedAssistantTextKey(turnId, text);
-      persistedAssistantTextCounts.set(key, (persistedAssistantTextCounts.get(key) ?? 0) + 1);
+      const entry: PersistedAssistantEntry = {
+        assistant,
+        key: `${turnId}\0${persistedAssistantEntryIndex}`,
+        text,
+        turnId,
+      };
+      persistedAssistantEntryIndex += 1;
+      const entries = persistedAssistantEntriesByTurn.get(turnId) ?? [];
+      entries.push(entry);
+      persistedAssistantEntriesByTurn.set(turnId, entries);
     }
   }
-  const consumedPersistedAssistantTextCounts = new Map<string, number>();
+  const reservedExactPersistedAssistantKeys = new Set<string>();
+  const consumedPersistedAssistantKeys = new Set<string>();
   const emittedAssistantIdentityKeys = new Set<string>();
   const emittedUnidentifiedAssistantTextKeys = new Set<string>();
   const emittedIdentifiedAssistantTextSourceCounts = new Map<string, Map<string, number>>();
   const consumedIdentifiedAssistantTextSourceCounts = new Map<string, Map<string, number>>();
+  const visibleAssistantIndexes = new Set<number>();
+  const visibleAssistants: TimelineItem[] = [];
 
-  const consumePersistedAssistantTextMatch = (turnId: string, text: string): boolean => {
-    const key = persistedAssistantTextKey(turnId, text);
-    const count = persistedAssistantTextCounts.get(key) ?? 0;
-    const consumed = consumedPersistedAssistantTextCounts.get(key) ?? 0;
-    if (consumed >= count) return false;
-    consumedPersistedAssistantTextCounts.set(key, consumed + 1);
-    return true;
+  const sourcesAreCompatible = (item: AssistantTimelineItem | StreamingTimelineItem, assistant: AssistantTimelineItem): boolean => {
+    return !item.sourceId || !assistant.sourceId || item.sourceId === assistant.sourceId;
   };
 
-  const isPersistedAssistantMatch = (item: Extract<TimelineItem, { kind: 'assistant' | 'streaming' }>, turnId: string, text: string): boolean => {
-    const persisted = persistedAssistantsByTurn.get(turnId) ?? [];
-    const exactOrCompatibleSource = persisted.some((assistant) => {
-      if (normalizedMessageBlock(assistant.text) !== text) return false;
-      if (item.sourceId && assistant.sourceId && item.sourceId !== assistant.sourceId) return false;
+  const consumePersistedAssistantTextMatch = (
+    item: AssistantTimelineItem,
+    turnId: string,
+    text: string,
+    consumedKeys: Set<string>,
+  ): boolean => {
+    const entries = persistedAssistantEntriesByTurn.get(turnId) ?? [];
+    const consume = (entry: PersistedAssistantEntry): boolean => {
+      if (reservedExactPersistedAssistantKeys.has(entry.key) || consumedKeys.has(entry.key)) return false;
+      consumedKeys.add(entry.key);
       return true;
-    });
-    if (exactOrCompatibleSource) return consumePersistedAssistantTextMatch(turnId, text);
+    };
+    const compatible = entries.find((entry) => entry.text === text && sourcesAreCompatible(item, entry.assistant) && consume(entry));
+    if (compatible) return true;
     if (!options.allowAssistantTextMatchAcrossSources) return false;
-    return persisted.some((assistant) => normalizedMessageBlock(assistant.text) === text) && consumePersistedAssistantTextMatch(turnId, text);
+    return Boolean(entries.find((entry) => entry.text === text && consume(entry)));
   };
+
+  const reserveExactPersistedAssistant = (item: AssistantTimelineItem): void => {
+    const turnId = timelineItemTurnId(item);
+    if (!turnId) return;
+    const entries = persistedAssistantEntriesByTurn.get(turnId) ?? [];
+    const entry = entries.find((candidate) => candidate.assistant.id === item.id && !reservedExactPersistedAssistantKeys.has(candidate.key));
+    if (entry) reservedExactPersistedAssistantKeys.add(entry.key);
+  };
+
+  for (const item of liveItems) {
+    if (item.kind === 'assistant' && persistedIds.has(item.id)) reserveExactPersistedAssistant(item);
+  }
 
   const addIdentifiedAssistantTextSource = (textKey: string, source: string) => {
     const counts = emittedIdentifiedAssistantTextSourceCounts.get(textKey) ?? new Map<string, number>();
@@ -921,63 +950,102 @@ export function visibleLiveTurnItemsForTimeline(
     return false;
   };
 
-  const isCoveredByAssistant = (item: Extract<TimelineItem, { kind: 'streaming' }>): boolean => {
+  for (const [index, item] of liveItems.entries()) {
+    if (item.kind !== 'assistant') continue;
+    if (persistedIds.has(item.id)) continue;
+
     const turnId = timelineItemTurnId(item);
-    if (!turnId) return false;
-    const assistants = [...(persistedAssistantsByTurn.get(turnId) ?? []), ...(liveAssistantsByTurn.get(turnId) ?? [])];
-    return assistants.some(
-      (assistant) => {
-        if (assistant.id === item.id) return false;
-        const sameMessage = !item.sourceId || !assistant.sourceId || item.sourceId === assistant.sourceId;
-        if (!sameMessage) return false;
-        return (!item.active && assistantIsFinal(assistant)) || messageLikelyCovers(item.text, assistant.text);
-      },
-    );
+    if (!turnId) {
+      visibleAssistantIndexes.add(index);
+      visibleAssistants.push(item);
+      continue;
+    }
+
+    const text = normalizedMessageBlock(item.text);
+    if (text && consumePersistedAssistantTextMatch(item, turnId, text, consumedPersistedAssistantKeys)) continue;
+
+    const identityKey = item.sourceId ? `${turnId}\0source:${item.sourceId}` : null;
+    const textKey = assistantTextKey(turnId, item.phase, text);
+    if (identityKey && emittedAssistantIdentityKeys.has(identityKey)) continue;
+    if (identityKey && emittedUnidentifiedAssistantTextKeys.has(textKey)) continue;
+    if (
+      identityKey &&
+      item.liveSource &&
+      options.allowAssistantTextMatchAcrossSources &&
+      consumeIdentifiedAssistantTextFromOtherSource(textKey, item.liveSource)
+    ) {
+      continue;
+    }
+    if (!identityKey && (emittedUnidentifiedAssistantTextKeys.has(textKey) || emittedIdentifiedAssistantTextSourceCounts.has(textKey))) continue;
+    if (identityKey) {
+      emittedAssistantIdentityKeys.add(identityKey);
+      if (item.liveSource) addIdentifiedAssistantTextSource(textKey, item.liveSource);
+    } else {
+      emittedUnidentifiedAssistantTextKeys.add(textKey);
+    }
+    visibleAssistantIndexes.add(index);
+    visibleAssistants.push(item);
+  }
+
+  const visibleAssistantsByTurn = assistantItemsByTurn(visibleAssistants);
+  const consumedStreamingCoveringAssistants = new Set<string>();
+  const consumedSourceLessFinalFallbackAssistants = new Set<string>();
+
+  const streamingCoveringAssistantKey = (assistant: AssistantTimelineItem): string => {
+    return `${timelineItemTurnId(assistant) ?? 'unscoped'}\0${assistant.id}`;
   };
 
-  const isCoveredByLaterStreaming = (item: Extract<TimelineItem, { kind: 'streaming' }>, index: number): boolean => {
+  const consumeStreamingCoveringAssistant = (item: StreamingTimelineItem): boolean => {
     const turnId = timelineItemTurnId(item);
     if (!turnId) return false;
-    return liveItems.slice(index + 1).some((candidate) => {
+    const assistants = [...(persistedAssistantsByTurn.get(turnId) ?? []), ...(visibleAssistantsByTurn.get(turnId) ?? [])];
+    for (const assistant of assistants) {
+      const sameSource = Boolean(item.sourceId && assistant.sourceId && item.sourceId === assistant.sourceId);
+      const sourceLessFinalFallback = !item.sourceId && !sameSource && !item.active && assistantIsFinal(assistant);
+      if (sourceLessFinalFallback) {
+        const key = streamingCoveringAssistantKey(assistant);
+        if (consumedSourceLessFinalFallbackAssistants.has(key)) continue;
+        consumedSourceLessFinalFallbackAssistants.add(key);
+        return true;
+      }
+
+      const textIsCovered = messageLikelyCovers(item.text, assistant.text);
+      const textCoverAllowed =
+        textIsCovered && (sameSource || !item.sourceId || !assistant.sourceId || options.allowAssistantTextMatchAcrossSources);
+      const covered =
+        (sameSource && ((!item.active && assistantIsFinal(assistant)) || textIsCovered)) ||
+        (textCoverAllowed && assistantIsFinal(assistant));
+      if (!covered) continue;
+
+      const key = streamingCoveringAssistantKey(assistant);
+      if (consumedStreamingCoveringAssistants.has(key)) continue;
+      consumedStreamingCoveringAssistants.add(key);
+      return true;
+    }
+    return false;
+  };
+
+  const isCoveredByLaterStreaming = (item: StreamingTimelineItem, index: number): boolean => {
+    const turnId = timelineItemTurnId(item);
+    if (!turnId) return false;
+    for (const candidate of liveItems.slice(index + 1)) {
       if (candidate.kind !== 'streaming') return false;
       if (timelineItemTurnId(candidate) !== turnId) return false;
       if ((item.sourceId || candidate.sourceId) && item.sourceId !== candidate.sourceId) return false;
-      return messageLikelyCovers(item.text, candidate.text);
-    });
+      if (messageLikelyCovers(item.text, candidate.text)) return true;
+    }
+    return false;
   };
 
   return liveItems.filter((item, index) => {
-    if (persistedIds.has(item.id)) return false;
-    if (item.kind !== 'assistant' && item.kind !== 'streaming') return true;
-
-    const turnId = timelineItemTurnId(item);
-    if (!turnId) return true;
-    const text = normalizedMessageBlock(item.text);
-    if (text && isPersistedAssistantMatch(item, turnId, text)) return false;
-    if (item.kind === 'assistant') {
-      const identityKey = item.sourceId ? `${turnId}\0source:${item.sourceId}` : null;
-      const textKey = assistantTextKey(turnId, item.phase, text);
-      if (identityKey && emittedAssistantIdentityKeys.has(identityKey)) return false;
-      if (identityKey && emittedUnidentifiedAssistantTextKeys.has(textKey)) return false;
-      if (
-        identityKey &&
-        item.liveSource &&
-        options.allowAssistantTextMatchAcrossSources &&
-        consumeIdentifiedAssistantTextFromOtherSource(textKey, item.liveSource)
-      ) {
-        return false;
-      }
-      if (!identityKey && (emittedUnidentifiedAssistantTextKeys.has(textKey) || emittedIdentifiedAssistantTextSourceCounts.has(textKey))) return false;
-      if (identityKey) {
-        emittedAssistantIdentityKeys.add(identityKey);
-        if (item.liveSource) addIdentifiedAssistantTextSource(textKey, item.liveSource);
-      } else {
-        emittedUnidentifiedAssistantTextKeys.add(textKey);
-      }
-      return true;
+    if (item.kind === 'assistant') return visibleAssistantIndexes.has(index);
+    if (persistedIds.has(item.id)) {
+      if (item.kind === 'streaming') consumeStreamingCoveringAssistant(item);
+      return false;
     }
-    if (isCoveredByAssistant(item)) return false;
+    if (item.kind !== 'streaming') return true;
     if (item.kind === 'streaming' && isCoveredByLaterStreaming(item, index)) return false;
+    if (consumeStreamingCoveringAssistant(item)) return false;
     return true;
   });
 }
