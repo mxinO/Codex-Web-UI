@@ -9,7 +9,14 @@ import type { CodexAppServer } from './appServer.js';
 import { isInteractiveCommandBlocked, runBangCommand } from './bangCommand.js';
 import type { ServerConfig } from './config.js';
 import { FileEditStore, sessionFileEditDbPath } from './fileEditStore.js';
-import { assertPathInsideRoot, resolveExistingPathInsideRoot, resolveWritablePathInsideRoot } from './fileTransfer.js';
+import {
+  assertPathInsideRoot,
+  openExistingFileInsideRoot,
+  readOpenedFileFully,
+  resolveExistingPathInsideRoot,
+  resolveWritablePathInsideRoot,
+  writeFileInsideRoot,
+} from './fileTransfer.js';
 import type { HostStateStore } from './hostState.js';
 import type { JsonRpcServerRequest } from './jsonRpc.js';
 import { logWarn } from './logger.js';
@@ -120,6 +127,7 @@ const REASONING_EFFORTS = new Set<CodexReasoningEffort>(['none', 'minimal', 'low
 const SANDBOX_MODES = new Set<CodexSandboxMode>(['read-only', 'workspace-write', 'danger-full-access']);
 const COLLABORATION_MODES = new Set<CodexCollaborationMode>(['default', 'plan']);
 const BROWSE_DIRECTORY_LIMIT = 500;
+export const LEGACY_READ_FILE_MAX_BYTES = 5 * 1024 * 1024;
 const FILE_DIFF_SNAPSHOT_MAX_BYTES = 1024 * 1024;
 const FILE_DIFF_SNAPSHOT_TTL_MS = 10 * 60 * 1000;
 const FILE_DIFF_SNAPSHOT_MAX_ENTRIES = 50;
@@ -563,16 +571,20 @@ async function readDirectory(deps: BrowserSocketDeps, requestedPath: string) {
 }
 
 async function readFile(deps: BrowserSocketDeps, requestedPath: string) {
-  const resolvedPath = await resolveReadableRpcPath(deps, requestedPath);
-  const stats = await fs.stat(resolvedPath);
-  if (!stats.isFile()) throw new Error('path is not a file');
-  const data = await fs.readFile(resolvedPath);
-  return { dataBase64: data.toString('base64') };
+  const opened = await openExistingFileInsideRoot(activeWorkspaceRoot(deps), requestedPath);
+  try {
+    if (opened.stats.size > LEGACY_READ_FILE_MAX_BYTES) {
+      throw new Error(`file is too large to read via legacy RPC (max ${LEGACY_READ_FILE_MAX_BYTES} bytes)`);
+    }
+    const data = await readOpenedFileFully(opened.handle, opened.stats.size);
+    return { dataBase64: data.toString('base64') };
+  } finally {
+    await opened.handle.close().catch(() => undefined);
+  }
 }
 
 async function writeFile(deps: BrowserSocketDeps, requestedPath: string, dataBase64: string) {
-  const resolvedPath = await resolveWritableRpcPath(deps, requestedPath);
-  await fs.writeFile(resolvedPath, Buffer.from(dataBase64, 'base64'));
+  await writeFileInsideRoot(activeWorkspaceRoot(deps), requestedPath, Buffer.from(dataBase64, 'base64'));
   return {};
 }
 

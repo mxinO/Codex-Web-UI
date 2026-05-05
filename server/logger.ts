@@ -27,7 +27,7 @@ export function configureLogger(options: { filePath?: string | null }): void {
 function redactSecrets(value: string): string {
   return value
     .replace(/([?&]token=)[^&\s"']+/gi, '$1<redacted>')
-    .replace(/(codex_web_ui_token=)[^;\s"']+/gi, '$1<redacted>')
+    .replace(/(codex_webui_token(?:_[a-f0-9]{12})?=)[^;\s"']+/gi, '$1<redacted>')
     .replace(/(authorization:\s*bearer\s+)[^\s"']+/gi, '$1<redacted>');
 }
 

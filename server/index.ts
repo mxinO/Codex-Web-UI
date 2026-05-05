@@ -15,8 +15,9 @@ import {
 import { attachBrowserSocket } from './browserSocket.js';
 import { readConfig } from './config.js';
 import { createFileContentHandler } from './fileContent.js';
+import { createFileDownloadHandler } from './fileDownload.js';
 import { createFilePreviewHandler } from './filePreview.js';
-import { resolveExistingPathInsideRoot, resolveWritablePathInsideRoot } from './fileTransfer.js';
+import { writeFileInsideRoot } from './fileTransfer.js';
 import { HostStateStore } from './hostState.js';
 import { configureLogger, logError, logInfo, logWarn } from './logger.js';
 import { resolvePackageRoot, resolveStartCwd } from './paths.js';
@@ -88,20 +89,9 @@ app.head('/api/file/content', fileContentHandler);
 app.get('/api/file/content', fileContentHandler);
 app.get('/api/file', createFilePreviewHandler({ authorized, getActiveCwd }));
 
-app.get('/api/download', async (req, res) => {
-  if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });
-  const activeCwd = getActiveCwd();
-  if (!activeCwd) return res.status(409).json({ error: 'no active cwd' });
-  const filePath = getQueryPath(req);
-  if (!filePath) return res.status(400).json({ error: 'path is required' });
-
-  try {
-    const resolved = await resolveExistingPathInsideRoot(activeCwd, filePath);
-    return res.download(resolved);
-  } catch (error) {
-    return res.status(400).json({ error: error instanceof Error ? error.message : String(error) });
-  }
-});
+const fileDownloadHandler = createFileDownloadHandler({ authorized, getActiveCwd });
+app.head('/api/download', fileDownloadHandler);
+app.get('/api/download', fileDownloadHandler);
 
 app.post('/api/upload', express.raw({ type: 'application/octet-stream', limit: '50mb' }), async (req, res) => {
   if (!authorized(req)) return res.status(401).json({ error: 'unauthorized' });
@@ -111,8 +101,7 @@ app.post('/api/upload', express.raw({ type: 'application/octet-stream', limit: '
   if (!filePath) return res.status(400).json({ error: 'path is required' });
 
   try {
-    const resolved = await resolveWritablePathInsideRoot(activeCwd, filePath);
-    await fs.promises.writeFile(resolved, Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0));
+    await writeFileInsideRoot(activeCwd, filePath, Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0));
     return res.json({ ok: true });
   } catch (error) {
     return res.status(400).json({ error: error instanceof Error ? error.message : String(error) });

@@ -11,6 +11,7 @@ interface FileEditorModalProps {
   readOnly: boolean;
   onClose: () => void;
   onSave: (content: string) => Promise<void>;
+  onOpenFile?: (path: string) => void;
 }
 
 function baseName(path: string): string {
@@ -97,7 +98,41 @@ export function languageForPath(path: string): string {
   }
 }
 
-export default function FileEditorModal({ path, initialContent, sizeBytes, readOnly, onClose, onSave }: FileEditorModalProps) {
+function directoryName(path: string): string {
+  const normalized = path.replace(/\/+$/, '');
+  const slashIndex = normalized.lastIndexOf('/');
+  if (slashIndex < 0) return '';
+  if (slashIndex === 0) return '/';
+  return normalized.slice(0, slashIndex);
+}
+
+function normalizeLinkedPath(path: string): string {
+  const absolute = path.startsWith('/');
+  const parts: string[] = [];
+  for (const part of path.split('/')) {
+    if (!part || part === '.') continue;
+    if (part === '..') {
+      if (parts.length > 0 && parts[parts.length - 1] !== '..') {
+        parts.pop();
+      } else if (!absolute) {
+        parts.push(part);
+      }
+      continue;
+    }
+    parts.push(part);
+  }
+  const normalized = `${absolute ? '/' : ''}${parts.join('/')}`;
+  return normalized || (absolute ? '/' : '.');
+}
+
+export function resolveMarkdownLinkPath(currentPath: string, linkedPath: string): string {
+  const trimmed = linkedPath.trim();
+  if (!trimmed || trimmed.startsWith('/') || trimmed.startsWith('~/')) return trimmed;
+  const base = directoryName(currentPath);
+  return normalizeLinkedPath(base ? `${base}/${trimmed}` : trimmed);
+}
+
+export default function FileEditorModal({ path, initialContent, sizeBytes, readOnly, onClose, onSave, onOpenFile }: FileEditorModalProps) {
   const [content, setContent] = useState(initialContent);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -132,6 +167,7 @@ export default function FileEditorModal({ path, initialContent, sizeBytes, readO
       setSaving(false);
     }
   };
+  const openMarkdownLink = onOpenFile ? (linkedPath: string) => onOpenFile(resolveMarkdownLinkPath(path, linkedPath)) : undefined;
 
   return (
     <div className="modal-overlay" role="presentation">
@@ -167,7 +203,7 @@ export default function FileEditorModal({ path, initialContent, sizeBytes, readO
           {readOnly && isMarkdown && markdownPreviewAllowed && viewMode === 'preview' ? (
             <Suspense fallback={<div className="detail-loading">Loading preview...</div>}>
               <div className="file-markdown-preview">
-                <MarkdownView content={content} />
+                <MarkdownView content={content} onOpenFile={openMarkdownLink} />
               </div>
             </Suspense>
           ) : (

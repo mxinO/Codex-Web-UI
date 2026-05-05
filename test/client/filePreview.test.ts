@@ -1,11 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { filePreviewUrl, isImagePath, normalizeMentionedFilePath } from '../../src/lib/filePreview';
+import { fileDownloadUrl, filePreviewUrl, isImagePath, normalizeMentionedFilePath } from '../../src/lib/filePreview';
 import { markdownFileHrefPath, splitFileMentions } from '../../src/lib/fileMentions';
 
 describe('file preview helpers', () => {
-  it('detects common image paths after line suffixes are removed', () => {
+  it('detects common image paths without treating raw line-like suffixes as extensions', () => {
     expect(isImagePath('plots/output.PNG')).toBe(true);
-    expect(isImagePath('/repo/screenshots/view.webp:12')).toBe(true);
+    expect(isImagePath('/repo/screenshots/view.webp:12')).toBe(false);
+    expect(isImagePath(normalizeMentionedFilePath('/repo/screenshots/view.webp:12'))).toBe(true);
     expect(isImagePath('src/App.tsx')).toBe(false);
   });
 
@@ -16,6 +17,8 @@ describe('file preview helpers', () => {
 
   it('builds inline preview urls without base64 encoding file contents', () => {
     expect(filePreviewUrl('/repo/plots/output image.png')).toBe('/api/file?path=%2Frepo%2Fplots%2Foutput%20image.png');
+    expect(filePreviewUrl('/repo/plots/output.png:12')).toBe('/api/file?path=%2Frepo%2Fplots%2Foutput.png%3A12');
+    expect(fileDownloadUrl('/repo/data/report.txt:12')).toBe('/api/download?path=%2Frepo%2Fdata%2Freport.txt%3A12');
   });
 });
 

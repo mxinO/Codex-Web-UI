@@ -61,7 +61,18 @@ vi.mock('../../src/hooks/useCodexSocket', () => ({
   }),
 }));
 vi.mock('../../src/components/AuthOverlay', () => ({ default: () => null }));
-vi.mock('../../src/components/ChatTimeline', () => ({ default: () => <div data-testid="chat-timeline" /> }));
+vi.mock('../../src/components/ChatTimeline', () => ({
+  default: ({ onOpenMentionedFile }: { onOpenMentionedFile?: (path: string) => void }) => (
+    <div data-testid="chat-timeline">
+      <button type="button" onClick={() => onOpenMentionedFile?.('/repo/src/app.py:12')}>
+        open mentioned text
+      </button>
+      <button type="button" onClick={() => onOpenMentionedFile?.('/repo/plot.png:12')}>
+        open mentioned image
+      </button>
+    </div>
+  ),
+}));
 vi.mock('../../src/components/CwdPicker', () => ({ default: () => null }));
 vi.mock('../../src/components/DetailModal', () => ({ default: () => null }));
 vi.mock('../../src/components/FileChangeTray', () => ({ default: () => null }));
@@ -75,6 +86,12 @@ vi.mock('../../src/components/FileExplorer', () => ({
     <div>
       <button type="button" onClick={() => onOpenFile('/repo/src/app.py', true)}>
         open text
+      </button>
+      <button type="button" onClick={() => onOpenFile('/repo/src/other.py', true)}>
+        open other text
+      </button>
+      <button type="button" onClick={() => onOpenFile('/repo/src/app.py:12', true)}>
+        open raw colon text
       </button>
       <button type="button" onClick={() => onOpenFile('/repo/plot.png', true)}>
         open image
@@ -124,6 +141,16 @@ async function flushReact() {
   });
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((promiseResolve, promiseReject) => {
+    resolve = promiseResolve;
+    reject = promiseReject;
+  });
+  return { promise, resolve, reject };
+}
+
 describe('App file open behavior', () => {
   beforeEach(() => {
     mocks.rpc.mockReset();
@@ -148,7 +175,7 @@ describe('App file open behavior', () => {
 
     expect(document.querySelector('[role="dialog"]')?.textContent).toContain('/repo/src/app.py');
     expect(document.querySelector('[role="dialog"]')?.textContent).toContain('size:15');
-    expect(mocks.readTextFileStream).toHaveBeenCalledWith('/repo/src/app.py');
+    expect(mocks.readTextFileStream).toHaveBeenCalledWith('/repo/src/app.py', expect.objectContaining({ signal: expect.any(AbortSignal) }));
     expect(mocks.rpc).not.toHaveBeenCalledWith('webui/fs/readFile', expect.anything());
   });
 
@@ -161,6 +188,73 @@ describe('App file open behavior', () => {
     await flushReact();
 
     expect(mocks.rpc).toHaveBeenCalledWith('webui/fs/getMetadata', { path: '/repo/src/app.py' });
+  });
+
+  it('preserves raw file explorer paths that end with line-like suffixes', async () => {
+    mocks.readTextFileStream.mockResolvedValue({ content: 'literal colon path\n', sizeBytes: 19, modifiedAtMs: 1234, truncated: false });
+
+    renderApp();
+    act(() => buttonByText('open raw colon text').click());
+    await flushReact();
+
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain('/repo/src/app.py:12');
+    expect(mocks.readTextFileStream).toHaveBeenCalledWith('/repo/src/app.py:12', expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
+  it('strips assistant-mentioned line suffixes before opening files', async () => {
+    mocks.readTextFileStream.mockResolvedValue({ content: 'mentioned\n', sizeBytes: 10, modifiedAtMs: 1234, truncated: false });
+
+    renderApp();
+    act(() => buttonByText('open mentioned text').click());
+    await flushReact();
+
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain('/repo/src/app.py');
+    expect(document.querySelector('[role="dialog"]')?.textContent).not.toContain('/repo/src/app.py:12');
+    expect(mocks.readTextFileStream).toHaveBeenCalledWith('/repo/src/app.py', expect.objectContaining({ signal: expect.any(AbortSignal) }));
+  });
+
+  it('strips assistant-mentioned line suffixes before image detection', async () => {
+    renderApp();
+    act(() => buttonByText('open mentioned image').click());
+    await flushReact();
+
+    expect(document.querySelector('[aria-label="Image viewer"]')?.textContent).toContain('/repo/plot.png');
+    expect(document.querySelector('[aria-label="Image viewer"]')?.textContent).not.toContain('/repo/plot.png:12');
+    expect(mocks.readTextFileStream).not.toHaveBeenCalled();
+  });
+
+  it('aborts earlier text opens and ignores stale completions from slow reads', async () => {
+    const first = deferred<{ content: string; sizeBytes: number; modifiedAtMs: number; truncated: false }>();
+    const second = deferred<{ content: string; sizeBytes: number; modifiedAtMs: number; truncated: false }>();
+    const signals = new Map<string, AbortSignal>();
+    mocks.readTextFileStream.mockImplementation((path: string, options?: { signal?: AbortSignal }) => {
+      if (options?.signal) signals.set(path, options.signal);
+      return path === '/repo/src/app.py' ? first.promise : second.promise;
+    });
+
+    renderApp();
+    act(() => buttonByText('open text').click());
+    expect(signals.get('/repo/src/app.py')?.aborted).toBe(false);
+
+    act(() => buttonByText('open other text').click());
+    expect(signals.get('/repo/src/app.py')?.aborted).toBe(true);
+
+    await act(async () => {
+      second.resolve({ content: 'second\n', sizeBytes: 7, modifiedAtMs: 2000, truncated: false });
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain('/repo/src/other.py');
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain('second');
+
+    await act(async () => {
+      first.resolve({ content: 'first\n', sizeBytes: 6, modifiedAtMs: 1000, truncated: false });
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain('/repo/src/other.py');
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain('second');
+    expect(document.querySelector('[role="dialog"]')?.textContent).not.toContain('first');
   });
 
   it('keeps image opens on the image viewer path', async () => {

@@ -16,8 +16,8 @@ describe('file content client helper', () => {
     vi.unstubAllGlobals();
   });
 
-  it('builds normalized content URLs', () => {
-    expect(fileContentUrl('/repo/src/app.py:12')).toBe('/api/file/content?path=%2Frepo%2Fsrc%2Fapp.py');
+  it('builds raw content URLs without stripping line-like suffixes', () => {
+    expect(fileContentUrl('/repo/src/app.py:12')).toBe('/api/file/content?path=%2Frepo%2Fsrc%2Fapp.py%3A12');
   });
 
   it('streams text chunks and returns metadata headers', async () => {
@@ -40,6 +40,18 @@ describe('file content client helper', () => {
     expect(fetch).toHaveBeenCalledWith('/api/file/content?path=%2Frepo%2Ffile.txt', expect.objectContaining({ credentials: 'same-origin', cache: 'no-store' }));
     expect(result).toEqual({ content: 'hello world', sizeBytes: 11, modifiedAtMs: 1234, truncated: false });
     expect(progress).toEqual(['hello ', 'world']);
+  });
+
+  it('passes abort signals to the file content fetch', async () => {
+    const controller = new AbortController();
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(streamFromChunks(['hello']), { status: 200 })));
+
+    await readTextFileStream('/repo/file.txt', { signal: controller.signal });
+
+    expect(fetch).toHaveBeenCalledWith(
+      '/api/file/content?path=%2Frepo%2Ffile.txt',
+      expect.objectContaining({ credentials: 'same-origin', cache: 'no-store', signal: controller.signal }),
+    );
   });
 
   it('throws useful errors for HTTP failures', async () => {

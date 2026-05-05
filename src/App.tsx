@@ -126,6 +126,10 @@ function extractModifiedAtMs(result: unknown): number | null {
   return null;
 }
 
+function isAbortError(error: unknown): boolean {
+  return typeof error === 'object' && error !== null && (error as { name?: unknown }).name === 'AbortError';
+}
+
 function fileChangeTurnId(item: Extract<TimelineItem, { kind: 'fileChange' }>): string | null {
   if (item.turnId) return item.turnId;
   const marker = ':file:';
@@ -221,6 +225,8 @@ export default function App() {
   const finalizedFileSummaryFetchesRef = useRef(new Set<string>());
   const liveNotificationWindowRef = useRef({ activeThreadId, activeTurnId: state?.activeTurnId ?? null, startCount: socket.notificationCount });
   const lastHandledCompletionCountRef = useRef<number | null>(null);
+  const fileOpenGenerationRef = useRef(0);
+  const fileOpenAbortRef = useRef<AbortController | null>(null);
   const pendingTurnStartCount = pendingTurnWindow?.threadId === activeThreadId ? pendingTurnWindow.startCount : null;
   notificationCountRef.current = socket.notificationCount;
   const localSortOrder = useCallback((key?: string) => {
@@ -238,6 +244,12 @@ export default function App() {
     socket.notificationCount,
     { pendingStartCount: pendingTurnStartCount },
   );
+
+  useEffect(() => {
+    return () => {
+      fileOpenAbortRef.current?.abort();
+    };
+  }, []);
   const liveNotificationActiveTurnId = liveNotificationWindowRef.current.activeTurnId;
   const liveNotificationStartCount = liveNotificationWindowRef.current.startCount;
   const lastNotification = socket.notifications.at(-1);
@@ -841,29 +853,41 @@ export default function App() {
 
   const openFile = useCallback(async (path: string, readOnly: boolean) => {
     setSessionError(null);
-    const normalizedPath = normalizeMentionedFilePath(path);
-    if (isImagePath(normalizedPath)) {
+    fileOpenAbortRef.current?.abort();
+    fileOpenAbortRef.current = null;
+    const generation = fileOpenGenerationRef.current + 1;
+    fileOpenGenerationRef.current = generation;
+    const isCurrentOpen = (controller: AbortController) =>
+      fileOpenGenerationRef.current === generation && fileOpenAbortRef.current === controller && !controller.signal.aborted;
+
+    if (isImagePath(path)) {
       setEditor(null);
-      setImageViewer({ path: normalizedPath });
+      setImageViewer({ path });
       return;
     }
 
+    const controller = new AbortController();
+    fileOpenAbortRef.current = controller;
+
     try {
       setImageViewer(null);
-      const contentResult = await readTextFileStream(normalizedPath);
+      const contentResult = await readTextFileStream(path, { signal: controller.signal });
+      if (!isCurrentOpen(controller)) return;
       let modifiedAtMs = contentResult.modifiedAtMs;
       if (modifiedAtMs === null) {
-        const metadataResult = await socket.rpc<unknown>('webui/fs/getMetadata', { path: normalizedPath });
+        const metadataResult = await socket.rpc<unknown>('webui/fs/getMetadata', { path });
+        if (!isCurrentOpen(controller)) return;
         modifiedAtMs = extractModifiedAtMs(metadataResult);
       }
       setEditor({
-        path: normalizedPath,
+        path,
         readOnly,
         content: contentResult.content,
         sizeBytes: contentResult.sizeBytes,
         modifiedAtMs,
       });
     } catch (error) {
+      if (controller.signal.aborted || fileOpenGenerationRef.current !== generation || isAbortError(error)) return;
       setSessionError(
         error instanceof FileContentTooLargeError
           ? `${error.message} Use the file explorer download button for this file.`
@@ -871,6 +895,10 @@ export default function App() {
             ? error.message
             : String(error),
       );
+    } finally {
+      if (fileOpenGenerationRef.current === generation && fileOpenAbortRef.current === controller) {
+        fileOpenAbortRef.current = null;
+      }
     }
   }, [socket.rpc]);
 
@@ -883,7 +911,7 @@ export default function App() {
   }, [removeQueued]);
 
   const handleOpenMentionedFile = useCallback((path: string) => {
-    void openFile(path, true);
+    void openFile(normalizeMentionedFilePath(path), true);
   }, [openFile]);
 
   const saveFile = async (path: string, content: string) => {
@@ -1003,6 +1031,7 @@ export default function App() {
           readOnly={editor.readOnly}
           onClose={() => setEditor(null)}
           onSave={(content) => saveFile(editor.path, content)}
+          onOpenFile={(path) => void openFile(path, true)}
         />
       )}
       {imageViewer && (

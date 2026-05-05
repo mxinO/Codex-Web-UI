@@ -1,11 +1,11 @@
 import http from 'node:http';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import WebSocket, { type RawData } from 'ws';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { attachBrowserSocket } from '../../server/browserSocket.js';
+import { attachBrowserSocket, LEGACY_READ_FILE_MAX_BYTES } from '../../server/browserSocket.js';
 import { authCookie } from '../../server/auth.js';
 import { HostStateStore } from '../../server/hostState.js';
 import { FileEditStore, sessionFileEditDbPath } from '../../server/fileEditStore.js';
@@ -2520,6 +2520,27 @@ describe('attachBrowserSocket fs RPC wrappers', () => {
     expect(request).not.toHaveBeenCalled();
   });
 
+  it('rejects oversized legacy file reads before base64 encoding', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request);
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-workspace-'));
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    stateStore.write({ ...stateStore.read(), activeCwd: workspace });
+    const filePath = join(workspace, 'large.bin');
+    writeFileSync(filePath, '');
+    truncateSync(filePath, LEGACY_READ_FILE_MAX_BYTES + 1);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 37, method: 'webui/fs/readFile', params: { path: filePath } }));
+    const response = await nextMessage(ws);
+
+    expect(request).not.toHaveBeenCalled();
+    expect(response).toEqual({
+      type: 'rpc/error',
+      id: 37,
+      error: `file is too large to read via legacy RPC (max ${LEGACY_READ_FILE_MAX_BYTES} bytes)`,
+    });
+  });
+
   it('rejects write file requests without string base64 data', async () => {
     const request = vi.fn<CodexAppServer['request']>();
     const { ws } = await makeHarness(request);
@@ -2546,6 +2567,33 @@ describe('attachBrowserSocket fs RPC wrappers', () => {
 
     expect(request).not.toHaveBeenCalled();
     expect(response).toEqual({ type: 'rpc/error', id: 33, error: 'path is outside active workspace' });
+  });
+
+  it('rejects write file requests through symlinks outside the active workspace without truncating the target', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request);
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-workspace-'));
+    const outside = mkdtempSync(join(tmpdir(), 'codex-webui-outside-'));
+    const outsideFile = join(outside, 'secret.txt');
+    writeFileSync(outsideFile, 'secret');
+    symlinkSync(outsideFile, join(workspace, 'link.txt'), 'file');
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(outside, { recursive: true, force: true }));
+    stateStore.write({ ...stateStore.read(), activeCwd: workspace });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 38,
+        method: 'webui/fs/writeFile',
+        params: { path: join(workspace, 'link.txt'), dataBase64: Buffer.from('changed').toString('base64') },
+      }),
+    );
+    const response = await nextMessage(ws);
+
+    expect(request).not.toHaveBeenCalled();
+    expect(response).toEqual({ type: 'rpc/error', id: 38, error: 'path is outside active workspace' });
+    expect(readFileSync(outsideFile, 'utf8')).toBe('secret');
   });
 
   it('rejects unsupported app-server passthrough methods', async () => {

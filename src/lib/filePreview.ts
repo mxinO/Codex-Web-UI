@@ -5,16 +5,16 @@ export function normalizeMentionedFilePath(path: string): string {
 }
 
 export function isImagePath(path: string): boolean {
-  const normalized = normalizeMentionedFilePath(path).toLowerCase();
+  const normalized = path.toLowerCase();
   const dotIndex = normalized.lastIndexOf('.');
   if (dotIndex < 0) return false;
   return IMAGE_EXTENSIONS.has(normalized.slice(dotIndex));
 }
 
 export function filePreviewUrl(path: string): string {
-  return `/api/file?path=${encodeURIComponent(normalizeMentionedFilePath(path))}`;
+  return `/api/file?path=${encodeURIComponent(path)}`;
 }
 
 export function fileDownloadUrl(path: string): string {
-  return `/api/download?path=${encodeURIComponent(normalizeMentionedFilePath(path))}`;
+  return `/api/download?path=${encodeURIComponent(path)}`;
 }

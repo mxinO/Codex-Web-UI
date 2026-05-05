@@ -1,5 +1,3 @@
-import { normalizeMentionedFilePath } from './filePreview';
-
 export const DEFAULT_TEXT_FILE_MAX_BYTES = 5 * 1024 * 1024;
 
 export class FileContentTooLargeError extends Error {
@@ -15,6 +13,7 @@ export class FileContentTooLargeError extends Error {
 export interface ReadTextFileStreamOptions {
   maxBytes?: number;
   onChunk?: (chunk: string) => void;
+  signal?: AbortSignal;
 }
 
 export interface ReadTextFileStreamResult {
@@ -42,12 +41,21 @@ async function responseError(response: Response): Promise<Error> {
 }
 
 export function fileContentUrl(path: string): string {
-  return `/api/file/content?path=${encodeURIComponent(normalizeMentionedFilePath(path))}`;
+  return `/api/file/content?path=${encodeURIComponent(path)}`;
+}
+
+function abortError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error ? signal.reason : new DOMException('The operation was aborted.', 'AbortError');
+}
+
+function throwIfAborted(signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw abortError(signal);
 }
 
 export async function readTextFileStream(path: string, options: ReadTextFileStreamOptions = {}): Promise<ReadTextFileStreamResult> {
   const maxBytes = options.maxBytes ?? DEFAULT_TEXT_FILE_MAX_BYTES;
-  const response = await fetch(fileContentUrl(path), { credentials: 'same-origin', cache: 'no-store' });
+  const response = await fetch(fileContentUrl(path), { credentials: 'same-origin', cache: 'no-store', signal: options.signal });
+  throwIfAborted(options.signal);
   if (!response.ok) throw await responseError(response);
 
   const sizeBytes = numberHeader(response.headers, 'x-codex-file-size') ?? numberHeader(response.headers, 'content-length');
@@ -63,10 +71,16 @@ export async function readTextFileStream(path: string, options: ReadTextFileStre
   const decoder = new TextDecoder('utf-8');
   const chunks: string[] = [];
   let receivedBytes = 0;
+  const abortRead = () => {
+    void reader.cancel(options.signal?.reason).catch(() => undefined);
+  };
 
   try {
+    throwIfAborted(options.signal);
+    options.signal?.addEventListener('abort', abortRead, { once: true });
     while (true) {
       const { value, done } = await reader.read();
+      throwIfAborted(options.signal);
       if (done) break;
       receivedBytes += value.byteLength;
       if (receivedBytes > maxBytes) {
@@ -78,9 +92,11 @@ export async function readTextFileStream(path: string, options: ReadTextFileStre
       options.onChunk?.(chunk);
     }
   } finally {
+    options.signal?.removeEventListener('abort', abortRead);
     reader.releaseLock();
   }
 
+  throwIfAborted(options.signal);
   const finalChunk = decoder.decode();
   if (finalChunk) {
     chunks.push(finalChunk);

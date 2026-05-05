@@ -23,13 +23,16 @@ describe('logger', () => {
     configureLogger({ filePath: logPath });
     logInfo('Open http://127.0.0.1:8080?token=secret-token', {
       url: 'http://127.0.0.1:8080/?mode=x&token=secret-token',
-      cookie: 'codex_web_ui_token=secret-token',
+      cookie: 'codex_webui_token=secret-token',
+      headerValue: 'Cookie: codex_webui_token=secret-token; codex_webui_token_012345abcdef=secret-token',
     });
     logWarn('request failed', new Error('GET /?token=secret-token failed'));
 
     const log = readFileSync(logPath, 'utf8');
     expect(log).not.toContain('secret-token');
     expect(log).toContain('token=<redacted>');
+    expect(log).toContain('codex_webui_token=<redacted>');
+    expect(log).toContain('codex_webui_token_012345abcdef=<redacted>');
     expect(statSync(logPath).mode & 0o777).toBe(0o600);
     expect(statSync(dir).mode & 0o777).toBe(0o700);
   });
