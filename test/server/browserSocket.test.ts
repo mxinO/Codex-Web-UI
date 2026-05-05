@@ -234,6 +234,22 @@ describe('attachBrowserSocket auth', () => {
 
     expect(initialHello.type).toBe('server/hello');
   });
+
+  it('rejects a stale scoped cookie after the server token changes', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ data: [] });
+    const scope = 'browser.test:3002';
+    const { initialHello } = await makeHarness(request, {
+      config: { noAuth: false },
+      token: 'current-token',
+      headers: {
+        Host: scope,
+        Cookie: authCookie('previous-token', scope).split(';')[0],
+      },
+    });
+
+    expect(initialHello).toEqual({ type: 'auth/error' });
+    expect(request).not.toHaveBeenCalled();
+  });
 });
 
 describe('attachBrowserSocket session RPCs', () => {

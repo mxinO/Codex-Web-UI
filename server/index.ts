@@ -9,7 +9,7 @@ import {
   authCookie,
   authScopeFromHostHeader,
   hashToken,
-  isTokenAuthorized,
+  isTokenValid,
   parseTokenFromCookieScopes,
 } from './auth.js';
 import { attachBrowserSocket } from './browserSocket.js';
@@ -41,8 +41,6 @@ const server = http.createServer(app);
 const stateStore = new HostStateStore(config.stateDir, config.hostname);
 const token = createAuthToken();
 const tokenHash = hashToken(token);
-const previousTokenHash = stateStore.read().authTokenHash;
-const acceptedTokenHashes = previousTokenHash && previousTokenHash !== tokenHash ? [previousTokenHash] : [];
 const fallbackAuthScope = `${config.hostname}:${config.port}`;
 
 stateStore.update((state) => ({ ...state, authTokenHash: tokenHash }));
@@ -69,12 +67,11 @@ function primaryAuthScopeForRequest(req: express.Request): string {
   return authScopesForRequest(req)[0];
 }
 
-function authorized(req: express.Request, options: { allowPreviousToken?: boolean } = {}): boolean {
+function authorized(req: express.Request): boolean {
   if (config.noAuth) return true;
   const queryToken = typeof req.query.token === 'string' ? req.query.token : null;
   const cookieToken = parseTokenFromCookieScopes(req.headers.cookie, authScopesForRequest(req));
-  const acceptedHashes = options.allowPreviousToken ? acceptedTokenHashes : [];
-  return isTokenAuthorized(token, acceptedHashes, queryToken) || isTokenAuthorized(token, acceptedHashes, cookieToken);
+  return isTokenValid(token, queryToken) || isTokenValid(token, cookieToken);
 }
 
 function getQueryPath(req: express.Request): string | null {
@@ -121,7 +118,7 @@ app.post('/api/upload', express.raw({ type: 'application/octet-stream', limit: '
 app.use(express.json({ limit: '2mb' }));
 
 app.get('/api/auth', (req, res) => {
-  if (!authorized(req, { allowPreviousToken: true })) return res.status(401).json({ authenticated: false });
+  if (!authorized(req)) return res.status(401).json({ authenticated: false });
   res.setHeader('Set-Cookie', authCookie(token, primaryAuthScopeForRequest(req)));
   res.json({ authenticated: true, hostname: config.hostname });
 });

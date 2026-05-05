@@ -5,8 +5,6 @@ import {
   authCookieName,
   authScopeFromHostHeader,
   hashToken,
-  isTokenAuthorized,
-  isTokenHashValid,
   isTokenValid,
   parseTokenFromCookie,
   parseTokenFromCookieScopes,
@@ -27,23 +25,13 @@ describe('auth helpers', () => {
     expect(isTokenValid(token, '')).toBe(false);
   });
 
-  it('validates persisted token hashes against raw tokens', () => {
+  it('hashes tokens for persistence without making hashes valid credentials', () => {
     const token = createAuthToken();
     const expectedHash = hashToken(token);
 
-    expect(isTokenHashValid(expectedHash, token)).toBe(true);
-    expect(isTokenHashValid(expectedHash, createAuthToken())).toBe(false);
-    expect(isTokenHashValid(expectedHash, '')).toBe(false);
-    expect(isTokenHashValid(null, token)).toBe(false);
-  });
-
-  it('authorizes the current token and accepted persisted token hashes', () => {
-    const current = createAuthToken();
-    const previous = createAuthToken();
-
-    expect(isTokenAuthorized(current, [hashToken(previous)], current)).toBe(true);
-    expect(isTokenAuthorized(current, [hashToken(previous)], previous)).toBe(true);
-    expect(isTokenAuthorized(current, [hashToken(previous)], createAuthToken())).toBe(false);
+    expect(expectedHash).toHaveLength(64);
+    expect(isTokenValid(expectedHash, token)).toBe(false);
+    expect(isTokenValid(token, expectedHash)).toBe(false);
   });
 
   it('parses cookie token', () => {

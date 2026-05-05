@@ -31,26 +31,6 @@ export function isTokenValid(expected: string, actual: string | null | undefined
   return crypto.timingSafeEqual(a, b);
 }
 
-export function isTokenHashValid(
-  expectedHash: string | null | undefined,
-  actualToken: string | null | undefined,
-): boolean {
-  if (!expectedHash || !actualToken) return false;
-  return isTokenValid(expectedHash, hashToken(actualToken));
-}
-
-export function isTokenAuthorized(
-  currentToken: string,
-  acceptedTokenHashes: Iterable<string | null | undefined>,
-  actualToken: string | null | undefined,
-): boolean {
-  if (isTokenValid(currentToken, actualToken)) return true;
-  for (const expectedHash of acceptedTokenHashes) {
-    if (isTokenHashValid(expectedHash, actualToken)) return true;
-  }
-  return false;
-}
-
 export function parseTokenFromCookie(header: string | undefined, scope?: string | null): string | null {
   return parseTokenFromCookieScopes(header, [scope]);
 }

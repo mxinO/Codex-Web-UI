@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import type http from 'node:http';
 import nodePath from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
-import { authScopeFromHostHeader, isTokenAuthorized, parseTokenFromCookieScopes } from './auth.js';
+import { authScopeFromHostHeader, isTokenValid, parseTokenFromCookieScopes } from './auth.js';
 import type { CodexAppServer } from './appServer.js';
 import { isInteractiveCommandBlocked, runBangCommand } from './bangCommand.js';
 import type { ServerConfig } from './config.js';
@@ -78,8 +78,8 @@ function authorized(
 ): boolean {
   if (deps.config.noAuth) return true;
   return (
-    isTokenAuthorized(deps.token, [], queryToken) ||
-    isTokenAuthorized(deps.token, [], parseTokenFromCookieScopes(cookieHeader, authScopesForRequest(hostHeader, deps.authCookieScope)))
+    isTokenValid(deps.token, queryToken) ||
+    isTokenValid(deps.token, parseTokenFromCookieScopes(cookieHeader, authScopesForRequest(hostHeader, deps.authCookieScope)))
   );
 }
 
