@@ -222,6 +222,7 @@ export default function App() {
     activeTurnId: state?.activeTurnId ?? null,
     queue: state?.queue ?? [],
   });
+  const manuallyRemovedQueuedIdsRef = useRef(new Set<string>());
   const finalizedFileSummaryFetchesRef = useRef(new Set<string>());
   const liveNotificationWindowRef = useRef({ activeThreadId, activeTurnId: state?.activeTurnId ?? null, startCount: socket.notificationCount });
   const lastHandledCompletionCountRef = useRef<number | null>(null);
@@ -415,6 +416,7 @@ export default function App() {
       { activeThreadId: previous.activeThreadId, activeTurnId: previous.activeTurnId },
       currentScope,
       localSortOrder,
+      { ignoredRemovedMessageIds: manuallyRemovedQueuedIdsRef.current },
     );
     const nextQueueIds = new Set(nextQueue.map((message) => message.id));
 
@@ -429,6 +431,9 @@ export default function App() {
     });
 
     previousQueueSnapshotRef.current = { ...currentScope, queue: nextQueue };
+    for (const id of Array.from(manuallyRemovedQueuedIdsRef.current)) {
+      if (!nextQueueIds.has(id)) manuallyRemovedQueuedIdsRef.current.delete(id);
+    }
     replaceQueue(nextQueue);
   }, [activeThreadId, localSortOrder, replaceQueue, state?.activeTurnId, state?.queue, timeline.items]);
 
@@ -835,19 +840,30 @@ export default function App() {
   const editQueued = useCallback(async (message: ClientQueuedMessage) => {
     setSessionError(null);
     try {
-      await removeFromQueue(message.id);
+      const result = await removeFromQueue(message.id, (removeResult) => {
+        if (removeResult.removed) manuallyRemovedQueuedIdsRef.current.add(message.id);
+      });
+      if (!result.removed) {
+        setSessionError('Queued message was already sent.');
+        return;
+      }
       setComposerDraft(message.text);
     } catch (error) {
+      manuallyRemovedQueuedIdsRef.current.delete(message.id);
       setSessionError(error instanceof Error ? error.message : String(error));
     }
   }, [removeFromQueue]);
 
-  const removeQueued = useCallback(async (id: string) => {
+  const removeQueued = useCallback(async (id: string): Promise<boolean> => {
     setSessionError(null);
     try {
-      await removeFromQueue(id);
+      const result = await removeFromQueue(id, (removeResult) => {
+        if (removeResult.removed) manuallyRemovedQueuedIdsRef.current.add(id);
+      });
+      return result.removed;
     } catch (error) {
       setSessionError(error instanceof Error ? error.message : String(error));
+      return false;
     }
   }, [removeFromQueue]);
 
@@ -907,7 +923,9 @@ export default function App() {
   }, [editQueued]);
 
   const handleQueuedRemove = useCallback((id: string) => {
-    void removeQueued(id);
+    void removeQueued(id).then((removed) => {
+      if (!removed) manuallyRemovedQueuedIdsRef.current.delete(id);
+    });
   }, [removeQueued]);
 
   const handleOpenMentionedFile = useCallback((path: string) => {

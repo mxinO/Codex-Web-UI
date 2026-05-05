@@ -1107,27 +1107,40 @@ export function claimedQueuedUserItemsFromQueueTransition(
   previousScope: TimelineNotificationScope,
   currentScope: TimelineNotificationScope,
   sortOrderForId: (id: string) => number,
+  options: { ignoredRemovedMessageIds?: ReadonlySet<string> } = {},
 ): Extract<TimelineItem, { kind: 'user' }>[] {
   const previousTurnId = previousScope.activeTurnId;
   const currentTurnId = currentScope.activeTurnId;
   if (!currentTurnId) return [];
   if (previousScope.activeThreadId !== currentScope.activeThreadId) return [];
-  if (previousTurnId === currentTurnId) return [];
-  if (isSyntheticPendingTurnId(previousTurnId)) return [];
-  if (!previousTurnId && isSyntheticPendingTurnId(currentTurnId)) return [];
+  if (previousTurnId === currentTurnId) {
+    if (!previousTurnId || isSyntheticPendingTurnId(previousTurnId)) return [];
+  } else {
+    if (isSyntheticPendingTurnId(previousTurnId)) return [];
+    if (!previousTurnId && isSyntheticPendingTurnId(currentTurnId)) return [];
+  }
 
   const currentIds = new Set(currentQueue.map((message) => message.id));
-  const removedHeadMessage = previousQueue[0] && !currentIds.has(previousQueue[0].id) ? previousQueue[0] : null;
-  if (!removedHeadMessage) return [];
+  const claimedMessages: QueuedTimelineMessage[] = [];
+  const allowMultipleClaims = previousTurnId === currentTurnId;
+  for (const message of previousQueue) {
+    if (currentIds.has(message.id)) break;
+    if (options.ignoredRemovedMessageIds?.has(message.id)) continue;
+    claimedMessages.push(message);
+    if (!allowMultipleClaims) break;
+  }
+  if (claimedMessages.length === 0) return [];
 
-  const id = claimedQueuedUserItemId(removedHeadMessage.id);
-  return [{
-    id,
-    kind: 'user',
-    timestamp: removedHeadMessage.createdAt,
-    sortOrder: sortOrderForId(id),
-    text: removedHeadMessage.text,
-  }];
+  return claimedMessages.map((message) => {
+    const id = claimedQueuedUserItemId(message.id);
+    return {
+      id,
+      kind: 'user',
+      timestamp: message.createdAt,
+      sortOrder: sortOrderForId(id),
+      text: message.text,
+    };
+  });
 }
 
 function liveRetentionKey(item: TimelineItem): string {

@@ -8,6 +8,11 @@ export interface ClientQueuedMessage {
   options?: Partial<CodexRunOptions>;
 }
 
+export interface QueueRemoveResult {
+  queue: ClientQueuedMessage[];
+  removed: boolean;
+}
+
 export function useQueue(rpc: <T>(method: string, params?: unknown) => Promise<T>, initialQueue: ClientQueuedMessage[] = []) {
   const [queue, setQueue] = useState<ClientQueuedMessage[]>(initialQueue);
 
@@ -20,9 +25,11 @@ export function useQueue(rpc: <T>(method: string, params?: unknown) => Promise<T
   );
 
   const remove = useCallback(
-    async (id: string) => {
-      const next = await rpc<ClientQueuedMessage[]>('webui/queue/remove', { id });
-      setQueue(next);
+    async (id: string, beforeReplace?: (result: QueueRemoveResult) => void) => {
+      const result = await rpc<QueueRemoveResult>('webui/queue/remove', { id, includeStatus: true });
+      beforeReplace?.(result);
+      setQueue(result.queue);
+      return result;
     },
     [rpc],
   );

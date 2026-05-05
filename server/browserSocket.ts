@@ -53,6 +53,21 @@ interface TurnStartParams {
   options?: CodexRunOptions;
 }
 
+interface QueuedTurnClaim {
+  threadId: string;
+  queuedMessage: QueuedMessage;
+}
+
+interface QueuedSteerClaim extends QueuedTurnClaim {
+  turnId: string;
+}
+
+interface QueuedSteerInFlight extends QueuedSteerClaim {
+  terminalDisposition: TerminalDisposition | null;
+  settled: boolean;
+  timedOut: boolean;
+}
+
 export interface BrowserSocketCleanup {
   close(): void;
 }
@@ -139,6 +154,7 @@ const COMPACTION_PENDING_TURN_PREFIX = 'compact-pending:';
 const TURN_START_PENDING_TURN_PREFIX = 'turn-start-pending:';
 const THREAD_TURNS_LIST_RPC_TIMEOUT_MS = 2 * 60 * 1000;
 const TURN_START_RPC_TIMEOUT_MS = 10 * 60 * 1000;
+const TURN_STEER_RPC_TIMEOUT_MS = 10 * 60 * 1000;
 const RECENT_NOTIFICATION_MAX_ENTRIES = 500;
 const RECENT_NOTIFICATION_MAX_BYTES = 2 * 1024 * 1024;
 const RECENT_NOTIFICATION_SINGLE_MAX_BYTES = 256 * 1024;
@@ -336,6 +352,16 @@ function notificationTurnId(message: { params?: unknown; payload?: unknown }): s
 
 type TerminalDisposition = 'advance-queue' | 'barrier';
 
+function queuedRunOptionsMatchActiveTurn(state: HostRuntimeState, message: QueuedMessage): boolean {
+  const options = message.options;
+  if (!options) return true;
+  if (options.model && options.model !== state.model) return false;
+  if (options.effort && options.effort !== state.effort) return false;
+  if (options.mode && options.mode !== state.mode) return false;
+  if (options.sandbox && options.sandbox !== state.sandbox) return false;
+  return true;
+}
+
 function taskTerminalDisposition(message: { method?: unknown; params?: unknown; payload?: unknown }): TerminalDisposition | null {
   if (message.method !== 'event_msg') return null;
   const payload = notificationPayload(message);
@@ -491,6 +517,11 @@ function completionMatchesActiveTurn(
 function isTurnStartTimeout(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /timed out:\s*turn\/start|request timed out:\s*turn\/start/i.test(message);
+}
+
+function isTurnSteerTimeout(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /timed out:\s*turn\/steer|request timed out:\s*turn\/steer/i.test(message);
 }
 
 function lastNotificationSeq(params: unknown): number | null {
@@ -1003,6 +1034,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const wss = new WebSocketServer({ server, path: '/ws' });
   let closed = false;
   let queuedStartInFlight: { threadId: string; queuedMessage: QueuedMessage } | null = null;
+  let queuedSteerInFlight: QueuedSteerInFlight | null = null;
   let bangCommandInFlight = false;
   const notificationStreamId = randomUUID();
   const pendingTurnStartContexts: TurnContext[] = [];
@@ -1012,6 +1044,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const knownThreadPaths = new Map<string, string>();
   let appServerGeneration = 0;
   const timedOutQueuedStarts = new Map<string, QueuedMessage>();
+  const deferredQueuedMessagesByThread = new Map<string, QueuedMessage[]>();
   const recentNotifications: Array<{ seq: number; message: unknown; bytes: number }> = [];
   let recentNotificationSeq = 0;
   let recentNotificationBytes = 0;
@@ -1123,6 +1156,11 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       completedTurnKeys.has(turnKey(threadId, turnId)) ||
       completedTurnKeys.has(turnKey(null, turnId))
     );
+  };
+
+  const isTerminalOrCompletingTurn = (threadId: string | null, turnId: string | null): boolean => {
+    if (!turnId) return false;
+    return hasCompletedTurn(threadId, turnId) || completingTurnKeys.has(turnKey(threadId, turnId)) || completingTurnKeys.has(turnKey(null, turnId));
   };
 
   const rememberTurnThreadPath = (threadId: string | null, turnId: string | null, threadPath: string | null) => {
@@ -1918,12 +1956,228 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
   };
 
+  const steerTurn = async ({ threadId, turnId, queuedMessage }: QueuedSteerClaim) => {
+    await ensureThreadResumed(threadId);
+    const current = deps.stateStore.read();
+    if (current.activeThreadId !== threadId || current.activeTurnId !== turnId || isTerminalOrCompletingTurn(threadId, turnId)) {
+      throw new Error('active turn is no longer steerable');
+    }
+    return requestCodex(
+      'turn/steer',
+      {
+        threadId,
+        expectedTurnId: turnId,
+        input: [{ type: 'text', text: queuedMessage.text, text_elements: [] }],
+      },
+      TURN_STEER_RPC_TIMEOUT_MS,
+    );
+  };
+
+  const deferQueuedMessageForThread = (threadId: string, queuedMessage: QueuedMessage): void => {
+    const current = deferredQueuedMessagesByThread.get(threadId) ?? [];
+    if (!current.some((message) => message.id === queuedMessage.id)) current.push(queuedMessage);
+    deferredQueuedMessagesByThread.set(threadId, current.slice(-deps.config.queueLimit));
+  };
+
+  const restoreDeferredQueuedMessagesForThread = (threadId: string): HostRuntimeState | null => {
+    const deferred = deferredQueuedMessagesByThread.get(threadId);
+    if (!deferred || deferred.length === 0) return null;
+    let restored = false;
+    const state = deps.stateStore.update((current) => {
+      if (current.activeThreadId !== threadId) return current;
+      restored = true;
+      const existingIds = new Set(current.queue.map((message) => message.id));
+      const restoredMessages = deferred.filter((message) => !existingIds.has(message.id));
+      return restoredMessages.length > 0
+        ? { ...current, queue: [...restoredMessages, ...current.queue].slice(0, deps.config.queueLimit) }
+        : current;
+    });
+    if (restored) deferredQueuedMessagesByThread.delete(threadId);
+    return restored ? state : null;
+  };
+
+  const restoreQueuedMessageToFront = (threadId: string, queuedMessage: QueuedMessage): HostRuntimeState | null => {
+    let restored = false;
+    const state = deps.stateStore.update((current) => {
+      if (current.activeThreadId !== threadId) return current;
+      restored = true;
+      return {
+        ...current,
+        queue: current.queue.some((message) => message.id === queuedMessage.id)
+          ? current.queue
+        : [queuedMessage, ...current.queue].slice(0, deps.config.queueLimit),
+      };
+    });
+    if (!restored) deferQueuedMessageForThread(threadId, queuedMessage);
+    return restored ? state : null;
+  };
+
+  const startQueuedTurnFromIdle = (threadId: string, queuedMessage: QueuedMessage): void => {
+    if (queuedStartInFlight) return;
+    queuedStartInFlight = { threadId, queuedMessage };
+
+    void (async () => {
+      let completedBeforeStartReturned = false;
+      try {
+        const result = await startTurn({ threadId, text: queuedMessage.text, options: queuedMessage.options });
+        const nextTurnId = extractTurnId(result);
+        timedOutQueuedStarts.delete(threadId);
+        const alreadyCompleted = hasCompletedTurn(threadId, nextTurnId);
+        completedBeforeStartReturned = alreadyCompleted;
+        const next = deps.stateStore.update((current) => {
+          if (current.activeThreadId !== threadId) return current;
+          if (alreadyCompleted && (current.activeTurnId === nextTurnId || isPendingTurnStartForThread(current.activeTurnId, threadId))) {
+            return applyRunOptionsToRuntimeState({ ...current, activeTurnId: null }, queuedMessage.options);
+          }
+          if (current.activeTurnId === nextTurnId) return applyRunOptionsToRuntimeState(current, queuedMessage.options);
+          if (isPendingTurnStartForThread(current.activeTurnId, threadId)) {
+            return applyRunOptionsToRuntimeState({ ...current, activeTurnId: nextTurnId }, queuedMessage.options);
+          }
+          return current;
+        });
+        if (next.activeThreadId === threadId) {
+          rememberTurnThreadPath(threadId, nextTurnId, next.activeThreadPath);
+          rememberTurnCwd(threadId, nextTurnId, next.activeCwd);
+          rememberLivePatchTurn(threadId, nextTurnId);
+        }
+        broadcastHello(next);
+      } catch (error) {
+        logWarn('Failed to start queued turn', error);
+        if (isTurnStartTimeout(error)) {
+          let restoredQueuedMessage = false;
+          const next = deps.stateStore.update((current) => {
+            if (current.activeThreadId !== threadId || !isPendingTurnStartForThread(current.activeTurnId, threadId)) return current;
+            restoredQueuedMessage = true;
+            return {
+              ...current,
+              activeTurnId: null,
+              queue: current.queue.some((message) => message.id === queuedMessage.id)
+                ? current.queue
+                : [queuedMessage, ...current.queue].slice(0, deps.config.queueLimit),
+            };
+          });
+          if (restoredQueuedMessage) timedOutQueuedStarts.set(threadId, queuedMessage);
+          broadcastHello(next);
+          return;
+        }
+        const next = deps.stateStore.update((current) => {
+          if (current.activeThreadId !== threadId || !isPendingTurnStartForThread(current.activeTurnId, threadId)) return current;
+          return {
+            ...current,
+            activeTurnId: null,
+            queue: current.queue.some((message) => message.id === queuedMessage.id)
+              ? current.queue
+              : [queuedMessage, ...current.queue].slice(0, deps.config.queueLimit),
+          };
+        });
+        broadcastHello(next);
+      } finally {
+        queuedStartInFlight = null;
+        if (!completedBeforeStartReturned || !maybeStartQueuedTurnFromIdle(threadId)) maybeSteerQueuedMessage();
+      }
+    })();
+  };
+
+  const maybeStartQueuedTurnFromIdle = (threadId: string): boolean => {
+    if (queuedStartInFlight) return false;
+    let claim: QueuedTurnClaim | null = null;
+    const claimed = deps.stateStore.update((current) => {
+      if (current.activeThreadId !== threadId || current.activeTurnId || !current.activeThreadId) return current;
+      const shifted = shiftQueuedMessage(current.queue);
+      if (!shifted.next) return current;
+      claim = { threadId: current.activeThreadId, queuedMessage: shifted.next };
+      return applyRunOptionsToRuntimeState(
+        { ...current, activeTurnId: pendingTurnStartTurnId(current.activeThreadId), queue: shifted.queue },
+        shifted.next.options,
+      );
+    });
+
+    const claimToStart = claim as QueuedTurnClaim | null;
+    if (!claimToStart) return false;
+    broadcastHello(claimed);
+    startQueuedTurnFromIdle(claimToStart.threadId, claimToStart.queuedMessage);
+    return true;
+  };
+
+  const maybeSteerQueuedMessage = (): void => {
+    if (queuedSteerInFlight || queuedStartInFlight) return;
+
+    let claim: QueuedSteerClaim | null = null;
+    const claimed = deps.stateStore.update((current) => {
+      if (!current.activeThreadId || !current.activeTurnId) return current;
+      if (isPendingTurnForThread(current.activeTurnId, current.activeThreadId)) return current;
+      if (isTerminalOrCompletingTurn(current.activeThreadId, current.activeTurnId)) return current;
+      const nextQueuedMessage = current.queue[0];
+      if (!nextQueuedMessage || !queuedRunOptionsMatchActiveTurn(current, nextQueuedMessage)) return current;
+      const shifted = shiftQueuedMessage(current.queue);
+      if (!shifted.next) return current;
+      claim = { threadId: current.activeThreadId, turnId: current.activeTurnId, queuedMessage: shifted.next };
+      return { ...current, queue: shifted.queue };
+    });
+
+    const claimToSteer = claim as QueuedSteerClaim | null;
+    if (!claimToSteer) return;
+    const inFlight: QueuedSteerInFlight = { ...claimToSteer, terminalDisposition: null, settled: false, timedOut: false };
+    queuedSteerInFlight = inFlight;
+    broadcastHello(claimed);
+
+    void (async () => {
+      let followUp: 'drain-active-turn' | 'start-next-turn' | null = null;
+      try {
+        await steerTurn(claimToSteer);
+        inFlight.settled = true;
+        const terminalDisposition = inFlight.terminalDisposition;
+        if (terminalDisposition === 'barrier') {
+          const restored = restoreQueuedMessageToFront(claimToSteer.threadId, claimToSteer.queuedMessage);
+          if (restored) broadcastHello(restored);
+        } else if (terminalDisposition === 'advance-queue') {
+          const current = deps.stateStore.read();
+          if (current.activeThreadId !== claimToSteer.threadId || current.activeTurnId !== claimToSteer.turnId) {
+            followUp = 'start-next-turn';
+          }
+        } else {
+          const current = deps.stateStore.read();
+          if (current.activeThreadId === claimToSteer.threadId && current.activeTurnId === claimToSteer.turnId) {
+            followUp = 'drain-active-turn';
+          }
+        }
+      } catch (error) {
+        logWarn('Failed to steer queued message into active turn', error);
+        inFlight.settled = true;
+        inFlight.timedOut = isTurnSteerTimeout(error);
+        const terminalDisposition = inFlight.terminalDisposition;
+        const restored = restoreQueuedMessageToFront(claimToSteer.threadId, claimToSteer.queuedMessage);
+        if (restored) broadcastHello(restored);
+        if (terminalDisposition === 'advance-queue' && !isTurnSteerTimeout(error)) {
+          const current = deps.stateStore.read();
+          if (current.activeThreadId !== claimToSteer.threadId || current.activeTurnId !== claimToSteer.turnId) {
+            followUp = 'start-next-turn';
+          }
+        }
+      } finally {
+        if (queuedSteerInFlight === inFlight) queuedSteerInFlight = null;
+      }
+      if (followUp === 'start-next-turn') {
+        maybeStartQueuedTurnFromIdle(claimToSteer.threadId);
+      } else if (followUp === 'drain-active-turn') {
+        maybeSteerQueuedMessage();
+      }
+    })();
+  };
+
   const handleTurnCompleted = async (message: { method?: unknown; params?: unknown; payload?: unknown }, disposition: TerminalDisposition) => {
     const advanceQueue = disposition === 'advance-queue';
     const allowMissingTurnId = advanceQueue;
     const completedThreadId = notificationThreadId(message);
     const completedTurnId = notificationTurnId(message);
     const current = deps.stateStore.read();
+    const completingSteer: QueuedSteerInFlight | null =
+      queuedSteerInFlight &&
+      (!completedThreadId || completedThreadId === queuedSteerInFlight.threadId) &&
+      completionMatchesActiveTurn(queuedSteerInFlight.turnId, queuedSteerInFlight.threadId, completedTurnId, { allowMissingTurnId })
+        ? queuedSteerInFlight
+        : null;
+    if (completingSteer) completingSteer.terminalDisposition = disposition;
 
     const missingTurnIdCanMatch =
       allowMissingTurnId && isPendingCompactionTurnForThread(current.activeTurnId, current.activeThreadId);
@@ -1971,7 +2225,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       return;
     }
 
-    if (queuedStartInFlight || !advanceQueue) {
+    if (queuedStartInFlight || queuedSteerInFlight || completingSteer || !advanceQueue) {
       const cleared = deps.stateStore.update((current) => {
         const stillActiveCompletion =
           Boolean(current.activeTurnId) &&
@@ -1986,29 +2240,25 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           rememberCompletedTurnKey(completionKey);
         }
       }
+      if (completingSteer && advanceQueue && completingSteer.settled && !completingSteer.timedOut) {
+        maybeStartQueuedTurnFromIdle(completingSteer.threadId);
+      }
       return;
     }
 
-    const claim: { threadId?: string; queuedMessage?: QueuedMessage } = {};
-
+    let claim: QueuedTurnClaim | null = null;
     const claimed = deps.stateStore.update((current) => {
       const stillActiveCompletion =
         Boolean(current.activeThreadId && current.activeTurnId) &&
         (!completedThreadId || completedThreadId === current.activeThreadId) &&
         completionMatchesActiveTurn(current.activeTurnId, current.activeThreadId, completedTurnId, { allowMissingTurnId });
       if (!stillActiveCompletion) return current;
-
-      if (!current.activeThreadId) {
-        return { ...current, activeTurnId: null };
-      }
+      if (!current.activeThreadId) return { ...current, activeTurnId: null };
 
       const shifted = shiftQueuedMessage(current.queue);
-      if (!shifted.next) {
-        return { ...current, activeTurnId: null };
-      }
+      if (!shifted.next) return { ...current, activeTurnId: null };
 
-      claim.threadId = current.activeThreadId;
-      claim.queuedMessage = shifted.next;
+      claim = { threadId: current.activeThreadId, queuedMessage: shifted.next };
       return applyRunOptionsToRuntimeState(
         { ...current, activeTurnId: pendingTurnStartTurnId(current.activeThreadId), queue: shifted.queue },
         shifted.next.options,
@@ -2016,8 +2266,8 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     });
     broadcastHello(claimed);
 
-    const { threadId, queuedMessage } = claim;
-    if (!threadId || !queuedMessage) {
+    const claimToStart = claim as QueuedTurnClaim | null;
+    if (!claimToStart) {
       if (completionKey) {
         completingTurnKeys.delete(completionKey);
         if (finalizedForCompletionKey) {
@@ -2027,69 +2277,13 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       return;
     }
 
-    queuedStartInFlight = { threadId, queuedMessage };
     if (completionKey) {
       completingTurnKeys.delete(completionKey);
       if (finalizedForCompletionKey) {
         rememberCompletedTurnKey(completionKey);
       }
     }
-
-    try {
-      const result = await startTurn({ threadId, text: queuedMessage.text, options: queuedMessage.options });
-      const nextTurnId = extractTurnId(result);
-      timedOutQueuedStarts.delete(threadId);
-      const alreadyCompleted = hasCompletedTurn(threadId, nextTurnId);
-      const next = deps.stateStore.update((current) => {
-        if (current.activeThreadId !== threadId) return current;
-        if (alreadyCompleted && (current.activeTurnId === nextTurnId || isPendingTurnStartForThread(current.activeTurnId, threadId))) {
-          return applyRunOptionsToRuntimeState({ ...current, activeTurnId: null }, queuedMessage.options);
-        }
-        if (current.activeTurnId === nextTurnId) return applyRunOptionsToRuntimeState(current, queuedMessage.options);
-        if (isPendingTurnStartForThread(current.activeTurnId, threadId)) {
-          return applyRunOptionsToRuntimeState({ ...current, activeTurnId: nextTurnId }, queuedMessage.options);
-        }
-        return current;
-      });
-      if (next.activeThreadId === threadId) {
-        rememberTurnThreadPath(threadId, nextTurnId, next.activeThreadPath);
-        rememberTurnCwd(threadId, nextTurnId, next.activeCwd);
-        rememberLivePatchTurn(threadId, nextTurnId);
-      }
-      broadcastHello(next);
-    } catch (error) {
-      logWarn('Failed to start queued turn', error);
-      if (isTurnStartTimeout(error)) {
-        let restoredQueuedMessage = false;
-        const next = deps.stateStore.update((current) => {
-          if (current.activeThreadId !== threadId || !isPendingTurnStartForThread(current.activeTurnId, threadId)) return current;
-          restoredQueuedMessage = true;
-          return {
-            ...current,
-            activeTurnId: null,
-            queue: current.queue.some((message) => message.id === queuedMessage.id)
-              ? current.queue
-              : [queuedMessage, ...current.queue].slice(0, deps.config.queueLimit),
-          };
-        });
-        if (restoredQueuedMessage) timedOutQueuedStarts.set(threadId, queuedMessage);
-        broadcastHello(next);
-        return;
-      }
-      const next = deps.stateStore.update((current) => {
-        if (current.activeThreadId !== threadId || !isPendingTurnStartForThread(current.activeTurnId, threadId)) return current;
-        return {
-          ...current,
-          activeTurnId: null,
-          queue: current.queue.some((message) => message.id === queuedMessage.id)
-            ? current.queue
-            : [queuedMessage, ...current.queue].slice(0, deps.config.queueLimit),
-        };
-      });
-      broadcastHello(next);
-    } finally {
-      queuedStartInFlight = null;
-    }
+    startQueuedTurnFromIdle(claimToStart.threadId, claimToStart.queuedMessage);
   };
 
   const handleTaskStarted = (message: { params?: unknown; payload?: unknown }) => {
@@ -2134,6 +2328,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       activeCwd: state.activeThreadId === threadId ? (cwd ?? state.activeCwd) : state.activeCwd,
     }));
     broadcastHello(next);
+    maybeSteerQueuedMessage();
   };
 
   const unsubscribeNotification = deps.codex.onNotification((message) => {
@@ -2307,7 +2502,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             resultThreadPath ?? resumePath ?? (requestedThreadPath && knownThreadPaths.get(threadId) === requestedThreadPath ? requestedThreadPath : null);
           const runtimeStatus = runtimeStatusFromThreadResult(result, options);
           rememberKnownThreadPath(threadId, activeThreadPath);
-          const state = deps.stateStore.update((state) => ({
+          let state = deps.stateStore.update((state) => ({
             ...state,
             activeThreadId: threadId,
             activeThreadPath,
@@ -2316,6 +2511,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             ...runtimeStatus,
             recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
           }));
+          state = restoreDeferredQueuedMessagesForThread(threadId) ?? state;
           send(ws, { type: 'rpc/result', id: request.id, result: sanitizeThreadHistory(result) });
           broadcastHello(state);
           return;
@@ -2334,6 +2530,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }));
           send(ws, { type: 'rpc/result', id: request.id, result: state.queue });
           broadcastHello(state);
+          maybeSteerQueuedMessage();
           return;
         }
 
@@ -2579,13 +2776,19 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             send(ws, { type: 'rpc/error', id: request.id, error: 'id is required' });
             return;
           }
+          const includeStatus = isRecord(request.params) && request.params.includeStatus === true;
 
-          const state = deps.stateStore.update((current) => ({
-            ...current,
-            queue: removeQueuedMessage(current.queue, id),
-          }));
-          send(ws, { type: 'rpc/result', id: request.id, result: state.queue });
+          let removed = false;
+          const state = deps.stateStore.update((current) => {
+            removed = current.queue.some((message) => message.id === id);
+            return {
+              ...current,
+              queue: removed ? removeQueuedMessage(current.queue, id) : current.queue,
+            };
+          });
+          send(ws, { type: 'rpc/result', id: request.id, result: includeStatus ? { queue: state.queue, removed } : state.queue });
           broadcastHello(state);
+          maybeSteerQueuedMessage();
           return;
         }
 
@@ -2669,6 +2872,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
           send(ws, { type: 'rpc/result', id: request.id, result });
           broadcastHello(state);
+          if (!alreadyCompleted || !maybeStartQueuedTurnFromIdle(threadId)) maybeSteerQueuedMessage();
           return;
         }
 

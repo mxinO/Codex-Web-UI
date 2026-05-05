@@ -1,5 +1,6 @@
 import http from 'node:http';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
+import fs from 'node:fs/promises';
 import { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -3291,6 +3292,603 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     expect(stateStore.read().queue).toEqual([]);
   });
 
+  it('reports whether a queued remove actually removed a queued message', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      queue: [
+        { id: 'queued-1', text: 'first', createdAt: 1 },
+        { id: 'queued-2', text: 'second', createdAt: 2 },
+      ],
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 121, method: 'webui/queue/remove', params: { id: 'queued-1', includeStatus: true } }));
+    expect(await nextRpcResponse(ws, 121)).toEqual({
+      type: 'rpc/result',
+      id: 121,
+      result: { queue: [{ id: 'queued-2', text: 'second', createdAt: 2 }], removed: true },
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 122, method: 'webui/queue/remove', params: { id: 'queued-missing', includeStatus: true } }));
+    expect(await nextRpcResponse(ws, 122)).toEqual({
+      type: 'rpc/result',
+      id: 122,
+      result: { queue: [{ id: 'queued-2', text: 'second', createdAt: 2 }], removed: false },
+    });
+  });
+
+  it('steers the next queued message after removing an option-blocked head item', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'turn/steer') return { turnId: 'turn-1' } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request);
+    const blocked = { id: 'queued-blocked', text: 'blocked', createdAt: 1, options: { model: 'other-model' } };
+    const steerable = { id: 'queued-steerable', text: 'steerable', createdAt: 2 };
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+      model: 'gpt-5.5',
+      queue: [blocked, steerable],
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 120, method: 'webui/queue/remove', params: { id: blocked.id } }));
+    expect(await nextRpcResponse(ws, 120)).toMatchObject({ type: 'rpc/result', id: 120, result: [steerable] });
+    await waitForRequestCalls(request, 2);
+
+    expect(request).toHaveBeenNthCalledWith(2, 'turn/steer', {
+      threadId: 'thread-1',
+      expectedTurnId: 'turn-1',
+      input: [{ type: 'text', text: 'steerable', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-1', queue: [] });
+  });
+
+  it('steers an enqueued message into the active turn without waiting for turn completion', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'turn/steer') return { turnId: 'turn-1' } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+    });
+
+    const enqueueResponse = nextRpcResponse(ws, 121);
+    ws.send(JSON.stringify({ type: 'rpc', id: 121, method: 'webui/queue/enqueue', params: { text: ' steer me ' } }));
+    expect(await enqueueResponse).toMatchObject({
+      type: 'rpc/result',
+      id: 121,
+      result: [{ text: 'steer me' }],
+    });
+    await waitForRequestCalls(request, 2);
+
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', {
+      threadId: 'thread-1',
+      path: '/sessions/thread-1.jsonl',
+      experimentalRawEvents: true,
+      persistExtendedHistory: true,
+      excludeTurns: true,
+    }, 120000);
+    expect(request).toHaveBeenNthCalledWith(2, 'turn/steer', {
+      threadId: 'thread-1',
+      expectedTurnId: 'turn-1',
+      input: [{ type: 'text', text: 'steer me', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-1', queue: [] });
+  });
+
+  it('waits for the real turn id before steering a queued message from a pending turn start', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'turn/steer') return { turnId: 'turn-1' } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-start-pending:thread-1',
+      activeCwd: '/work/project',
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 122, method: 'webui/queue/enqueue', params: { text: 'after start' } }));
+    expect(await nextRpcResponse(ws, 122)).toMatchObject({ type: 'rpc/result', id: 122 });
+    await flushPromises();
+    expect(request).not.toHaveBeenCalled();
+    expect(stateStore.read().queue).toMatchObject([{ text: 'after start' }]);
+
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-1' });
+    await waitForRequestCalls(request, 2);
+
+    expect(request).toHaveBeenNthCalledWith(2, 'turn/steer', {
+      threadId: 'thread-1',
+      expectedTurnId: 'turn-1',
+      input: [{ type: 'text', text: 'after start', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-1', queue: [] });
+  });
+
+  it('drains multiple queued messages into the active turn in FIFO order', async () => {
+    const firstSteer = deferred<unknown>();
+    let steerCount = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string, params?: unknown) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T);
+      if (method === 'turn/steer') {
+        steerCount += 1;
+        return steerCount === 1 ? (firstSteer.promise as Promise<T>) : Promise.resolve({ turnId: 'turn-1', params } as T);
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 125, method: 'webui/queue/enqueue', params: { text: 'first' } }));
+    expect(await nextRpcResponse(ws, 125)).toMatchObject({ type: 'rpc/result', id: 125 });
+    await waitForRequestCalls(request, 2);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 126, method: 'webui/queue/enqueue', params: { text: 'second' } }));
+    expect(await nextRpcResponse(ws, 126)).toMatchObject({ type: 'rpc/result', id: 126 });
+    await flushPromises();
+    expect(request).toHaveBeenCalledTimes(2);
+
+    firstSteer.resolve({ turnId: 'turn-1' });
+    await waitForRequestCalls(request, 3);
+
+    expect(request).toHaveBeenNthCalledWith(2, 'turn/steer', {
+      threadId: 'thread-1',
+      expectedTurnId: 'turn-1',
+      input: [{ type: 'text', text: 'first', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(request).toHaveBeenNthCalledWith(3, 'turn/steer', {
+      threadId: 'thread-1',
+      expectedTurnId: 'turn-1',
+      input: [{ type: 'text', text: 'second', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeTurnId: 'turn-1', queue: [] });
+  });
+
+  it('leaves option-changing queued messages for a new turn', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'turn/start') return { turn: { id: 'turn-2' } } as T;
+      if (method === 'turn/steer') throw new Error('option-changing messages must not be steered');
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+      model: 'gpt-5.5',
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 127,
+        method: 'webui/queue/enqueue',
+        params: { text: 'use another model', options: { model: 'gpt-5.4' } },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 127)).toMatchObject({ type: 'rpc/result', id: 127 });
+    await flushPromises();
+    expect(request).not.toHaveBeenCalled();
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-1' });
+    await waitForRequestCalls(request, 2);
+
+    expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'use another model', text_elements: [] }],
+      model: 'gpt-5.4',
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeTurnId: 'turn-2', queue: [] });
+  });
+
+  it('steers queued messages whose run options already match the active turn', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'turn/steer') return { turnId: 'turn-1' } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+      model: 'gpt-5.5',
+      effort: 'high',
+      sandbox: 'workspace-write',
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 128,
+        method: 'webui/queue/enqueue',
+        params: { text: 'same options', options: { model: 'gpt-5.5', effort: 'high', sandbox: 'workspace-write' } },
+      }),
+    );
+    expect(await nextRpcResponse(ws, 128)).toMatchObject({ type: 'rpc/result', id: 128 });
+    await waitForRequestCalls(request, 2);
+
+    expect(request).toHaveBeenNthCalledWith(2, 'turn/steer', {
+      threadId: 'thread-1',
+      expectedTurnId: 'turn-1',
+      input: [{ type: 'text', text: 'same options', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeTurnId: 'turn-1', queue: [] });
+  });
+
+  it('restores a queued steer failure and starts it after the active turn completes', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'turn/steer') throw new Error('active turn is not steerable');
+      if (method === 'turn/start') return { turn: { id: 'turn-2' } } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 123, method: 'webui/queue/enqueue', params: { text: 'fallback' } }));
+    expect(await nextRpcResponse(ws, 123)).toMatchObject({ type: 'rpc/result', id: 123 });
+    await waitForRequestCalls(request, 2);
+    await flushPromises();
+    expect(stateStore.read()).toMatchObject({ activeTurnId: 'turn-1', queue: [{ text: 'fallback' }] });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-1' });
+    await waitForRequestCalls(request, 3);
+
+    expect(request).toHaveBeenNthCalledWith(3, 'turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'fallback', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-2', queue: [] });
+  });
+
+  it('does not start another queued turn when the active turn completes while a queued steer is in flight', async () => {
+    let resolveSteer: (value: unknown) => void = () => undefined;
+    const steerPromise = new Promise<unknown>((resolve) => {
+      resolveSteer = resolve;
+    });
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T);
+      if (method === 'turn/steer') return steerPromise as Promise<T>;
+      if (method === 'turn/start') throw new Error('queued turn must not auto-start while steer is in flight');
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 124, method: 'webui/queue/enqueue', params: { text: 'in flight' } }));
+    expect(await nextRpcResponse(ws, 124)).toMatchObject({ type: 'rpc/result', id: 124 });
+    await waitForRequestCalls(request, 2);
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-1' });
+    await waitForActiveTurnCleared(stateStore);
+    resolveSteer({ turnId: 'turn-1' });
+    await flushPromises();
+
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'turn/steer']);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [] });
+  });
+
+  it('starts remaining queued messages after an in-flight steer succeeds following completion', async () => {
+    const firstSteer = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T);
+      if (method === 'turn/steer') return firstSteer.promise as Promise<T>;
+      if (method === 'turn/start') return Promise.resolve({ turn: { id: 'turn-2' } } as T);
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 129, method: 'webui/queue/enqueue', params: { text: 'first' } }));
+    expect(await nextRpcResponse(ws, 129)).toMatchObject({ type: 'rpc/result', id: 129 });
+    await waitForRequestCalls(request, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 130, method: 'webui/queue/enqueue', params: { text: 'second' } }));
+    expect(await nextRpcResponse(ws, 130)).toMatchObject({ type: 'rpc/result', id: 130 });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-1' });
+    await waitForActiveTurnCleared(stateStore);
+    firstSteer.resolve({ turnId: 'turn-1' });
+    await waitForRequestCalls(request, 3);
+
+    expect(request).toHaveBeenNthCalledWith(3, 'turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'second', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-2', queue: [] });
+  });
+
+  it('restores an in-flight steer after interruption without auto-starting it', async () => {
+    const steer = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T);
+      if (method === 'turn/steer') return steer.promise as Promise<T>;
+      if (method === 'turn/start') throw new Error('interrupted steer must not auto-start');
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 137, method: 'webui/queue/enqueue', params: { text: 'keep queued' } }));
+    expect(await nextRpcResponse(ws, 137)).toMatchObject({ type: 'rpc/result', id: 137 });
+    await waitForRequestCalls(request, 2);
+
+    notify('turn/interrupted', { threadId: 'thread-1', turnId: 'turn-1' });
+    await waitForActiveTurnCleared(stateStore);
+    steer.reject(new Error('turn was interrupted'));
+    await flushPromises();
+
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'turn/steer']);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [{ text: 'keep queued' }] });
+  });
+
+  it('restores a timed-out in-flight steer after completion without auto-starting an ambiguous duplicate', async () => {
+    const steer = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T);
+      if (method === 'turn/steer') return steer.promise as Promise<T>;
+      if (method === 'turn/start') throw new Error('timed-out steer must not auto-start');
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 138, method: 'webui/queue/enqueue', params: { text: 'maybe sent' } }));
+    expect(await nextRpcResponse(ws, 138)).toMatchObject({ type: 'rpc/result', id: 138 });
+    await waitForRequestCalls(request, 2);
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-1' });
+    await waitForActiveTurnCleared(stateStore);
+    steer.reject(new Error('JSON-RPC request timed out: turn/steer'));
+    await flushPromises();
+
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'turn/steer']);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [{ text: 'maybe sent' }] });
+  });
+
+  it('does not drain later queued messages into a turn whose completion is still finalizing', async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const threadPath = join(sessionDir, 'rollout-2026-05-05T00-00-00-thread-steer-race.jsonl');
+    const filePath = join(root, 'steer-race.txt');
+    writeFileSync(threadPath, '');
+    writeFileSync(filePath, 'after\n');
+    const store = new FileEditStore(sessionFileEditDbPath(threadPath));
+    store.recordSnapshot({ turnId: 'turn-1', itemId: 'edit-1', path: filePath, before: 'before\n' });
+    store.close();
+
+    const statGate = deferred<ReturnType<typeof statSync>>();
+    const originalStat = fs.stat.bind(fs);
+    const statSpy = vi.spyOn(fs, 'stat').mockImplementation(((target: unknown, ...args: unknown[]) => {
+      if (String(target) === filePath) return statGate.promise;
+      return (originalStat as (...innerArgs: unknown[]) => Promise<unknown>)(target, ...args);
+    }) as never);
+    cleanups.push(() => statSpy.mockRestore());
+
+    const firstSteer = deferred<unknown>();
+    let steerCount = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: root, path: threadPath } } as T);
+      if (method === 'turn/steer') {
+        steerCount += 1;
+        return steerCount === 1 ? (firstSteer.promise as Promise<T>) : Promise.reject(new Error('second message must not steer into completed turn'));
+      }
+      if (method === 'turn/start') return Promise.resolve({ turn: { id: 'turn-2' } } as T);
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: threadPath,
+      activeTurnId: 'turn-1',
+      activeCwd: root,
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 141, method: 'webui/queue/enqueue', params: { text: 'first' } }));
+    expect(await nextRpcResponse(ws, 141)).toMatchObject({ type: 'rpc/result', id: 141 });
+    await waitForRequestCalls(request, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 142, method: 'webui/queue/enqueue', params: { text: 'second' } }));
+    expect(await nextRpcResponse(ws, 142)).toMatchObject({ type: 'rpc/result', id: 142 });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-1' });
+    for (let attempt = 0; attempt < 20 && statSpy.mock.calls.length === 0; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    expect(statSpy).toHaveBeenCalled();
+
+    firstSteer.resolve({ turnId: 'turn-1' });
+    await flushPromises();
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'turn/steer']);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-1', queue: [{ text: 'second' }] });
+
+    statGate.resolve(statSync(filePath));
+    await waitForRequestCalls(request, 3);
+    expect(request).toHaveBeenNthCalledWith(3, 'turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'second', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-2', queue: [] });
+  });
+
+  it('does not steer newly queued input into a turn whose completion is still finalizing', async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const threadPath = join(sessionDir, 'rollout-2026-05-05T00-00-00-thread-enqueue-race.jsonl');
+    const filePath = join(root, 'enqueue-race.txt');
+    writeFileSync(threadPath, '');
+    writeFileSync(filePath, 'after\n');
+    const store = new FileEditStore(sessionFileEditDbPath(threadPath));
+    store.recordSnapshot({ turnId: 'turn-1', itemId: 'edit-1', path: filePath, before: 'before\n' });
+    store.close();
+
+    const statGate = deferred<ReturnType<typeof statSync>>();
+    const originalStat = fs.stat.bind(fs);
+    const statSpy = vi.spyOn(fs, 'stat').mockImplementation(((target: unknown, ...args: unknown[]) => {
+      if (String(target) === filePath) return statGate.promise;
+      return (originalStat as (...innerArgs: unknown[]) => Promise<unknown>)(target, ...args);
+    }) as never);
+    cleanups.push(() => statSpy.mockRestore());
+
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: root, path: threadPath } } as T);
+      if (method === 'turn/start') return Promise.resolve({ turn: { id: 'turn-2' } } as T);
+      if (method === 'turn/steer') return Promise.reject(new Error('must not steer into completed turn'));
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: threadPath,
+      activeTurnId: 'turn-1',
+      activeCwd: root,
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-1' });
+    for (let attempt = 0; attempt < 20 && statSpy.mock.calls.length === 0; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    expect(statSpy).toHaveBeenCalled();
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 144, method: 'webui/queue/enqueue', params: { text: 'after terminal' } }));
+    expect(await nextRpcResponse(ws, 144)).toMatchObject({ type: 'rpc/result', id: 144, result: [{ text: 'after terminal' }] });
+    await flushPromises();
+    expect(request).not.toHaveBeenCalled();
+
+    statGate.resolve(statSync(filePath));
+    await waitForRequestCalls(request, 2);
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'turn/start']);
+    expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'after terminal', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-2', queue: [] });
+  });
+
+  it('does not send a queued steer if the active turn completes while resume is pending', async () => {
+    const resume = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return resume.promise as Promise<T>;
+      if (method === 'turn/start') return Promise.resolve({ turn: { id: 'turn-2' } } as T);
+      if (method === 'turn/steer') return Promise.reject(new Error('must not steer after completion'));
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 146, method: 'webui/queue/enqueue', params: { text: 'pending resume' } }));
+    expect(await nextRpcResponse(ws, 146)).toMatchObject({ type: 'rpc/result', id: 146 });
+    await waitForRequestCalls(request, 1);
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-1' });
+    await waitForActiveTurnCleared(stateStore);
+    resume.resolve({ thread: { id: 'thread-1', cwd: '/work/project' } });
+    await waitForRequestCalls(request, 2);
+
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'turn/start']);
+    expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'pending resume', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-2', queue: [] });
+  });
+
+  it('defers a failed queued steer until its original session is active again', async () => {
+    const steer = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: '/work/project' } } as T);
+      if (method === 'turn/steer') return steer.promise as Promise<T>;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 143, method: 'webui/queue/enqueue', params: { text: 'thread one only' } }));
+    expect(await nextRpcResponse(ws, 143)).toMatchObject({ type: 'rpc/result', id: 143 });
+    await waitForRequestCalls(request, 2);
+
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-2', activeTurnId: 'turn-2', queue: [] });
+    steer.reject(new Error('steer failed after session switch'));
+    await flushPromises();
+
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-2', activeTurnId: 'turn-2', queue: [] });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 145, method: 'webui/session/resume', params: { threadId: 'thread-1' } }));
+    expect(await nextRpcResponse(ws, 145)).toMatchObject({ type: 'rpc/result', id: 145 });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [{ text: 'thread one only' }] });
+  });
+
   it('does not write a direct started turn id into a different active session', async () => {
     let resolveStart: (value: unknown) => void = () => undefined;
     const startPromise = new Promise<unknown>((resolve) => {
@@ -3356,6 +3954,74 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     resolveStart({ turn: { id: 'turn-1' } });
     expect(await nextRpcResponse(ws, 132)).toEqual({ type: 'rpc/result', id: 132, result: { turn: { id: 'turn-1' } } });
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-1' });
+  });
+
+  it('steers queued input after a direct turn/start response installs the real turn id', async () => {
+    const start = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: '/work/project' } } as T);
+      if (method === 'turn/start') return start.promise as Promise<T>;
+      if (method === 'turn/steer') return Promise.resolve({ turnId: 'turn-1' } as T);
+      return Promise.reject(new Error(`unexpected method ${method}`));
+    });
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: null, activeCwd: '/work/project' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 139, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'hello' } }));
+    await waitForRequestCalls(request, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 140, method: 'webui/queue/enqueue', params: { text: 'queued while pending' } }));
+    expect(await nextRpcResponse(ws, 140)).toMatchObject({ type: 'rpc/result', id: 140 });
+    await flushPromises();
+    expect(request).toHaveBeenCalledTimes(2);
+
+    start.resolve({ turn: { id: 'turn-1' } });
+    expect(await nextRpcResponse(ws, 139)).toEqual({ type: 'rpc/result', id: 139, result: { turn: { id: 'turn-1' } } });
+    await waitForRequestCalls(request, 3);
+
+    expect(request).toHaveBeenNthCalledWith(3, 'turn/steer', {
+      threadId: 'thread-1',
+      expectedTurnId: 'turn-1',
+      input: [{ type: 'text', text: 'queued while pending', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-1', queue: [] });
+  });
+
+  it('starts queued input when a direct turn completes before turn/start returns', async () => {
+    const start = deferred<unknown>();
+    let startCount = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: '/work/project' } } as T);
+      if (method === 'turn/start') {
+        startCount += 1;
+        return startCount === 1 ? (start.promise as Promise<T>) : Promise.resolve({ turn: { id: 'turn-2' } } as T);
+      }
+      if (method === 'turn/steer') return Promise.reject(new Error('completed direct turn must not be steered'));
+      return Promise.reject(new Error(`unexpected method ${method}`));
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: null, activeCwd: '/work/project' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 148, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'hello' } }));
+    await waitForRequestCalls(request, 2);
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-1' });
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-1' });
+    await waitForActiveTurnCleared(stateStore);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 149, method: 'webui/queue/enqueue', params: { text: 'queued after completion' } }));
+    expect(await nextRpcResponse(ws, 149)).toMatchObject({ type: 'rpc/result', id: 149 });
+    await flushPromises();
+    expect(request).toHaveBeenCalledTimes(2);
+
+    start.resolve({ turn: { id: 'turn-1' } });
+    expect(await nextRpcResponse(ws, 148)).toEqual({ type: 'rpc/result', id: 148, result: { turn: { id: 'turn-1' } } });
+    await waitForRequestCalls(request, 3);
+
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'turn/start', 'turn/start']);
+    expect(request).toHaveBeenNthCalledWith(3, 'turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'queued after completion', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-2', queue: [] });
   });
 
   it('keeps direct turn starts pending when app-server turn/start times out after send', async () => {
@@ -3716,6 +4382,51 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [secondQueued] });
   });
 
+  it('starts the next queued prompt after an early-completed queued turn start returns', async () => {
+    let resolveStart: (value: unknown) => void = () => undefined;
+    const startPromise = new Promise<unknown>((resolve) => {
+      resolveStart = resolve;
+    });
+    let startCount = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({} as T);
+      if (method === 'turn/start') {
+        startCount += 1;
+        return startCount === 1 ? (startPromise as Promise<T>) : Promise.resolve({ turn: { id: 'turn-after-early' } } as T);
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const secondQueued = { id: 'queued-2', text: 'second', createdAt: 2 };
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-old',
+      queue: [
+        { id: 'queued-1', text: 'first', createdAt: 1 },
+        secondQueued,
+      ],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    await waitForRequestCalls(request, 2);
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-next' });
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-next' });
+    await flushPromises();
+
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [secondQueued] });
+
+    resolveStart({ turn: { id: 'turn-next' } });
+    await waitForRequestCalls(request, 3);
+
+    expect(request).toHaveBeenNthCalledWith(3, 'turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'second', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-after-early', queue: [] });
+  });
+
   it('treats Codex task_complete event messages as turn completion', async () => {
     const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ turn: { id: 'turn-next' } });
     const { stateStore, notify } = await makeHarness(request);
@@ -3802,14 +4513,17 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-next', queue: [] });
   });
 
-  it('does not claim a second queued message while a queued start is in flight', async () => {
+  it('does not claim a second queued message until a queued start has a real turn id', async () => {
     let resolveStart: (value: unknown) => void = () => undefined;
     const startPromise = new Promise<unknown>((resolve) => {
       resolveStart = resolve;
     });
-    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) =>
-      method === 'thread/resume' ? Promise.resolve({} as T) : (startPromise as Promise<T>),
-    );
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({} as T);
+      if (method === 'turn/start') return startPromise as Promise<T>;
+      if (method === 'turn/steer') return Promise.resolve({ turnId: 'turn-next' } as T);
+      throw new Error(`unexpected method: ${method}`);
+    });
     const { stateStore, notify } = await makeHarness(request);
     const secondQueued = { id: 'queued-2', text: 'second', createdAt: 2 };
     stateStore.write({
@@ -3836,8 +4550,13 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     expect(stateStore.read()).toMatchObject({ activeTurnId: 'turn-start-pending:thread-1', queue: [secondQueued] });
 
     resolveStart({ turn: { id: 'turn-next' } });
-    await flushPromises();
-    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-next', queue: [secondQueued] });
+    await waitForRequestCalls(request, 3);
+    expect(request).toHaveBeenNthCalledWith(3, 'turn/steer', {
+      threadId: 'thread-1',
+      expectedTurnId: 'turn-next',
+      input: [{ type: 'text', text: 'second', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-next', queue: [] });
   });
 
   it('restores a claimed queued message when queued turn start fails', async () => {

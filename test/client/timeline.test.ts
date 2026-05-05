@@ -1631,6 +1631,90 @@ describe('timeline', () => {
     ]);
   });
 
+  it('skips ignored removed heads before claiming one sent prompt on an active-turn transition', () => {
+    const claimed = claimedQueuedUserItemsFromQueueTransition(
+      [
+        { id: 'queued-1', text: 'edited locally', createdAt: 1000 },
+        { id: 'queued-2', text: 'started next turn', createdAt: 1001 },
+      ],
+      [],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-2' },
+      () => 10,
+      { ignoredRemovedMessageIds: new Set(['queued-1']) },
+    );
+
+    expect(claimed).toEqual([
+      { id: 'claimed-queued:user:queued-2', kind: 'user', timestamp: 1001, sortOrder: 10, text: 'started next turn' },
+    ]);
+  });
+
+  it('claims a removed queued head while the active turn stays the same for turn steering', () => {
+    const claimed = claimedQueuedUserItemsFromQueueTransition(
+      [
+        { id: 'queued-1', text: 'steered', createdAt: 1000 },
+        { id: 'queued-2', text: 'still queued', createdAt: 1001 },
+      ],
+      [{ id: 'queued-2', text: 'still queued', createdAt: 1001 }],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      () => 10,
+    );
+
+    expect(claimed).toEqual([
+      { id: 'claimed-queued:user:queued-1', kind: 'user', timestamp: 1000, sortOrder: 10, text: 'steered' },
+    ]);
+  });
+
+  it('claims multiple removed queued heads while the active turn stays the same for turn steering', () => {
+    const claimed = claimedQueuedUserItemsFromQueueTransition(
+      [
+        { id: 'queued-1', text: 'first steered', createdAt: 1000 },
+        { id: 'queued-2', text: 'second steered', createdAt: 1001 },
+        { id: 'queued-3', text: 'still queued', createdAt: 1002 },
+      ],
+      [{ id: 'queued-3', text: 'still queued', createdAt: 1002 }],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      (id) => id.length,
+    );
+
+    expect(claimed).toEqual([
+      {
+        id: 'claimed-queued:user:queued-1',
+        kind: 'user',
+        timestamp: 1000,
+        sortOrder: 'claimed-queued:user:queued-1'.length,
+        text: 'first steered',
+      },
+      {
+        id: 'claimed-queued:user:queued-2',
+        kind: 'user',
+        timestamp: 1001,
+        sortOrder: 'claimed-queued:user:queued-2'.length,
+        text: 'second steered',
+      },
+    ]);
+  });
+
+  it('does not claim edited or canceled queued heads while claiming later steered heads', () => {
+    const claimed = claimedQueuedUserItemsFromQueueTransition(
+      [
+        { id: 'queued-1', text: 'edited locally', createdAt: 1000 },
+        { id: 'queued-2', text: 'sent by steer', createdAt: 1001 },
+      ],
+      [],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      () => 10,
+      { ignoredRemovedMessageIds: new Set(['queued-1']) },
+    );
+
+    expect(claimed).toEqual([
+      { id: 'claimed-queued:user:queued-2', kind: 'user', timestamp: 1001, sortOrder: 10, text: 'sent by steer' },
+    ]);
+  });
+
   it('does not claim removed queued prompts after the queue head remains visible', () => {
     expect(
       claimedQueuedUserItemsFromQueueTransition(
@@ -1670,6 +1754,7 @@ describe('timeline', () => {
         { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
         { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
         () => 10,
+        { ignoredRemovedMessageIds: new Set(['queued-1']) },
       ),
     ).toEqual([]);
   });
