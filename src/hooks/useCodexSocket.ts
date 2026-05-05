@@ -45,6 +45,8 @@ type ServerMessage =
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 const MAX_RETAINED_NOTIFICATIONS = 5000;
 const NOTIFICATION_FLUSH_DELAY_MS = 125;
+const TRANSIENT_AUTH_REJECTION_RETRIES = 3;
+const AUTH_CHECK_TIMEOUT_MS = 10_000;
 
 interface PendingRpc {
   resolve: (v: unknown) => void;
@@ -52,9 +54,11 @@ interface PendingRpc {
   timer: number;
 }
 
-function getWebSocketUrl() {
+function getWebSocketUrl(token: string | null = null) {
   const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-  return `${protocol}://${window.location.host}/ws`;
+  const url = new URL(`${protocol}://${window.location.host}/ws`);
+  if (token) url.searchParams.set('token', token);
+  return url.toString();
 }
 
 function stripTokenFromUrl() {
@@ -64,6 +68,25 @@ function stripTokenFromUrl() {
   url.searchParams.delete('token');
   const search = url.searchParams.toString();
   window.history.replaceState(null, '', `${url.pathname}${search ? `?${search}` : ''}${url.hash}`);
+}
+
+function tokenFromUrl(): string | null {
+  const value = new URL(window.location.href).searchParams.get('token');
+  return value && value.trim() ? value : null;
+}
+
+async function fetchAuth(path: string): Promise<Response> {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), AUTH_CHECK_TIMEOUT_MS);
+  try {
+    return await fetch(path, { credentials: 'same-origin', signal: controller.signal });
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError';
 }
 
 function parseServerMessage(data: string): ServerMessage | null {
@@ -198,6 +221,9 @@ export function useCodexSocket() {
   const connectionStateRef = useRef<ConnectionState>('connecting');
   const reconnectTimerRef = useRef<number | null>(null);
   const hasConnectedRef = useRef(false);
+  const authRejectionCountRef = useRef(0);
+  const authTokenRef = useRef<string | null>(tokenFromUrl());
+  const forceWebSocketTokenRef = useRef(false);
   const storedReplayStateRef = useRef<StoredNotificationReplayState>(readStoredNotificationReplayState());
   const seenServerNotificationSeqsRef = useRef<Set<string>>(new Set());
   const nextNotificationOrderRef = useRef(0);
@@ -291,9 +317,18 @@ export function useCodexSocket() {
       const trimmed = token.trim();
       if (!trimmed) throw new Error('Token is required');
 
-      const response = await fetch(`/api/auth?token=${encodeURIComponent(trimmed)}`, { credentials: 'same-origin' });
+      let response: Response;
+      try {
+        response = await fetchAuth(`/api/auth?token=${encodeURIComponent(trimmed)}`);
+      } catch (error) {
+        if (isAbortError(error)) throw new Error('Authentication request timed out');
+        throw error;
+      }
       if (!response.ok) throw new Error('Invalid token');
 
+      authTokenRef.current = trimmed;
+      forceWebSocketTokenRef.current = true;
+      authRejectionCountRef.current = 0;
       stripTokenFromUrl();
       setTrackedConnectionState('connecting');
       setAuthRetryEpoch((value) => value + 1);
@@ -321,14 +356,43 @@ export function useCodexSocket() {
       retry = Math.min(5_000, retry * 1.6);
     };
 
+    const handleAuthRejected = (options: { schedule: boolean }) => {
+      authRejectionCountRef.current += 1;
+      if (hasConnectedRef.current && authRejectionCountRef.current <= TRANSIENT_AUTH_REJECTION_RETRIES) {
+        setTrackedConnectionState('disconnected');
+        if (options.schedule) scheduleReconnect();
+        return false;
+      }
+
+      authTokenRef.current = null;
+      forceWebSocketTokenRef.current = false;
+      setTrackedConnectionState('auth-error');
+      rejectPending(new Error('authentication failed'));
+      return true;
+    };
+
     const connect = async () => {
       if (stopped) return;
 
       setTrackedConnectionState('connecting');
 
+      const urlToken = tokenFromUrl();
+      if (urlToken) authTokenRef.current = urlToken;
+      let authUsedToken = Boolean(urlToken);
       let auth: Response;
       try {
-        auth = await fetch(`/api/auth${window.location.search}`, { credentials: 'same-origin' });
+        auth = await fetchAuth(`/api/auth${window.location.search}`);
+        if (!auth.ok && !urlToken) {
+          const rememberedToken = authTokenRef.current;
+          if (rememberedToken) {
+            auth = await fetchAuth(`/api/auth?token=${encodeURIComponent(rememberedToken)}`);
+            authUsedToken = true;
+            if (!auth.ok) {
+              authTokenRef.current = null;
+              forceWebSocketTokenRef.current = false;
+            }
+          }
+        }
       } catch {
         if (stopped) return;
         setTrackedConnectionState('disconnected');
@@ -339,14 +403,16 @@ export function useCodexSocket() {
       if (stopped || connectionStateRef.current === 'auth-error') return;
 
       if (!auth.ok) {
-        setTrackedConnectionState('auth-error');
-        rejectPending(new Error('authentication failed'));
+        handleAuthRejected({ schedule: true });
         return;
       }
 
+      if (urlToken) authTokenRef.current = urlToken;
+      authRejectionCountRef.current = 0;
+      const websocketToken = authUsedToken || forceWebSocketTokenRef.current ? authTokenRef.current : null;
       stripTokenFromUrl();
 
-      const ws = new WebSocket(getWebSocketUrl());
+      const ws = new WebSocket(getWebSocketUrl(websocketToken));
       wsRef.current = ws;
 
       ws.onopen = () => {
@@ -376,13 +442,16 @@ export function useCodexSocket() {
         if (!message) return;
 
         if (message.type === 'server/hello') {
+          forceWebSocketTokenRef.current = false;
+          authRejectionCountRef.current = 0;
           rememberNotificationStream(message.notificationStreamId);
           setHello(message);
           setRequests(message.requests ?? []);
         } else if (message.type === 'auth/error') {
-          setTrackedConnectionState('auth-error');
-          rejectPending(new Error('authentication failed'));
+          forceWebSocketTokenRef.current = Boolean(authTokenRef.current);
+          const terminal = handleAuthRejected({ schedule: false });
           ws.close();
+          if (terminal) return;
         } else if (message.type === 'codex/notification') {
           if (!rememberNotificationSeq(message.streamId, message.seq)) return;
           queueNotification(message.message, { streamId: message.streamId ?? null, seq: message.seq ?? null });

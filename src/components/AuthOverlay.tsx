@@ -40,7 +40,7 @@ export default function AuthOverlay({ visible, onSubmitToken }: AuthOverlayProps
     <div className="modal-overlay">
       <form className="auth-box" role="dialog" aria-modal="true" aria-labelledby={titleId} onSubmit={(event) => void submit(event)}>
         <h2 id={titleId}>Authentication Required</h2>
-        <p>The server token changed. Enter the access token printed by the server.</p>
+        <p>Enter the access token printed by the server.</p>
         <label className="field-label auth-token-field">
           Access token
           <input

@@ -48,6 +48,8 @@ describe('AuthOverlay', () => {
     expect(dialog?.getAttribute('aria-labelledby')).toBe(heading?.id);
     expect(heading?.id).toBeTruthy();
     expect(heading?.textContent).toBe('Authentication Required');
+    expect(document.body.textContent).toContain('Enter the access token printed by the server.');
+    expect(document.body.textContent).not.toContain('server token changed');
     expect(document.querySelector('input')?.getAttribute('placeholder')).toBe('Paste access token');
   });
 

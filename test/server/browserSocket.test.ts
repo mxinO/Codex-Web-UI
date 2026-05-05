@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import WebSocket, { type RawData } from 'ws';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { attachBrowserSocket } from '../../server/browserSocket.js';
+import { authCookie } from '../../server/auth.js';
 import { HostStateStore } from '../../server/hostState.js';
 import { FileEditStore, sessionFileEditDbPath } from '../../server/fileEditStore.js';
 import type { CodexAppServer } from '../../server/appServer.js';
@@ -42,7 +43,17 @@ function makeConfig(): ServerConfig {
 type TestRequest = (method: string, params?: unknown, timeoutMs?: number) => Promise<unknown>;
 const TURN_START_RPC_TIMEOUT_MS = 10 * 60 * 1000;
 
-async function makeHarness(request: TestRequest, options: { startCwd?: string; initialState?: Partial<HostRuntimeState> } = {}) {
+async function makeHarness(
+  request: TestRequest,
+  options: {
+    startCwd?: string;
+    initialState?: Partial<HostRuntimeState>;
+    config?: Partial<ServerConfig>;
+    token?: string;
+    authCookieScope?: string;
+    headers?: Record<string, string>;
+  } = {},
+) {
   const server = http.createServer();
   const stateDir = mkdtempSync(join(tmpdir(), 'codex-webui-browser-socket-'));
   const stateStore = new HostStateStore(stateDir, 'test-host');
@@ -73,7 +84,15 @@ async function makeHarness(request: TestRequest, options: { startCwd?: string; i
       return () => undefined;
     }),
   } as unknown as CodexAppServer;
-  const cleanup = attachBrowserSocket(server, { config: makeConfig(), codex, stateStore, token: 'token', startCwd: options.startCwd });
+  const config = { ...makeConfig(), ...options.config };
+  const cleanup = attachBrowserSocket(server, {
+    config,
+    codex,
+    stateStore,
+    token: options.token ?? 'token',
+    authCookieScope: options.authCookieScope,
+    startCwd: options.startCwd,
+  });
 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
   cleanups.push(() => {
@@ -83,7 +102,7 @@ async function makeHarness(request: TestRequest, options: { startCwd?: string; i
   });
 
   const { port } = server.address() as AddressInfo;
-  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+  const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`, options.headers ? { headers: options.headers } : undefined);
   const hello = nextMessage(ws);
   await new Promise<void>((resolve) => ws.once('open', resolve));
   cleanups.push(() => ws.close());
@@ -169,6 +188,36 @@ async function waitForActiveTurnCleared(stateStore: HostStateStore): Promise<voi
 
 afterEach(() => {
   for (const cleanup of cleanups.splice(0)) cleanup();
+});
+
+describe('attachBrowserSocket auth', () => {
+  it('accepts a browser socket authenticated by the scoped current cookie', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ data: [] });
+    const scope = 'test-host:3002';
+    const { initialHello } = await makeHarness(request, {
+      config: { noAuth: false },
+      token: 'current-token',
+      authCookieScope: scope,
+      headers: { Cookie: authCookie('current-token', scope).split(';')[0] },
+    });
+
+    expect(initialHello.type).toBe('server/hello');
+  });
+
+  it('accepts a browser socket authenticated by the request host scoped cookie', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ data: [] });
+    const scope = 'browser.test:3002';
+    const { initialHello } = await makeHarness(request, {
+      config: { noAuth: false },
+      token: 'current-token',
+      headers: {
+        Host: scope,
+        Cookie: authCookie('current-token', scope).split(';')[0],
+      },
+    });
+
+    expect(initialHello.type).toBe('server/hello');
+  });
 });
 
 describe('attachBrowserSocket session RPCs', () => {

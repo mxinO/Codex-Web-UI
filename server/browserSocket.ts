@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import type http from 'node:http';
 import nodePath from 'node:path';
 import { WebSocket, WebSocketServer } from 'ws';
-import { isTokenValid, parseTokenFromCookie } from './auth.js';
+import { authScopeFromHostHeader, isTokenAuthorized, parseTokenFromCookieScopes } from './auth.js';
 import type { CodexAppServer } from './appServer.js';
 import { isInteractiveCommandBlocked, runBangCommand } from './bangCommand.js';
 import type { ServerConfig } from './config.js';
@@ -21,6 +21,7 @@ interface BrowserSocketDeps {
   codex: CodexAppServer;
   stateStore: HostStateStore;
   token: string;
+  authCookieScope?: string;
   startCwd?: string;
 }
 
@@ -62,9 +63,24 @@ function parseBrowserRequest(raw: Buffer | ArrayBuffer | Buffer[]): BrowserReque
   }
 }
 
-function authorized(deps: BrowserSocketDeps, queryToken: string | null, cookieHeader: string | undefined): boolean {
+function authScopesForRequest(hostHeader: string | undefined, fallbackScope?: string): string[] {
+  const requestScope = authScopeFromHostHeader(hostHeader, fallbackScope) ?? fallbackScope;
+  if (!requestScope) return [];
+  if (!fallbackScope || requestScope === fallbackScope) return [requestScope];
+  return [requestScope, fallbackScope];
+}
+
+function authorized(
+  deps: BrowserSocketDeps,
+  queryToken: string | null,
+  cookieHeader: string | undefined,
+  hostHeader: string | undefined,
+): boolean {
   if (deps.config.noAuth) return true;
-  return isTokenValid(deps.token, queryToken) || isTokenValid(deps.token, parseTokenFromCookie(cookieHeader));
+  return (
+    isTokenAuthorized(deps.token, [], queryToken) ||
+    isTokenAuthorized(deps.token, [], parseTokenFromCookieScopes(cookieHeader, authScopesForRequest(hostHeader, deps.authCookieScope)))
+  );
 }
 
 function closeClient(ws: WebSocket): void {
@@ -2133,7 +2149,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     });
 
     const url = new URL(req.url ?? '/ws', 'http://localhost');
-    if (!authorized(deps, url.searchParams.get('token'), req.headers.cookie)) {
+    if (!authorized(deps, url.searchParams.get('token'), req.headers.cookie, req.headers.host)) {
       send(ws, { type: 'auth/error' });
       ws.close(1008, 'unauthorized');
       return;

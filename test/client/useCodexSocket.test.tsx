@@ -70,6 +70,7 @@ beforeEach(() => {
   currentSocket = null;
   window.history.replaceState(null, '', '/app?token=secret&mode=test#pane');
   window.localStorage.clear();
+  window.sessionStorage.clear();
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{}', { status: 200 })));
   vi.stubGlobal('WebSocket', MockWebSocket);
 });
@@ -89,11 +90,12 @@ describe('useCodexSocket', () => {
   it('strips token after auth succeeds and rejects timed-out RPCs', async () => {
     await renderHook();
 
-    expect(fetch).toHaveBeenCalledWith('/api/auth?token=secret&mode=test', { credentials: 'same-origin' });
+    expect(fetch).toHaveBeenCalledWith('/api/auth?token=secret&mode=test', expect.objectContaining({ credentials: 'same-origin' }));
     expect(window.location.search).toBe('?mode=test');
     expect(window.location.hash).toBe('#pane');
 
     const ws = MockWebSocket.instances[0];
+    expect(ws.url).toBe(`ws://${window.location.host}/ws?token=secret`);
     act(() => {
       ws.open();
     });
@@ -129,15 +131,94 @@ describe('useCodexSocket', () => {
       await currentSocket?.submitToken('new-token');
     });
 
-    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/auth?token=new-token', { credentials: 'same-origin' });
-    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/auth', { credentials: 'same-origin' });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/auth?token=new-token', expect.objectContaining({ credentials: 'same-origin' }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/auth', expect.objectContaining({ credentials: 'same-origin' }));
     expect(MockWebSocket.instances).toHaveLength(1);
+    expect(MockWebSocket.instances[0].url).toBe(`ws://${window.location.host}/ws?token=new-token`);
 
     act(() => {
       MockWebSocket.instances[0].open();
     });
 
     expect(currentSocket?.connectionState).toBe('connected');
+  });
+
+  it('reuses the current tab token when the reconnect cookie auth check fails', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response('{}', { status: 200 }))
+      .mockResolvedValueOnce(new Response('{}', { status: 401 }))
+      .mockResolvedValueOnce(new Response('{}', { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await renderHook();
+    const first = MockWebSocket.instances[0];
+    act(() => {
+      first.open();
+      first.close();
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/auth?mode=test', expect.objectContaining({ credentials: 'same-origin' }));
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/auth?token=secret', expect.objectContaining({ credentials: 'same-origin' }));
+    expect(currentSocket?.connectionState).not.toBe('auth-error');
+    expect(MockWebSocket.instances).toHaveLength(2);
+    expect(MockWebSocket.instances[1].url).toBe(`ws://${window.location.host}/ws?token=secret`);
+  });
+
+  it('retries websocket auth with the current tab token after a cookie-only websocket rejection', async () => {
+    await renderHook();
+    const first = MockWebSocket.instances[0];
+    act(() => {
+      first.open();
+      first.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'server/hello',
+            hostname: 'host-a',
+            state: { activeThreadId: null, activeThreadPath: null, activeTurnId: null, activeCwd: null, theme: 'dark', queue: [] },
+          }),
+        }),
+      );
+      first.close();
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+    });
+    expect(MockWebSocket.instances[1].url).toBe(`ws://${window.location.host}/ws`);
+
+    act(() => {
+      MockWebSocket.instances[1].onmessage?.(new MessageEvent('message', { data: JSON.stringify({ type: 'auth/error' }) }));
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(400);
+    });
+
+    expect(currentSocket?.connectionState).not.toBe('auth-error');
+    expect(MockWebSocket.instances[2].url).toBe(`ws://${window.location.host}/ws?token=secret`);
+  });
+
+  it('treats an auth check timeout as a reconnectable connection problem', async () => {
+    const fetchMock = vi.fn((_url: string, init?: RequestInit) => {
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    window.history.replaceState(null, '', '/app');
+
+    await renderHook();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+
+    expect(currentSocket?.connectionState).toBe('disconnected');
+    expect(currentSocket?.connectionState).not.toBe('auth-error');
+    expect(MockWebSocket.instances).toHaveLength(0);
   });
 
   it('stores app-server requests from the browser socket', async () => {

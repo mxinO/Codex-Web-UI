@@ -4,7 +4,14 @@ import http from 'node:http';
 import type { AddressInfo } from 'node:net';
 import path from 'node:path';
 import { CodexAppServer } from './appServer.js';
-import { createAuthToken, authCookie, hashToken, isTokenValid, parseTokenFromCookie } from './auth.js';
+import {
+  createAuthToken,
+  authCookie,
+  authScopeFromHostHeader,
+  hashToken,
+  isTokenAuthorized,
+  parseTokenFromCookieScopes,
+} from './auth.js';
 import { attachBrowserSocket } from './browserSocket.js';
 import { readConfig } from './config.js';
 import { createFilePreviewHandler } from './filePreview.js';
@@ -34,6 +41,9 @@ const server = http.createServer(app);
 const stateStore = new HostStateStore(config.stateDir, config.hostname);
 const token = createAuthToken();
 const tokenHash = hashToken(token);
+const previousTokenHash = stateStore.read().authTokenHash;
+const acceptedTokenHashes = previousTokenHash && previousTokenHash !== tokenHash ? [previousTokenHash] : [];
+const fallbackAuthScope = `${config.hostname}:${config.port}`;
 
 stateStore.update((state) => ({ ...state, authTokenHash: tokenHash }));
 
@@ -50,11 +60,21 @@ stateStore.update((state) => ({
   appServerPid: codex.getPid(),
 }));
 
-function authorized(req: express.Request): boolean {
+function authScopesForRequest(req: express.Request): string[] {
+  const requestScope = authScopeFromHostHeader(req.headers.host, fallbackAuthScope) ?? fallbackAuthScope;
+  return requestScope === fallbackAuthScope ? [fallbackAuthScope] : [requestScope, fallbackAuthScope];
+}
+
+function primaryAuthScopeForRequest(req: express.Request): string {
+  return authScopesForRequest(req)[0];
+}
+
+function authorized(req: express.Request, options: { allowPreviousToken?: boolean } = {}): boolean {
   if (config.noAuth) return true;
   const queryToken = typeof req.query.token === 'string' ? req.query.token : null;
-  const cookieToken = parseTokenFromCookie(req.headers.cookie);
-  return isTokenValid(token, queryToken) || isTokenValid(token, cookieToken);
+  const cookieToken = parseTokenFromCookieScopes(req.headers.cookie, authScopesForRequest(req));
+  const acceptedHashes = options.allowPreviousToken ? acceptedTokenHashes : [];
+  return isTokenAuthorized(token, acceptedHashes, queryToken) || isTokenAuthorized(token, acceptedHashes, cookieToken);
 }
 
 function getQueryPath(req: express.Request): string | null {
@@ -101,8 +121,8 @@ app.post('/api/upload', express.raw({ type: 'application/octet-stream', limit: '
 app.use(express.json({ limit: '2mb' }));
 
 app.get('/api/auth', (req, res) => {
-  if (!authorized(req)) return res.status(401).json({ authenticated: false });
-  res.setHeader('Set-Cookie', authCookie(token));
+  if (!authorized(req, { allowPreviousToken: true })) return res.status(401).json({ authenticated: false });
+  res.setHeader('Set-Cookie', authCookie(token, primaryAuthScopeForRequest(req)));
   res.json({ authenticated: true, hostname: config.hostname });
 });
 
@@ -128,7 +148,7 @@ app.get('*', (_req, res) => {
   return res.sendFile(indexHtml);
 });
 
-const browserSockets = attachBrowserSocket(server, { config, codex, stateStore, token, startCwd });
+const browserSockets = attachBrowserSocket(server, { config, codex, stateStore, token, authCookieScope: fallbackAuthScope, startCwd });
 
 server.on('error', (err) => {
   logError('Browser server failed', err);
