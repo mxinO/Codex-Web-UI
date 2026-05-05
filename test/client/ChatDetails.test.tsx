@@ -58,6 +58,91 @@ describe('ChatItem details', () => {
     expect(document.querySelector('.markdown-body li')?.textContent).toBe('item');
   });
 
+  it('renders assistant LaTeX math delimiters with KaTeX', async () => {
+    const item: TimelineItem = {
+      id: 'a1',
+      kind: 'assistant',
+      timestamp: 1,
+      text: 'Inline \\(a^2+b^2=c^2\\).\n\n\\[\nE=mc^2\n\\]\n\nKeep `\\(literal\\)` as code.',
+      phase: null,
+    };
+
+    render(<ChatItem item={item} onOpenDetail={vi.fn()} onApprovalDecision={onApprovalDecision} />);
+
+    await act(async () => {
+      await import('../../src/components/MarkdownView');
+    });
+    await flushLazy();
+
+    expect(document.querySelectorAll('.markdown-body .katex').length).toBeGreaterThanOrEqual(2);
+    expect(document.querySelector('.markdown-body .katex-display')).toBeInstanceOf(HTMLElement);
+    expect(document.querySelector('.markdown-body code')?.textContent).toBe('\\(literal\\)');
+  });
+
+  it('keeps LaTeX-like delimiters literal in markdown destinations and fenced code', async () => {
+    const onOpenMentionedFile = vi.fn();
+    const item: TimelineItem = {
+      id: 'a1',
+      kind: 'assistant',
+      timestamp: 1,
+      text:
+        'See [guide](docs/foo\\(1\\).md), [reference][ref], and inline \\(x+y\\).\n\n' +
+        '[ref]: docs/ref\\(2\\).md\n\n' +
+        '> ```\n> \\(literal\\)\n> ```\n\n' +
+        '```\n```not-a-close\n\\(still-code\\)\n```  ',
+      phase: null,
+    };
+
+    render(
+      <ChatItem
+        item={item}
+        onOpenDetail={vi.fn()}
+        onApprovalDecision={onApprovalDecision}
+        onOpenMentionedFile={onOpenMentionedFile}
+      />,
+    );
+
+    await act(async () => {
+      await import('../../src/components/MarkdownView');
+    });
+    await flushLazy();
+
+    expect(document.querySelector('.markdown-body .katex')).toBeInstanceOf(HTMLElement);
+    expect(document.querySelector('.markdown-body blockquote code')?.textContent).toContain('\\(literal\\)');
+    expect(Array.from(document.querySelectorAll('.markdown-body code')).some((node) => node.textContent?.includes('\\(still-code\\)'))).toBe(true);
+
+    const fileLinks = Array.from(document.querySelectorAll<HTMLButtonElement>('.markdown-file-link'));
+    expect(fileLinks.map((link) => link.textContent)).toEqual(['guide', 'reference']);
+
+    act(() => {
+      fileLinks[0].click();
+      fileLinks[1].click();
+    });
+
+    expect(onOpenMentionedFile).toHaveBeenNthCalledWith(1, 'docs/foo(1).md');
+    expect(onOpenMentionedFile).toHaveBeenNthCalledWith(2, 'docs/ref(2).md');
+  });
+
+  it('normalizes LaTeX delimiters only in markdown prose', async () => {
+    const { normalizeLatexDelimiters } = await import('../../src/components/MarkdownView');
+
+    const normalized = normalizeLatexDelimiters(
+      'Inline \\(x\\).\n\n' +
+        '\\[\ny\n\\]\n\n' +
+        '[ref]: docs/foo\\(1\\).md\n\n' +
+        '<a\n  href="docs/bar\\(2\\).md">raw</a>\n\n' +
+        '```\n```not-a-close\n\\(literal\\)\n```  \n\n' +
+        '`\\(streaming-code)',
+    );
+
+    expect(normalized).toContain('$x$');
+    expect(normalized).toContain('$$\ny\n$$');
+    expect(normalized).toContain('[ref]: docs/foo\\(1\\).md');
+    expect(normalized).toContain('href="docs/bar\\(2\\).md"');
+    expect(normalized).toContain('```not-a-close\n\\(literal\\)');
+    expect(normalized).toContain('`\\(streaming-code)');
+  });
+
   it('opens assistant file mentions and markdown file links without linking code spans or external links', async () => {
     const onOpenMentionedFile = vi.fn();
     const item: TimelineItem = {
