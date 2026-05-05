@@ -3,12 +3,23 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import FileEditorModal from '../../src/components/FileEditorModal';
+import FileEditorModal, { languageForPath } from '../../src/components/FileEditorModal';
 
 vi.mock('@monaco-editor/react', () => ({
-  default: ({ value, onChange, options }: { value?: string; onChange?: (value?: string) => void; options?: { readOnly?: boolean } }) => (
+  default: ({
+    value,
+    onChange,
+    options,
+    language,
+  }: {
+    value?: string;
+    onChange?: (value?: string) => void;
+    options?: { readOnly?: boolean };
+    language?: string;
+  }) => (
     <textarea
       className="monaco-editor-mock"
+      data-language={language}
       readOnly={options?.readOnly}
       value={value ?? ''}
       onChange={(event) => onChange?.(event.target.value)}
@@ -41,6 +52,17 @@ afterEach(() => {
 });
 
 describe('FileEditorModal', () => {
+  it('maps common source paths to Monaco language ids', () => {
+    expect(languageForPath('/repo/script.sh')).toBe('shell');
+    expect(languageForPath('/repo/.bashrc')).toBe('shell');
+    expect(languageForPath('/repo/Makefile')).toBe('makefile');
+    expect(languageForPath('/repo/Dockerfile')).toBe('dockerfile');
+    expect(languageForPath('/repo/src/main.rs')).toBe('rust');
+    expect(languageForPath('/repo/query.sql')).toBe('sql');
+    expect(languageForPath('/repo/README.md')).toBe('markdown');
+    expect(languageForPath('/repo/config.toml')).toBe('toml');
+  });
+
   it('uses the lazy Monaco editor surface for editable files', async () => {
     render(<FileEditorModal path="/repo/a.ts" initialContent="const value = 1;" readOnly={false} onClose={vi.fn()} onSave={vi.fn()} />);
 
@@ -52,5 +74,57 @@ describe('FileEditorModal', () => {
     const editor = document.querySelector<HTMLTextAreaElement>('.monaco-editor-mock');
     expect(editor?.value).toBe('const value = 1;');
     expect(editor?.readOnly).toBe(false);
+    expect(editor?.dataset.language).toBe('typescript');
+  });
+
+  it('renders markdown preview controls for read-only markdown files', async () => {
+    render(
+      <FileEditorModal
+        path="/repo/README.md"
+        initialContent="# Title\n\n| A | B |\n| - | - |\n| 1 | 2 |\n"
+        sizeBytes={42}
+        readOnly
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const previewButton = Array.from(document.querySelectorAll('button')).find((button) => button.textContent === 'Preview');
+    expect(previewButton).toBeTruthy();
+
+    act(() => {
+      previewButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    await act(async () => {
+      await import('../../src/components/MarkdownView');
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(document.querySelector('.file-markdown-preview')?.textContent).toContain('Title');
+  });
+
+  it('disables markdown preview for large markdown files', async () => {
+    render(
+      <FileEditorModal
+        path="/repo/LARGE.md"
+        initialContent="# Large\n"
+        sizeBytes={2 * 1024 * 1024}
+        readOnly
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Preview')).toBe(false);
+    expect(document.body.textContent).toContain('Preview disabled for large Markdown files.');
   });
 });

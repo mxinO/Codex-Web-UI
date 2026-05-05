@@ -1605,7 +1605,43 @@ button.activity-card:focus-visible {
 .file-editor-actions {
   flex: 0 0 auto;
   display: flex;
+  align-items: center;
   gap: 8px;
+}
+
+.file-editor-segments {
+  display: inline-flex;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--surface-sunken);
+}
+
+.file-editor-segments button {
+  min-width: 62px;
+  height: 28px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: 5px;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  cursor: pointer;
+}
+
+.file-editor-segments button.active {
+  background: var(--surface-raised);
+  color: var(--text-primary);
+  box-shadow: var(--shadow-subtle);
+}
+
+.file-editor-note {
+  max-width: 260px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .file-editor-error {
@@ -1625,6 +1661,13 @@ button.activity-card:focus-visible {
 .file-editor-monaco {
   width: 100%;
   height: 100%;
+}
+
+.file-markdown-preview {
+  height: 100%;
+  overflow: auto;
+  padding: 18px 22px;
+  background: var(--bg-primary);
 }
 
 .file-editor-textarea {
