@@ -14,6 +14,7 @@ import {
 } from './auth.js';
 import { attachBrowserSocket } from './browserSocket.js';
 import { readConfig } from './config.js';
+import { createFileContentHandler } from './fileContent.js';
 import { createFilePreviewHandler } from './filePreview.js';
 import { resolveExistingPathInsideRoot, resolveWritablePathInsideRoot } from './fileTransfer.js';
 import { HostStateStore } from './hostState.js';
@@ -82,6 +83,9 @@ function getActiveCwd(): string | null {
   return stateStore.read().activeCwd;
 }
 
+const fileContentHandler = createFileContentHandler({ authorized, getActiveCwd });
+app.head('/api/file/content', fileContentHandler);
+app.get('/api/file/content', fileContentHandler);
 app.get('/api/file', createFilePreviewHandler({ authorized, getActiveCwd }));
 
 app.get('/api/download', async (req, res) => {
