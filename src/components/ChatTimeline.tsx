@@ -12,6 +12,8 @@ interface ChatTimelineProps {
   showActivityRunning?: boolean;
   loading?: boolean;
   loadError?: string | null;
+  retryScheduled?: boolean;
+  onRetryLoad?: () => void;
   onOpenDetail: (item: TimelineItem) => void;
   onApprovalDecision: (item: Extract<TimelineItem, { kind: 'approval' }>, decision: unknown) => Promise<void>;
   onQueuedEdit?: (message: Extract<TimelineItem, { kind: 'queued' }>['message']) => void;
@@ -81,6 +83,8 @@ export default function ChatTimeline({
   showActivityRunning = false,
   loading = false,
   loadError = null,
+  retryScheduled = false,
+  onRetryLoad,
   onOpenDetail,
   onApprovalDecision,
   onQueuedEdit,
@@ -253,8 +257,13 @@ export default function ChatTimeline({
               'Loading messages...'
             ) : loadError ? (
               <>
-                <span>Failed to load messages. Retrying...</span>
+                <span>{retryScheduled ? 'Failed to load messages. Retrying...' : 'Failed to load messages.'}</span>
                 <span className="chat-empty__detail">{loadError}</span>
+                {!retryScheduled && onRetryLoad && (
+                  <button className="load-more" type="button" onClick={onRetryLoad}>
+                    Retry
+                  </button>
+                )}
               </>
             ) : (
               'No messages loaded.'

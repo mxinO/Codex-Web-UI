@@ -190,7 +190,7 @@ export default function App() {
   const state = socket.hello?.state;
   const activeThreadId = state?.activeThreadId ?? null;
   const activeThreadPath = state?.activeThreadPath ?? null;
-  const timeline = useThreadTimeline(activeThreadId, socket.rpc);
+  const timeline = useThreadTimeline(activeThreadId, activeThreadPath, socket.rpc);
   const { queue: queuedMessages, enqueue, remove: removeFromQueue, replace: replaceQueue } = useQueue(socket.rpc, state?.queue ?? []);
   const [threads, setThreads] = useState<CodexThread[]>([]);
   const [sessionPickerOpen, setSessionPickerOpen] = useState(false);
@@ -969,6 +969,8 @@ export default function App() {
                   showActivityRunning={timeline.isViewingLatest && showActivityRunning}
                   loading={timeline.loading}
                   loadError={timeline.loadError}
+                  retryScheduled={timeline.retryScheduled}
+                  onRetryLoad={timeline.reload}
                   onOpenDetail={openDetailItem}
                   onApprovalDecision={respondToApproval}
                   onQueuedEdit={handleQueuedEdit}

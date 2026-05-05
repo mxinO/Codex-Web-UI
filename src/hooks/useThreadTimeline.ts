@@ -142,6 +142,17 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
+function turnListRequestParams(threadId: string, threadPath: string | null, cursor: string | null) {
+  const params: { threadId: string; threadPath?: string; limit: number; sortDirection: 'desc'; cursor: string | null } = {
+    threadId,
+    limit: PAGE_SIZE,
+    sortDirection: 'desc',
+    cursor,
+  };
+  if (threadPath) params.threadPath = threadPath;
+  return params;
+}
+
 function mergeLatestTurns(current: CodexTurn[], latest: CodexTurn[], limit: number): CodexTurn[] {
   if (latest.length === 0) return current;
   if (current.length === 0) return trimNewestTurnWindow(latest, limit);
@@ -170,8 +181,14 @@ function mergeOlderTurns(current: CodexTurn[], older: CodexTurn[], limit: number
   return trimOldestTurnWindow(merged, limit);
 }
 
-export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method: string, params?: unknown, timeoutMs?: number) => Promise<T>) {
+export function useThreadTimeline(
+  activeThreadId: string | null,
+  activeThreadPath: string | null,
+  rpc: <T>(method: string, params?: unknown, timeoutMs?: number) => Promise<T>,
+) {
   const activeThreadRef = useRef(activeThreadId);
+  const activeThreadPathRef = useRef(activeThreadPath);
+  const isViewingLatestRef = useRef(true);
   const requestGenerationRef = useRef(0);
   const initialRetryTimerRef = useRef<number | null>(null);
   const initialRetryAttemptRef = useRef(0);
@@ -180,8 +197,11 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
   const [cursor, setCursor] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [retryScheduled, setRetryScheduled] = useState(false);
   const [isViewingLatest, setIsViewingLatest] = useState(true);
   activeThreadRef.current = activeThreadId;
+  activeThreadPathRef.current = activeThreadPath;
+  isViewingLatestRef.current = isViewingLatest;
   const items = useMemo<TimelineItem[]>(
     () => (activeThreadId && loadedThreadId === activeThreadId ? normalizeTurns(turns) : []),
     [activeThreadId, loadedThreadId, turns],
@@ -204,12 +224,7 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
     (threadId: string) =>
       rpc<TurnListResult>(
         'thread/turns/list',
-        {
-          threadId,
-          limit: PAGE_SIZE,
-          sortDirection: 'desc',
-          cursor: null,
-        },
+        turnListRequestParams(threadId, activeThreadPathRef.current, null),
         THREAD_TURNS_LIST_TIMEOUT_MS,
       ),
     [rpc],
@@ -223,6 +238,7 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
     clearInitialRetryTimer();
     setLoading(true);
     setLoadError(null);
+    setRetryScheduled(false);
     try {
       const result = await fetchLatestPage(threadId);
       if (!isCurrentRequest(threadId, generation)) return;
@@ -230,7 +246,7 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
       setTurns((current) => (mode === 'replace' ? latest : mergeLatestTurns(current, latest, WINDOW_TURN_LIMIT)));
       setLoadedThreadId(threadId);
       const nextCursor = getNextCursor(result);
-      setCursor((currentCursor) => (mode === 'replace' || isViewingLatest ? nextCursor : currentCursor));
+      setCursor((currentCursor) => (mode === 'replace' || isViewingLatestRef.current ? nextCursor : currentCursor));
       if (mode === 'replace') setIsViewingLatest(true);
       setLoadError(null);
     } catch (error) {
@@ -240,7 +256,7 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
     } finally {
       if (isCurrentRequest(threadId, generation)) setLoading(false);
     }
-  }, [activeThreadId, clearInitialRetryTimer, fetchLatestPage, isCurrentRequest, isViewingLatest]);
+  }, [activeThreadId, clearInitialRetryTimer, fetchLatestPage, isCurrentRequest]);
 
   const reload = useCallback(() => fetchLatest('merge'), [fetchLatest]);
   const jumpToLatest = useCallback(() => fetchLatest('replace'), [fetchLatest]);
@@ -253,12 +269,11 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
 
     setLoading(true);
     try {
-      const result = await rpc<TurnListResult>('thread/turns/list', {
-        threadId,
-        limit: PAGE_SIZE,
-        sortDirection: 'desc',
-        cursor: requestCursor,
-      }, THREAD_TURNS_LIST_TIMEOUT_MS);
+      const result = await rpc<TurnListResult>(
+        'thread/turns/list',
+        turnListRequestParams(threadId, activeThreadPathRef.current, requestCursor),
+        THREAD_TURNS_LIST_TIMEOUT_MS,
+      );
       if (!isCurrentRequest(threadId, generation)) return;
       const older = [...resultTurns(result)].reverse();
       setTurns((current) => mergeOlderTurns(current, older, WINDOW_TURN_LIMIT));
@@ -282,6 +297,7 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
     setLoadedThreadId(null);
     setCursor(null);
     setLoadError(null);
+    setRetryScheduled(false);
     setIsViewingLatest(true);
 
     if (!threadId) {
@@ -291,6 +307,7 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
 
     const loadInitial = () => {
       setLoading(true);
+      setRetryScheduled(false);
       void fetchLatestPage(threadId)
       .then((result) => {
         if (!isCurrentRequest(threadId, generation)) return;
@@ -299,15 +316,21 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
         setLoadedThreadId(threadId);
         setCursor(getNextCursor(result));
         setLoadError(null);
+        setRetryScheduled(false);
         initialRetryAttemptRef.current = 0;
         setIsViewingLatest(true);
       })
       .catch((error) => {
         if (!isCurrentRequest(threadId, generation)) return;
         setLoadError(errorMessage(error));
-        const delay = INITIAL_LOAD_RETRY_DELAYS_MS[Math.min(initialRetryAttemptRef.current, INITIAL_LOAD_RETRY_DELAYS_MS.length - 1)];
+        const delay = INITIAL_LOAD_RETRY_DELAYS_MS[initialRetryAttemptRef.current];
+        if (delay === undefined) {
+          setRetryScheduled(false);
+          return;
+        }
         initialRetryAttemptRef.current += 1;
         clearInitialRetryTimer();
+        setRetryScheduled(true);
         initialRetryTimerRef.current = window.setTimeout(() => {
           initialRetryTimerRef.current = null;
           if (isCurrentRequest(threadId, generation)) loadInitial();
@@ -326,5 +349,15 @@ export function useThreadTimeline(activeThreadId: string | null, rpc: <T>(method
     };
   }, [activeThreadId, clearInitialRetryTimer, fetchLatestPage, isCurrentRequest]);
 
-  return { items, loadOlder, hasOlder: Boolean(activeCursor), loading: timelineLoading, loadError, reload, jumpToLatest, isViewingLatest };
+  return {
+    items,
+    loadOlder,
+    hasOlder: Boolean(activeCursor),
+    loading: timelineLoading,
+    loadError,
+    retryScheduled,
+    reload,
+    jumpToLatest,
+    isViewingLatest,
+  };
 }

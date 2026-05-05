@@ -43,6 +43,22 @@ function makeConfig(): ServerConfig {
 type TestRequest = (method: string, params?: unknown, timeoutMs?: number) => Promise<unknown>;
 const TURN_START_RPC_TIMEOUT_MS = 10 * 60 * 1000;
 
+interface Deferred<T> {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (error: Error) => void;
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
 async function makeHarness(
   request: TestRequest,
   options: {
@@ -487,10 +503,11 @@ describe('attachBrowserSocket session RPCs', () => {
 
     expect(request).toHaveBeenCalledWith('thread/resume', {
       threadId: 'thread-1',
+      path: '/sessions/thread-1.jsonl',
       experimentalRawEvents: true,
       persistExtendedHistory: true,
       excludeTurns: true,
-    });
+    }, 120000);
     expect(request).toHaveBeenCalledWith('thread/compact/start', { threadId: 'thread-1' });
     expect(response).toEqual({ type: 'rpc/result', id: 41, result: {} });
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'compact-pending:thread-1' });
@@ -2528,6 +2545,81 @@ describe('attachBrowserSocket fs RPC wrappers', () => {
 });
 
 describe('attachBrowserSocket app-server lifecycle', () => {
+  it('uses the persisted active thread path when timeline load implicitly resumes after server restart', async () => {
+    const threadPath = '/home/user/.codex/sessions/2026/05/05/rollout-thread-1.jsonl';
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: threadPath } };
+      return { data: [] };
+    });
+    const { ws } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: threadPath,
+        activeCwd: '/work/project',
+      },
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 39, method: 'thread/turns/list', params: { threadId: 'thread-1', threadPath } }));
+    await nextRpcResponse(ws, 39);
+
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', {
+      threadId: 'thread-1',
+      path: threadPath,
+      experimentalRawEvents: true,
+      persistExtendedHistory: true,
+      excludeTurns: true,
+    }, 120000);
+    expect(request).toHaveBeenNthCalledWith(2, 'thread/turns/list', {
+      threadId: 'thread-1',
+      cursor: null,
+      limit: 50,
+      sortDirection: 'desc',
+    }, 120000);
+  });
+
+  it('does not let a stale in-flight resume mark a restarted app-server thread as resumed', async () => {
+    const threadPath = '/home/user/.codex/sessions/2026/05/05/rollout-thread-1.jsonl';
+    const firstResume = deferred<unknown>();
+    let resumeCalls = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/resume') {
+        resumeCalls += 1;
+        if (resumeCalls === 1) return firstResume.promise;
+        return { thread: { id: 'thread-1', cwd: '/work/project', path: threadPath } };
+      }
+      return { data: [] };
+    });
+    const { ws, emitHealthChange, health } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: threadPath,
+        activeCwd: '/work/project',
+      },
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 391, method: 'webui/session/resume', params: { threadId: 'thread-1', threadPath } }));
+    await waitForRequest(request);
+
+    health.mockReturnValue({ connected: false, dead: true, error: 'Codex app-server exited', readyzUrl: null, url: null });
+    emitHealthChange();
+    health.mockReturnValue({ connected: true, dead: false, error: null, readyzUrl: 'http://127.0.0.1:1/readyz', url: 'ws://127.0.0.1:1' });
+
+    firstResume.resolve({ thread: { id: 'thread-1', cwd: '/work/project', path: threadPath } });
+    await nextRpcResponse(ws, 391);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 392, method: 'thread/turns/list', params: { threadId: 'thread-1', threadPath } }));
+    await nextRpcResponse(ws, 392);
+
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'thread/resume', 'thread/turns/list']);
+    expect(request).toHaveBeenNthCalledWith(2, 'thread/resume', {
+      threadId: 'thread-1',
+      path: threadPath,
+      experimentalRawEvents: true,
+      persistExtendedHistory: true,
+      excludeTurns: true,
+    }, 120000);
+  });
+
   it('ensures the app-server is started before timeline RPCs after reconnect or refresh', async () => {
     const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ data: [] });
     const { ws, start, health } = await makeHarness(request);
@@ -2549,7 +2641,7 @@ describe('attachBrowserSocket app-server lifecycle', () => {
       experimentalRawEvents: true,
       persistExtendedHistory: true,
       excludeTurns: true,
-    });
+    }, 120000);
     expect(request).toHaveBeenNthCalledWith(2, 'thread/turns/list', {
       threadId: 'thread-1',
       cursor: null,
@@ -3111,7 +3203,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       id: 17,
       result: { ok: false, cleared: true, error: 'thread not found' },
     });
-    expect(request).toHaveBeenCalledWith('thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true, excludeTurns: true });
+    expect(request).toHaveBeenCalledWith('thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true, excludeTurns: true }, 120000);
     expect(stateStore.read()).toMatchObject({ activeThreadId: null, activeThreadPath: null, activeTurnId: null, activeCwd: '/work/project' });
   });
 
@@ -3359,7 +3451,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     await waitForRequestCalls(request, 2);
 
     expect(request).toHaveBeenCalledTimes(2);
-    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true, excludeTurns: true });
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true, excludeTurns: true }, 120000);
     expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'next', text_elements: [] }],
@@ -3573,7 +3665,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     notify('event_msg', { payload: { type: 'task_complete', thread_id: 'thread-1', turn_id: 'turn-old' } });
     await waitForRequestCalls(request, 2);
 
-    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true, excludeTurns: true });
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true, excludeTurns: true }, 120000);
     expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'next', text_elements: [] }],
@@ -3672,7 +3764,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     await waitForRequestCalls(request, 2);
 
     expect(request).toHaveBeenCalledTimes(2);
-    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true, excludeTurns: true });
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true, excludeTurns: true }, 120000);
     expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'first', text_elements: [] }],

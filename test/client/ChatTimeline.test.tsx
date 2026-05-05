@@ -65,11 +65,26 @@ afterEach(() => {
 
 describe('ChatTimeline', () => {
   it('shows a retrying load error instead of an empty-history message', () => {
-    render(<ChatTimeline {...baseProps} items={emptyItems} loadError="RPC request timed out: thread/turns/list" />);
+    render(<ChatTimeline {...baseProps} items={emptyItems} loadError="RPC request timed out: thread/turns/list" retryScheduled />);
 
     expect(document.body.textContent).toContain('Failed to load messages. Retrying...');
     expect(document.body.textContent).toContain('RPC request timed out: thread/turns/list');
     expect(document.body.textContent).not.toContain('No messages loaded.');
+  });
+
+  it('shows a manual retry action when automatic retries are exhausted', () => {
+    const onRetryLoad = vi.fn();
+    render(<ChatTimeline {...baseProps} items={emptyItems} loadError="thread not found" onRetryLoad={onRetryLoad} />);
+
+    expect(document.body.textContent).toContain('Failed to load messages.');
+    expect(document.body.textContent).not.toContain('Retrying...');
+
+    const button = Array.from(document.querySelectorAll('button')).find((item) => item.textContent === 'Retry');
+    act(() => {
+      button?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+
+    expect(onRetryLoad).toHaveBeenCalledTimes(1);
   });
 
   it('shows a jump-to-latest action while an older page is displayed', () => {

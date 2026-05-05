@@ -616,15 +616,17 @@ async function isBrowsableDirectoryEntry(entry: fsSync.Dirent, entryPath: string
   }
 }
 
-function turnListParams(params: unknown): { threadId: string; cursor: unknown; limit: number; sortDirection: string } | string {
+function turnListParams(params: unknown): { threadId: string; threadPath: string | null; cursor: unknown; limit: number; sortDirection: string } | string {
   if (!isRecord(params)) return 'thread list params are required';
   const threadId = getRequiredString(params, 'threadId');
   if (!threadId) return 'threadId is required';
+  const threadPath = getOptionalString(params, 'threadPath');
 
   const limit = typeof params.limit === 'number' && Number.isFinite(params.limit) ? Math.max(1, Math.min(100, Math.floor(params.limit))) : 50;
   const sortDirection = params.sortDirection === 'asc' ? 'asc' : 'desc';
   return {
     threadId,
+    threadPath,
     cursor: typeof params.cursor === 'string' ? params.cursor : null,
     limit,
     sortDirection,
@@ -996,6 +998,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const resumedThreadIds = new Set<string>();
   const resumeThreadPromises = new Map<string, Promise<void>>();
   const knownThreadPaths = new Map<string, string>();
+  let appServerGeneration = 0;
   const timedOutQueuedStarts = new Map<string, QueuedMessage>();
   const recentNotifications: Array<{ seq: number; message: unknown; bytes: number }> = [];
   let recentNotificationSeq = 0;
@@ -1042,6 +1045,12 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     for (const thread of threads) rememberKnownThreadPath(extractThreadId(thread), extractThreadPath(thread));
   };
 
+  const invalidateResumedThreads = () => {
+    appServerGeneration += 1;
+    resumedThreadIds.clear();
+    resumeThreadPromises.clear();
+  };
+
   const validatedThreadPath = (
     state: HostRuntimeState,
     threadId: string | null,
@@ -1052,6 +1061,20 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     if (threadId && knownThreadPaths.get(threadId) === threadPath) return threadPath;
     if (turnId && turnThreadPaths.get(turnKey(threadId, turnId)) === threadPath) return threadPath;
     if ((!threadId || threadId === state.activeThreadId) && threadPath === state.activeThreadPath) return threadPath;
+    return null;
+  };
+
+  const resumePathForThread = (threadId: string, requestedThreadPath?: string | null): string | null => {
+    const state = deps.stateStore.read();
+    const requested = requestedThreadPath && nodePath.isAbsolute(requestedThreadPath)
+      ? validatedThreadPath(state, threadId, null, requestedThreadPath)
+      : null;
+    if (requested) return requested;
+    const known = knownThreadPaths.get(threadId);
+    if (known) return known;
+    if (state.activeThreadId === threadId && state.activeThreadPath && nodePath.isAbsolute(state.activeThreadPath)) {
+      return state.activeThreadPath;
+    }
     return null;
   };
 
@@ -1782,7 +1805,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const ensureCodexStarted = (): Promise<void> | null => {
     const health = deps.codex.health();
     if (health.connected && !health.dead) return null;
-    resumedThreadIds.clear();
+    invalidateResumedThreads();
     return deps.codex.start().then(() => {
       const appServerUrl = deps.codex.getUrl();
       const appServerPid = deps.codex.getPid();
@@ -1802,39 +1825,57 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     return starting ? starting.then(call) : call();
   };
 
-  const ensureThreadResumed = (threadId: string): Promise<void> => {
+  const ensureThreadResumed = (threadId: string, requestedThreadPath?: string | null): Promise<void> => {
     if (resumedThreadIds.has(threadId)) return Promise.resolve();
     const existing = resumeThreadPromises.get(threadId);
     if (existing) return existing;
 
+    const resumePath = resumePathForThread(threadId, requestedThreadPath);
+    let generation: number | null = null;
     let resumePromise: Promise<void>;
-    resumePromise = requestCodex('thread/resume', { threadId, experimentalRawEvents: true, persistExtendedHistory: true, excludeTurns: true })
-      .then((result) => {
-        const activeCwd = extractThreadCwd(result);
-        const activeThreadPath = extractThreadPath(result);
-        const runtimeStatus = runtimeStatusFromThreadResult(result);
-        rememberKnownThreadPath(threadId, activeThreadPath);
-        let updatedActiveThread = false;
-        const nextState = deps.stateStore.update((state) => {
-          if (state.activeThreadId !== threadId) return state;
-          updatedActiveThread = true;
-          return {
-            ...state,
-            activeCwd: activeCwd ?? state.activeCwd,
-            activeThreadPath: activeThreadPath ?? state.activeThreadPath,
-            recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
-            ...runtimeStatus,
-          };
-        });
-        if (updatedActiveThread) broadcastHello(nextState);
+    resumePromise = (async () => {
+      const starting = ensureCodexStarted();
+      if (starting) await starting;
+      generation = appServerGeneration;
+      const result = await deps.codex.request(
+        'thread/resume',
+        {
+          threadId,
+          ...(resumePath ? { path: resumePath } : {}),
+          experimentalRawEvents: true,
+          persistExtendedHistory: true,
+          excludeTurns: true,
+        },
+        THREAD_TURNS_LIST_RPC_TIMEOUT_MS,
+      );
+      const activeCwd = extractThreadCwd(result);
+      const activeThreadPath = extractThreadPath(result) ?? resumePath;
+      const runtimeStatus = runtimeStatusFromThreadResult(result);
+      rememberKnownThreadPath(threadId, activeThreadPath);
+      let updatedActiveThread = false;
+      const nextState = deps.stateStore.update((state) => {
+        if (state.activeThreadId !== threadId) return state;
+        updatedActiveThread = true;
+        return {
+          ...state,
+          activeCwd: activeCwd ?? state.activeCwd,
+          activeThreadPath: activeThreadPath ?? state.activeThreadPath,
+          recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
+          ...runtimeStatus,
+        };
+      });
+      if (updatedActiveThread) broadcastHello(nextState);
+      const health = deps.codex.health();
+      if (generation === appServerGeneration && health.connected && !health.dead) {
         resumedThreadIds.add(threadId);
-      })
+      }
+    })()
       .catch((error) => {
         if (isMissingThreadError(error)) clearMissingActiveThread(threadId, error);
         throw error;
       })
       .finally(() => {
-        if (resumeThreadPromises.get(threadId) === resumePromise) {
+        if ((generation === null || generation === appServerGeneration) && resumeThreadPromises.get(threadId) === resumePromise) {
           resumeThreadPromises.delete(threadId);
         }
       });
@@ -2112,8 +2153,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const unsubscribeHealthChange = deps.codex.onHealthChange(() => {
     const health = deps.codex.health();
     if (!health.connected || health.dead) {
-      resumedThreadIds.clear();
-      resumeThreadPromises.clear();
+      invalidateResumedThreads();
       pendingServerRequests.clear();
       const current = deps.stateStore.read();
       if (current.activeTurnId) {
@@ -2232,21 +2272,27 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           const requestedThreadPath = getOptionalString(request.params, 'threadPath');
 
           const options = runOptionsFromParams(request.params);
+          const resumePath = resumePathForThread(threadId, requestedThreadPath);
           const params = applyThreadRunOptions<SessionResumeParams & { experimentalRawEvents: boolean; persistExtendedHistory: boolean; [key: string]: unknown }>({
             threadId,
+            ...(resumePath ? { path: resumePath } : {}),
             experimentalRawEvents: true,
             persistExtendedHistory: true,
             excludeTurns: true,
           }, options);
-          const result = await requestCodex('thread/resume', params).catch((error) => {
+          const starting = ensureCodexStarted();
+          if (starting) await starting;
+          const generation = appServerGeneration;
+          const result = await deps.codex.request('thread/resume', params).catch((error) => {
             if (isMissingThreadError(error)) clearMissingActiveThread(threadId, error);
             throw error;
           });
-          resumedThreadIds.add(threadId);
+          const health = deps.codex.health();
+          if (generation === appServerGeneration && health.connected && !health.dead) resumedThreadIds.add(threadId);
           const activeCwd = extractThreadCwd(result) ?? deps.stateStore.read().activeCwd;
           const resultThreadPath = extractThreadPath(result);
           const activeThreadPath =
-            resultThreadPath ?? (requestedThreadPath && knownThreadPaths.get(threadId) === requestedThreadPath ? requestedThreadPath : null);
+            resultThreadPath ?? resumePath ?? (requestedThreadPath && knownThreadPaths.get(threadId) === requestedThreadPath ? requestedThreadPath : null);
           const runtimeStatus = runtimeStatusFromThreadResult(result, options);
           rememberKnownThreadPath(threadId, activeThreadPath);
           const state = deps.stateStore.update((state) => ({
@@ -2494,12 +2540,20 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
           let result: unknown;
           try {
-            await ensureThreadResumed(params.threadId);
-            result = await requestCodex('thread/turns/list', params, THREAD_TURNS_LIST_RPC_TIMEOUT_MS);
+            await ensureThreadResumed(params.threadId, params.threadPath);
+            const codexParams = {
+              threadId: params.threadId,
+              cursor: params.cursor,
+              limit: params.limit,
+              sortDirection: params.sortDirection,
+            };
+            result = await requestCodex('thread/turns/list', codexParams, THREAD_TURNS_LIST_RPC_TIMEOUT_MS);
             const drain = drainPatchCaptureQueue();
             if (drain) await drain;
             result = augmentTurnListWithStoredFileSummaries(result, params.threadId);
           } catch (error) {
+            resumedThreadIds.delete(params.threadId);
+            resumeThreadPromises.delete(params.threadId);
             if (isMissingThreadError(error)) clearMissingActiveThread(params.threadId, error);
             throw error;
           }

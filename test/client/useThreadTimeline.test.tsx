@@ -10,7 +10,7 @@ import type { CodexTurn } from '../../src/types/codex';
 
 type HookResult = ReturnType<typeof useThreadTimeline>;
 type RpcResult = { data?: CodexTurn[]; turns?: CodexTurn[]; thread?: { turns?: CodexTurn[] }; nextCursor?: string | null; next_cursor?: string | null };
-type TimelineRpc = Parameters<typeof useThreadTimeline>[1];
+type TimelineRpc = Parameters<typeof useThreadTimeline>[2];
 
 interface Deferred<T> {
   promise: Promise<T>;
@@ -55,24 +55,32 @@ function itemText(item: NonNullable<HookResult>['items'][number]): string {
   return item.kind === 'assistant' || item.kind === 'user' || item.kind === 'notice' || item.kind === 'streaming' ? item.text : '';
 }
 
-function Harness({ activeThreadId, rpc }: { activeThreadId: string | null; rpc: <T>(method: string, params?: unknown) => Promise<T> }) {
-  currentTimeline = useThreadTimeline(activeThreadId, rpc);
+function Harness({
+  activeThreadId,
+  activeThreadPath,
+  rpc,
+}: {
+  activeThreadId: string | null;
+  activeThreadPath: string | null;
+  rpc: <T>(method: string, params?: unknown) => Promise<T>;
+}) {
+  currentTimeline = useThreadTimeline(activeThreadId, activeThreadPath, rpc);
   return null;
 }
 
-async function renderHook(activeThreadId: string | null, rpc: <T>(method: string, params?: unknown) => Promise<T>) {
+async function renderHook(activeThreadId: string | null, rpc: <T>(method: string, params?: unknown) => Promise<T>, activeThreadPath: string | null = null) {
   container = document.createElement('div');
   document.body.append(container);
   root = createRoot(container);
 
   await act(async () => {
-    root?.render(<Harness activeThreadId={activeThreadId} rpc={rpc} />);
+    root?.render(<Harness activeThreadId={activeThreadId} activeThreadPath={activeThreadPath} rpc={rpc} />);
   });
 }
 
-async function rerenderHook(activeThreadId: string | null, rpc: <T>(method: string, params?: unknown) => Promise<T>) {
+async function rerenderHook(activeThreadId: string | null, rpc: <T>(method: string, params?: unknown) => Promise<T>, activeThreadPath: string | null = null) {
   await act(async () => {
-    root?.render(<Harness activeThreadId={activeThreadId} rpc={rpc} />);
+    root?.render(<Harness activeThreadId={activeThreadId} activeThreadPath={activeThreadPath} rpc={rpc} />);
   });
 }
 
@@ -109,6 +117,22 @@ describe('useThreadTimeline', () => {
     expect((currentTimeline as HookResult & { isViewingLatest?: boolean })?.isViewingLatest).toBe(true);
   });
 
+  it('includes the active thread path when loading history after refresh', async () => {
+    const first = deferred<RpcResult>();
+    const rpc = vi.fn(() => first.promise);
+    const threadPath = '/home/user/.codex/sessions/2026/05/05/rollout-thread-1.jsonl';
+
+    await renderHook('thread-1', asRpc(rpc), threadPath);
+
+    expect(rpc).toHaveBeenCalledWith('thread/turns/list', {
+      threadId: 'thread-1',
+      threadPath,
+      limit: 12,
+      sortDirection: 'desc',
+      cursor: null,
+    }, 120000);
+  });
+
   it('initial load failure exposes an error and retries the fixed-size latest page', async () => {
     vi.useFakeTimers();
     const failed = deferred<RpcResult>();
@@ -124,6 +148,7 @@ describe('useThreadTimeline', () => {
     expect(currentTimeline?.items).toEqual([]);
     expect(currentTimeline?.loading).toBe(false);
     expect(currentTimeline?.loadError).toBe('RPC request timed out: thread/turns/list');
+    expect(currentTimeline?.retryScheduled).toBe(true);
 
     await act(async () => {
       vi.advanceTimersByTime(999);
@@ -148,6 +173,31 @@ describe('useThreadTimeline', () => {
 
     expect(currentTimeline?.items.map(itemText)).toEqual(['turn-1']);
     expect(currentTimeline?.loadError).toBeNull();
+    expect(currentTimeline?.retryScheduled).toBe(false);
+  });
+
+  it('stops automatic initial retries after the retry budget is exhausted', async () => {
+    vi.useFakeTimers();
+    const rpc = vi.fn(() => Promise.reject(new Error('thread not found')));
+
+    await renderHook('thread-1', asRpc(rpc));
+
+    for (const delay of [1000, 2500, 5000, 10000]) {
+      await act(async () => {
+        await Promise.resolve();
+      });
+      expect(currentTimeline?.retryScheduled).toBe(true);
+      await act(async () => {
+        vi.advanceTimersByTime(delay);
+      });
+    }
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(currentTimeline?.loadError).toBe('thread not found');
+    expect(currentTimeline?.retryScheduled).toBe(false);
+    expect(rpc).toHaveBeenCalledTimes(5);
   });
 
   it('loadOlder prepends older messages while preserving the latest page when under the window limit', async () => {
