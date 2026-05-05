@@ -21,7 +21,7 @@ export function languageForPath(path: string): string {
   const name = baseName(path);
   const extension = name.includes('.') ? name.split('.').pop()?.toLowerCase() : '';
   if (name === 'makefile' || name.endsWith('.mk')) return 'shell';
-  if (name === 'dockerfile' || name.endsWith('.dockerfile')) return 'dockerfile';
+  if (name === 'dockerfile' || name.startsWith('dockerfile.') || name.endsWith('.dockerfile')) return 'dockerfile';
   if (name === '.bashrc' || name === '.zshrc' || name === '.profile' || name === '.bash_profile') return 'shell';
 
   switch (extension) {
@@ -55,6 +55,7 @@ export function languageForPath(path: string): string {
     case 'java':
       return 'java';
     case 'js':
+    case 'jsx':
     case 'mjs':
     case 'cjs':
       return 'javascript';
@@ -83,6 +84,8 @@ export function languageForPath(path: string): string {
       return 'ini';
     case 'ts':
     case 'tsx':
+    case 'mts':
+    case 'cts':
       return 'typescript';
     case 'xml':
       return 'xml';

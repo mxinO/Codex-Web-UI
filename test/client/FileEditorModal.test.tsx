@@ -57,6 +57,10 @@ describe('FileEditorModal', () => {
     expect(languageForPath('/repo/.bashrc')).toBe('shell');
     expect(languageForPath('/repo/Makefile')).toBe('shell');
     expect(languageForPath('/repo/Dockerfile')).toBe('dockerfile');
+    expect(languageForPath('/repo/Dockerfile.dev')).toBe('dockerfile');
+    expect(languageForPath('/repo/view.jsx')).toBe('javascript');
+    expect(languageForPath('/repo/package.mts')).toBe('typescript');
+    expect(languageForPath('/repo/package.cts')).toBe('typescript');
     expect(languageForPath('/repo/src/main.rs')).toBe('rust');
     expect(languageForPath('/repo/query.sql')).toBe('sql');
     expect(languageForPath('/repo/README.md')).toBe('markdown');
