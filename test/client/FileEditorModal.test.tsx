@@ -55,12 +55,12 @@ describe('FileEditorModal', () => {
   it('maps common source paths to Monaco language ids', () => {
     expect(languageForPath('/repo/script.sh')).toBe('shell');
     expect(languageForPath('/repo/.bashrc')).toBe('shell');
-    expect(languageForPath('/repo/Makefile')).toBe('makefile');
+    expect(languageForPath('/repo/Makefile')).toBe('shell');
     expect(languageForPath('/repo/Dockerfile')).toBe('dockerfile');
     expect(languageForPath('/repo/src/main.rs')).toBe('rust');
     expect(languageForPath('/repo/query.sql')).toBe('sql');
     expect(languageForPath('/repo/README.md')).toBe('markdown');
-    expect(languageForPath('/repo/config.toml')).toBe('toml');
+    expect(languageForPath('/repo/config.toml')).toBe('ini');
   });
 
   it('uses the lazy Monaco editor surface for editable files', async () => {

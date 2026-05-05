@@ -20,7 +20,7 @@ function baseName(path: string): string {
 export function languageForPath(path: string): string {
   const name = baseName(path);
   const extension = name.includes('.') ? name.split('.').pop()?.toLowerCase() : '';
-  if (name === 'makefile' || name.endsWith('.mk')) return 'makefile';
+  if (name === 'makefile' || name.endsWith('.mk')) return 'shell';
   if (name === 'dockerfile' || name.endsWith('.dockerfile')) return 'dockerfile';
   if (name === '.bashrc' || name === '.zshrc' || name === '.profile' || name === '.bash_profile') return 'shell';
 
@@ -80,7 +80,7 @@ export function languageForPath(path: string): string {
     case 'swift':
       return 'swift';
     case 'toml':
-      return 'toml';
+      return 'ini';
     case 'ts':
     case 'tsx':
       return 'typescript';

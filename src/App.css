@@ -1603,13 +1603,15 @@ button.activity-card:focus-visible {
 }
 
 .file-editor-actions {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
   display: flex;
   align-items: center;
   gap: 8px;
+  min-width: 0;
 }
 
 .file-editor-segments {
+  flex: 0 0 auto;
   display: inline-flex;
   padding: 2px;
   border: 1px solid var(--border);
@@ -1636,7 +1638,9 @@ button.activity-card:focus-visible {
 }
 
 .file-editor-note {
-  max-width: 260px;
+  flex: 1 1 120px;
+  min-width: 0;
+  max-width: min(240px, 28vw);
   color: var(--text-secondary);
   font-size: 12px;
   overflow: hidden;
