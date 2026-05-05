@@ -5,6 +5,7 @@ const MonacoEditor = lazy(() => import('@monaco-editor/react'));
 interface FileEditorModalProps {
   path: string;
   initialContent: string;
+  sizeBytes?: number | null;
   readOnly: boolean;
   onClose: () => void;
   onSave: (content: string) => Promise<void>;

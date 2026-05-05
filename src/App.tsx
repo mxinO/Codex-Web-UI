@@ -15,6 +15,7 @@ import { useQueue, type ClientQueuedMessage } from './hooks/useQueue';
 import { useThreadTimeline } from './hooks/useThreadTimeline';
 import { useTheme } from './hooks/useTheme';
 import { appendEphemeralBangItem, bangOutputEventToTimelineItem, getBangCommandOutputDetail } from './lib/bangCommands';
+import { FileContentTooLargeError, readTextFileStream } from './lib/fileContent';
 import { isImagePath, normalizeMentionedFilePath } from './lib/filePreview';
 import {
   COLLABORATION_MODES,
@@ -58,6 +59,7 @@ interface OpenEditor {
   path: string;
   readOnly: boolean;
   content: string;
+  sizeBytes: number | null;
   modifiedAtMs: number | null;
 }
 
@@ -67,15 +69,6 @@ interface OpenImage {
 
 type UserTimelineItem = Extract<TimelineItem, { kind: 'user' }>;
 type FileChangeSummaryTimelineItem = Extract<TimelineItem, { kind: 'fileChangeSummary' }>;
-
-function decodeUtf8Base64(value: string): string {
-  const binary = window.atob(value);
-  const bytes = new Uint8Array(binary.length);
-  for (let index = 0; index < binary.length; index += 1) {
-    bytes[index] = binary.charCodeAt(index);
-  }
-  return new TextDecoder().decode(bytes);
-}
 
 function encodeUtf8Base64(value: string): string {
   const bytes = new TextEncoder().encode(value);
@@ -118,14 +111,6 @@ function getNestedRecord(value: unknown, key: string): Record<string, unknown> |
   if (typeof value !== 'object' || value === null) return null;
   const child = (value as Record<string, unknown>)[key];
   return typeof child === 'object' && child !== null ? (child as Record<string, unknown>) : null;
-}
-
-function extractBase64(result: unknown): string {
-  if (typeof result !== 'object' || result === null) return '';
-  const record = result as Record<string, unknown>;
-  const data = getNestedRecord(result, 'data');
-  const value = record.dataBase64 ?? record.contentBase64 ?? data?.dataBase64 ?? data?.contentBase64;
-  return typeof value === 'string' ? value : '';
 }
 
 function extractModifiedAtMs(result: unknown): number | null {
@@ -865,16 +850,27 @@ export default function App() {
 
     try {
       setImageViewer(null);
-      const contentResult = await socket.rpc<unknown>('webui/fs/readFile', { path: normalizedPath });
-      const metadataResult = await socket.rpc<unknown>('webui/fs/getMetadata', { path: normalizedPath });
+      const contentResult = await readTextFileStream(normalizedPath);
+      let modifiedAtMs = contentResult.modifiedAtMs;
+      if (modifiedAtMs === null) {
+        const metadataResult = await socket.rpc<unknown>('webui/fs/getMetadata', { path: normalizedPath });
+        modifiedAtMs = extractModifiedAtMs(metadataResult);
+      }
       setEditor({
         path: normalizedPath,
         readOnly,
-        content: decodeUtf8Base64(extractBase64(contentResult)),
-        modifiedAtMs: extractModifiedAtMs(metadataResult),
+        content: contentResult.content,
+        sizeBytes: contentResult.sizeBytes,
+        modifiedAtMs,
       });
     } catch (error) {
-      setSessionError(error instanceof Error ? error.message : String(error));
+      setSessionError(
+        error instanceof FileContentTooLargeError
+          ? `${error.message} Use the file explorer download button for this file.`
+          : error instanceof Error
+            ? error.message
+            : String(error),
+      );
     }
   }, [socket.rpc]);
 
@@ -1003,6 +999,7 @@ export default function App() {
         <FileEditorModal
           path={editor.path}
           initialContent={editor.content}
+          sizeBytes={editor.sizeBytes}
           readOnly={editor.readOnly}
           onClose={() => setEditor(null)}
           onSave={(content) => saveFile(editor.path, content)}
