@@ -1,10 +1,13 @@
 import express from 'express';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
 import { createFileContentHandler, FILE_CONTENT_CSP } from '../../server/fileContent.js';
+
+const hasMkfifo = spawnSync('sh', ['-c', 'command -v mkfifo >/dev/null 2>&1']).status === 0;
 
 interface TestServer {
   baseUrl: string;
@@ -56,6 +59,7 @@ describe('file content endpoint', () => {
     mkdirSync(join(root, 'src'), { recursive: true });
     mkdirSync(outside, { recursive: true });
     writeFileSync(join(root, 'src', 'app.py'), 'print("hello")\n');
+    writeFileSync(join(root, 'src', '💥.txt'), 'unicode name\n');
     writeFileSync(join(outside, 'secret.txt'), 'secret');
     return { root, outside };
   }
@@ -107,6 +111,21 @@ describe('file content endpoint', () => {
     }
   });
 
+  it.runIf(hasMkfifo)('rejects FIFOs without waiting for a writer', async () => {
+    const { root } = makeWorkspace();
+    const fifoPath = join(root, 'src', 'pipe');
+    const result = spawnSync('mkfifo', [fifoPath]);
+    expect(result.status).toBe(0);
+    const server = await listen(makeApp({ root }));
+    try {
+      const response = await fetch(`${server.baseUrl}/api/file/content?path=src%2Fpipe`, { signal: AbortSignal.timeout(2000) });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({ error: 'path is not a file' });
+    } finally {
+      await server.close();
+    }
+  });
+
   it('streams file bytes with safe headers', async () => {
     const { root } = makeWorkspace();
     const expected = 'print("hello")\n';
@@ -120,7 +139,25 @@ describe('file content endpoint', () => {
       expect(response.headers.get('x-content-type-options')).toBe('nosniff');
       expect(response.headers.get('x-codex-file-size')).toBe(String(Buffer.byteLength(expected)));
       expect(response.headers.get('x-codex-file-modified-at-ms')).toMatch(/^\d+(\.\d+)?$/);
+      expect(response.headers.get('content-length')).toBe(String(Buffer.byteLength(expected)));
+      expect(response.headers.get('last-modified')).toBeTruthy();
       expect(await response.text()).toBe(expected);
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('uses an ASCII-safe content disposition for Unicode filenames', async () => {
+    const { root } = makeWorkspace();
+    const server = await listen(makeApp({ root }));
+    try {
+      const response = await fetch(`${server.baseUrl}/api/file/content?path=src%2F%F0%9F%92%A5.txt`);
+      expect(response.status).toBe(200);
+      const disposition = response.headers.get('content-disposition');
+      expect(disposition).toContain('inline; filename=');
+      expect(disposition).toContain("filename*=UTF-8''%F0%9F%92%A5.txt");
+      expect(disposition && /^[\x00-\x7f]*$/.test(disposition)).toBe(true);
+      expect(await response.text()).toBe('unicode name\n');
     } finally {
       await server.close();
     }

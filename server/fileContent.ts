@@ -13,7 +13,21 @@ function getQueryPath(req: express.Request): string | null {
 }
 
 function contentDispositionFilename(filePath: string): string {
-  return path.basename(filePath).replace(/["\\\r\n]/g, '_') || 'file';
+  return path.basename(filePath) || 'file';
+}
+
+function asciiHeaderFilename(fileName: string): string {
+  const fallback = fileName.replace(/[^\x20-\x7e]|["\\\r\n]/g, '_').trim();
+  return fallback || 'file';
+}
+
+function rfc5987Filename(fileName: string): string {
+  return encodeURIComponent(fileName).replace(/['()*]/g, (char) => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+}
+
+function contentDispositionHeader(filePath: string): string {
+  const fileName = contentDispositionFilename(filePath);
+  return `inline; filename="${asciiHeaderFilename(fileName)}"; filename*=UTF-8''${rfc5987Filename(fileName)}`;
 }
 
 function isPathInsideRoot(resolvedRoot: string, resolvedTarget: string): boolean {
@@ -40,7 +54,8 @@ async function realPathForOpenedFile(fd: number): Promise<string> {
 export async function openContentFile(root: string, filePath: string): Promise<{ handle: FileHandle; realPath: string; stats: fs.Stats }> {
   const realRoot = await fsp.realpath(root);
   const lexicalPath = assertPathInsideRoot(root, filePath);
-  const handle = await fsp.open(lexicalPath, 'r');
+  const openFlags = fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK ?? 0);
+  const handle = await fsp.open(lexicalPath, openFlags);
 
   try {
     const [realPath, stats] = await Promise.all([realPathForOpenedFile(handle.fd), handle.stat()]);
@@ -74,13 +89,17 @@ export function createFileContentHandler(options: {
       res.setHeader('Cache-Control', 'no-store');
       res.setHeader('X-Content-Type-Options', 'nosniff');
       res.setHeader('Content-Security-Policy', FILE_CONTENT_CSP);
-      res.setHeader('Content-Disposition', `inline; filename="${contentDispositionFilename(realPath)}"`);
+      res.setHeader('Content-Disposition', contentDispositionHeader(realPath));
       if (req.method === 'HEAD') {
         await handle.close();
         return res.end();
       }
+      if (stats.size === 0) {
+        await handle.close();
+        return res.end();
+      }
 
-      const stream = handle.createReadStream({ autoClose: true });
+      const stream = handle.createReadStream({ autoClose: true, start: 0, end: stats.size - 1 });
       res.on('close', () => {
         if (!res.writableEnded) stream.destroy();
       });
