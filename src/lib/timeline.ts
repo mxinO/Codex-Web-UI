@@ -4,7 +4,7 @@ import type { CodexRunOptions } from '../types/ui';
 type TimelineItemOrder = { sortOrder?: number | null };
 
 export type TimelineItem = TimelineItemOrder & (
-  | { id: string; kind: 'user'; timestamp: number; text: string }
+  | { id: string; kind: 'user'; timestamp: number; text: string; turnId?: string | null }
   | {
       id: string;
       kind: 'assistant';
@@ -355,7 +355,7 @@ export function turnToTimelineItems(turn: CodexTurn): TimelineItem[] {
     const id = safeItemId(turn, item, index);
     if (item.type === 'webuiFileChangeSummary') return [];
     if (item.type === 'fileChange') return fileChangeItemsForTurnItem({ ...turn, items }, item, index, timestamp);
-    if (item.type === 'userMessage') return [{ id, kind: 'user', timestamp, text: userText(item) }];
+    if (item.type === 'userMessage') return [{ id, kind: 'user', timestamp, text: userText(item), turnId: turn.id }];
     if (item.type === 'agentMessage') {
       return [{
         id,
@@ -1075,10 +1075,24 @@ export function claimedQueuedUserItemsWithoutHistory<T extends Extract<TimelineI
   const visible = pendingItems.filter(
     (pending) =>
       !historyItems.some(
-        (item) => item.kind === 'user' && item.text.trim() === pending.text.trim() && item.timestamp >= pending.timestamp,
+        (item) =>
+          item.kind === 'user' &&
+          item.text.trim() === pending.text.trim() &&
+          ((pending.turnId && item.turnId === pending.turnId) || item.timestamp >= pending.timestamp),
       ),
   );
   return visible.length > CLAIMED_QUEUED_USER_ITEM_LIMIT ? visible.slice(-CLAIMED_QUEUED_USER_ITEM_LIMIT) : visible;
+}
+
+export function retargetSyntheticUserItemsToTurn<T extends Extract<TimelineItem, { kind: 'user' }>>(items: T[], turnId: string | null | undefined): T[] {
+  if (!turnId || isSyntheticPendingTurnId(turnId)) return items;
+  let changed = false;
+  const next = items.map((item) => {
+    if (!item.turnId || !isSyntheticPendingTurnId(item.turnId)) return item;
+    changed = true;
+    return { ...item, turnId };
+  });
+  return changed ? next : items;
 }
 
 function liveCurrentDuplicateKey(item: TimelineItem): string {
@@ -1139,6 +1153,7 @@ export function claimedQueuedUserItemsFromQueueTransition(
       timestamp: message.createdAt,
       sortOrder: sortOrderForId(id),
       text: message.text,
+      turnId: currentTurnId,
     };
   });
 }

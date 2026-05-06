@@ -121,7 +121,7 @@ function ChatItem({
         <QueueCard
           message={item.message}
           onEdit={(message) => onQueuedEdit?.(message)}
-          onRemove={(id) => onQueuedRemove?.(id)}
+          onRemove={(message) => onQueuedRemove?.(message.id)}
         />
       </div>
     );

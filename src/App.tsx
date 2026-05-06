@@ -9,6 +9,7 @@ import FileExplorer from './components/FileExplorer';
 import Header from './components/Header';
 import ImageViewerModal from './components/ImageViewerModal';
 import InputBox from './components/InputBox';
+import QueueTray from './components/QueueTray';
 import SessionPicker from './components/SessionPicker';
 import { useCodexSocket } from './hooks/useCodexSocket';
 import { useQueue, type ClientQueuedMessage } from './hooks/useQueue';
@@ -47,6 +48,7 @@ import {
   notificationMatchesActiveTurn,
   pendingUserItemsWithoutHistory,
   requestKey,
+  retargetSyntheticUserItemsToTurn,
   timelineItemsWithLiveTurnOverlay,
   visibleRetainedLiveTurnItemsForTimeline,
   visibleLiveTurnItemsForTimeline,
@@ -319,17 +321,6 @@ export default function App() {
     () => retainedFileSummaryItems.filter((item) => !historyFileSummaryTurnIds.has(item.turnId)),
     [historyFileSummaryTurnIds, retainedFileSummaryItems],
   );
-  const queuedTimelineItems = useMemo<TimelineItem[]>(
-    () =>
-      queuedMessages.map((message) => ({
-        id: `queued:${message.id}`,
-        kind: 'queued',
-        timestamp: message.createdAt,
-        sortOrder: localSortOrder(`queued:${message.id}`),
-        message,
-      })),
-    [localSortOrder, queuedMessages],
-  );
   const approvalItems = useMemo(
     () =>
       approvalItemsFromRequests(socket.requests, answeredApprovals).map((item) => ({
@@ -346,12 +337,11 @@ export default function App() {
       ...visibleRetainedFileSummaryItems,
       ...pendingUserItems,
       ...claimedQueuedUserItems,
-      ...queuedTimelineItems,
       ...ephemeralItems,
       ...visibleLiveTurnItems,
       ...approvalItems,
     ]);
-  }, [approvalItems, claimedQueuedUserItems, ephemeralItems, pendingUserItems, queuedTimelineItems, timeline.isViewingLatest, timeline.items, timelineItemsForChat, visibleLiveTurnItems, visibleRetainedFileSummaryItems, visibleRetainedLiveTurnItems]);
+  }, [approvalItems, claimedQueuedUserItems, ephemeralItems, pendingUserItems, timeline.isViewingLatest, timeline.items, timelineItemsForChat, visibleLiveTurnItems, visibleRetainedFileSummaryItems, visibleRetainedLiveTurnItems]);
   const runOptions = useMemo<CodexRunOptions>(() => ({ model, mode: effectiveMode(mode, model), effort, sandbox }), [effort, mode, model, sandbox]);
   const serverModel = sanitizeStoredModel(state?.model ?? null);
   const serverEffort = sanitizeStoredEffort(state?.effort ?? null);
@@ -495,6 +485,14 @@ export default function App() {
   }, [pendingTurnWindow, state?.activeTurnId]);
 
   useEffect(() => {
+    setClaimedQueuedUserItems((items) => {
+      const retargeted = retargetSyntheticUserItemsToTurn(items, state?.activeTurnId);
+      const next = claimedQueuedUserItemsWithoutHistory(timeline.items, retargeted);
+      return next === items ? items : next;
+    });
+  }, [state?.activeTurnId, timeline.items]);
+
+  useEffect(() => {
     if (!pendingCompactionThreadId) return;
     if (activeThreadId !== pendingCompactionThreadId || state?.activeTurnId) setPendingCompactionThreadId(null);
   }, [activeThreadId, pendingCompactionThreadId, state?.activeTurnId]);
@@ -554,7 +552,6 @@ export default function App() {
 
   useEffect(() => {
     setPendingUserItems((items) => pendingUserItemsWithoutHistory(timeline.items, items));
-    setClaimedQueuedUserItems((items) => claimedQueuedUserItemsWithoutHistory(timeline.items, items));
   }, [timeline.items]);
 
   useEffect(() => {
@@ -854,12 +851,13 @@ export default function App() {
     }
   }, [removeFromQueue]);
 
-  const removeQueued = useCallback(async (id: string): Promise<boolean> => {
+  const removeQueued = useCallback(async (message: ClientQueuedMessage): Promise<boolean> => {
     setSessionError(null);
     try {
-      const result = await removeFromQueue(id, (removeResult) => {
-        if (removeResult.removed) manuallyRemovedQueuedIdsRef.current.add(id);
+      const result = await removeFromQueue(message.id, (removeResult) => {
+        if (removeResult.removed) manuallyRemovedQueuedIdsRef.current.add(message.id);
       });
+      if (result.removed) setComposerDraft(message.text);
       return result.removed;
     } catch (error) {
       setSessionError(error instanceof Error ? error.message : String(error));
@@ -922,11 +920,16 @@ export default function App() {
     void editQueued(message as ClientQueuedMessage);
   }, [editQueued]);
 
-  const handleQueuedRemove = useCallback((id: string) => {
-    void removeQueued(id).then((removed) => {
-      if (!removed) manuallyRemovedQueuedIdsRef.current.delete(id);
+  const handleQueuedRemove = useCallback((message: ClientQueuedMessage) => {
+    void removeQueued(message).then((removed) => {
+      if (!removed) manuallyRemovedQueuedIdsRef.current.delete(message.id);
     });
   }, [removeQueued]);
+
+  const handleQueuedTimelineRemove = useCallback((id: string) => {
+    const message = queuedMessages.find((candidate) => candidate.id === id);
+    if (message) handleQueuedRemove(message);
+  }, [handleQueuedRemove, queuedMessages]);
 
   const handleOpenMentionedFile = useCallback((path: string) => {
     void openFile(normalizeMentionedFilePath(path), true);
@@ -1016,7 +1019,7 @@ export default function App() {
                   onOpenDetail={openDetailItem}
                   onApprovalDecision={respondToApproval}
                   onQueuedEdit={handleQueuedEdit}
-                  onQueuedRemove={handleQueuedRemove}
+                  onQueuedRemove={handleQueuedTimelineRemove}
                   onOpenFileSummary={openFileSummaryDiff}
                   onOpenMentionedFile={handleOpenMentionedFile}
                 />
@@ -1025,6 +1028,7 @@ export default function App() {
               )}
             </div>
             {activeFileSummary && <FileChangeTray summary={activeFileSummary} onOpenDiff={openFileSummaryDiff} />}
+            <QueueTray messages={queuedMessages} onEdit={handleQueuedEdit} onCancel={handleQueuedRemove} />
             <InputBox
               rpc={socket.rpc}
               threadId={activeThreadId}

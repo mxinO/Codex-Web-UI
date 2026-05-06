@@ -401,12 +401,33 @@ input:focus-visible {
   padding: 32px 18px 18px;
 }
 
-.queue-list {
+.queue-tray {
   flex: 0 0 auto;
   width: min(920px, 100%);
   max-height: min(34vh, 260px);
   margin: 0 auto;
-  padding: 8px 16px;
+  padding: 8px 16px 0;
+  border-top: 1px solid var(--border);
+  background: color-mix(in srgb, var(--bg-primary) 88%, var(--bg-secondary));
+}
+
+.queue-tray__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  min-height: 24px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.queue-tray__header small {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.queue-tray__list {
+  max-height: min(28vh, 220px);
   overflow-y: auto;
 }
 
@@ -422,7 +443,8 @@ input:focus-visible {
   background: var(--bg-secondary);
 }
 
-.chat-row--user .queued-message {
+.chat-row--user .queued-message,
+.queue-tray .queued-message {
   width: min(720px, 86%);
   margin-left: auto;
   background: color-mix(in srgb, var(--user-bubble) 72%, var(--surface-raised));

@@ -16,6 +16,7 @@ import {
   liveTimelineItemsFromNotifications,
   liveTurnItemsFromNotifications,
   requestKey,
+  retargetSyntheticUserItemsToTurn,
   pendingUserItemsWithoutHistory,
   shouldShowLiveStreamingItem,
   timelineItemsWithLiveTurnOverlay,
@@ -302,7 +303,7 @@ describe('timeline', () => {
 
     expect(() => turnToTimelineItems(turn)).not.toThrow();
     expect(turnToTimelineItems(turn)).toEqual([
-      { id: 'turn-2:0', kind: 'user', timestamp: 0, text: '' },
+      { id: 'turn-2:0', kind: 'user', timestamp: 0, text: '', turnId: 'turn-2' },
       { id: 'turn-2:r1', kind: 'notice', timestamp: 0, text: '' },
     ]);
   });
@@ -1562,7 +1563,14 @@ describe('timeline', () => {
     );
 
     expect(claimed).toEqual([
-      { id: 'claimed-queued:user:queued-1', kind: 'user', timestamp: 1000, sortOrder: 10, text: 'queued prompt' },
+      {
+        id: 'claimed-queued:user:queued-1',
+        kind: 'user',
+        timestamp: 1000,
+        sortOrder: 10,
+        text: 'queued prompt',
+        turnId: 'turn-start-pending:thread-1',
+      },
     ]);
     expect(pendingUserItemsWithoutHistory([], claimed)).toEqual(claimed);
     expect(
@@ -1583,6 +1591,65 @@ describe('timeline', () => {
     ).toEqual([]);
   });
 
+  it('confirms a steered queued prompt from finalized history for the same turn even when history uses the turn start timestamp', () => {
+    const claimed: Extract<TimelineItem, { kind: 'user' }>[] = [
+      { id: 'claimed-queued:user:queued-1', kind: 'user', timestamp: 2000, sortOrder: 10, text: 'same turn', turnId: 'turn-1' },
+    ];
+
+    expect(
+      claimedQueuedUserItemsWithoutHistory([{ id: 'turn-1:u1', kind: 'user', timestamp: 1000, text: 'same turn', turnId: 'turn-1' }], claimed),
+    ).toEqual([]);
+    expect(
+      claimedQueuedUserItemsWithoutHistory([{ id: 'turn-2:u1', kind: 'user', timestamp: 1000, text: 'same turn', turnId: 'turn-2' }], claimed),
+    ).toEqual(claimed);
+  });
+
+  it('does not confirm a queued-turn claim with a synthetic pending turn id from unrelated finalized history', () => {
+    const claimed: Extract<TimelineItem, { kind: 'user' }>[] = [
+      {
+        id: 'claimed-queued:user:queued-1',
+        kind: 'user',
+        timestamp: 2000,
+        sortOrder: 10,
+        text: 'started from queue',
+        turnId: 'turn-start-pending:thread-1',
+      },
+    ];
+
+    expect(
+      claimedQueuedUserItemsWithoutHistory(
+        [{ id: 'turn-real:u1', kind: 'user', timestamp: 1000, text: 'started from queue', turnId: 'turn-real' }],
+        claimed,
+      ),
+    ).toEqual(claimed);
+    expect(
+      claimedQueuedUserItemsWithoutHistory([{ id: 'turn-old:u1', kind: 'user', timestamp: 1000, text: 'started from queue', turnId: 'turn-old' }], claimed),
+    ).toEqual(claimed);
+  });
+
+  it('retargets synthetic queued claims to the real active turn before history cleanup', () => {
+    const claimed: Extract<TimelineItem, { kind: 'user' }>[] = [
+      {
+        id: 'claimed-queued:user:queued-1',
+        kind: 'user',
+        timestamp: 2000,
+        sortOrder: 10,
+        text: 'started from queue',
+        turnId: 'turn-start-pending:thread-1',
+      },
+    ];
+
+    const retargeted = retargetSyntheticUserItemsToTurn(claimed, 'turn-real');
+
+    expect(retargeted).toEqual([{ ...claimed[0], turnId: 'turn-real' }]);
+    expect(
+      claimedQueuedUserItemsWithoutHistory(
+        [{ id: 'turn-real:u1', kind: 'user', timestamp: 1000, text: 'started from queue', turnId: 'turn-real' }],
+        retargeted,
+      ),
+    ).toEqual([]);
+  });
+
   it('claims a timed-out queued prompt when a late real turn starts from idle', () => {
     const claimed = claimedQueuedUserItemsFromQueueTransition(
       [{ id: 'queued-1', text: 'late prompt', createdAt: 1000 }],
@@ -1593,7 +1660,7 @@ describe('timeline', () => {
     );
 
     expect(claimed).toEqual([
-      { id: 'claimed-queued:user:queued-1', kind: 'user', timestamp: 1000, sortOrder: 10, text: 'late prompt' },
+      { id: 'claimed-queued:user:queued-1', kind: 'user', timestamp: 1000, sortOrder: 10, text: 'late prompt', turnId: 'turn-late' },
     ]);
   });
 
@@ -1627,7 +1694,14 @@ describe('timeline', () => {
     );
 
     expect(claimed).toEqual([
-      { id: 'claimed-queued:user:queued-1', kind: 'user', timestamp: 1000, sortOrder: 10, text: 'first' },
+      {
+        id: 'claimed-queued:user:queued-1',
+        kind: 'user',
+        timestamp: 1000,
+        sortOrder: 10,
+        text: 'first',
+        turnId: 'turn-start-pending:thread-1',
+      },
     ]);
   });
 
@@ -1645,7 +1719,7 @@ describe('timeline', () => {
     );
 
     expect(claimed).toEqual([
-      { id: 'claimed-queued:user:queued-2', kind: 'user', timestamp: 1001, sortOrder: 10, text: 'started next turn' },
+      { id: 'claimed-queued:user:queued-2', kind: 'user', timestamp: 1001, sortOrder: 10, text: 'started next turn', turnId: 'turn-2' },
     ]);
   });
 
@@ -1662,7 +1736,7 @@ describe('timeline', () => {
     );
 
     expect(claimed).toEqual([
-      { id: 'claimed-queued:user:queued-1', kind: 'user', timestamp: 1000, sortOrder: 10, text: 'steered' },
+      { id: 'claimed-queued:user:queued-1', kind: 'user', timestamp: 1000, sortOrder: 10, text: 'steered', turnId: 'turn-1' },
     ]);
   });
 
@@ -1686,6 +1760,7 @@ describe('timeline', () => {
         timestamp: 1000,
         sortOrder: 'claimed-queued:user:queued-1'.length,
         text: 'first steered',
+        turnId: 'turn-1',
       },
       {
         id: 'claimed-queued:user:queued-2',
@@ -1693,6 +1768,7 @@ describe('timeline', () => {
         timestamp: 1001,
         sortOrder: 'claimed-queued:user:queued-2'.length,
         text: 'second steered',
+        turnId: 'turn-1',
       },
     ]);
   });
@@ -1711,7 +1787,7 @@ describe('timeline', () => {
     );
 
     expect(claimed).toEqual([
-      { id: 'claimed-queued:user:queued-2', kind: 'user', timestamp: 1001, sortOrder: 10, text: 'sent by steer' },
+      { id: 'claimed-queued:user:queued-2', kind: 'user', timestamp: 1001, sortOrder: 10, text: 'sent by steer', turnId: 'turn-1' },
     ]);
   });
 

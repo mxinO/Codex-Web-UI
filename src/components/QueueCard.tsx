@@ -3,7 +3,7 @@ import type { ClientQueuedMessage } from '../hooks/useQueue';
 interface QueueCardProps {
   message: ClientQueuedMessage;
   onEdit: (message: ClientQueuedMessage) => void;
-  onRemove: (id: string) => void;
+  onRemove: (message: ClientQueuedMessage) => void;
 }
 
 export default function QueueCard({ message, onEdit, onRemove }: QueueCardProps) {
@@ -15,7 +15,7 @@ export default function QueueCard({ message, onEdit, onRemove }: QueueCardProps)
         <button className="text-button" type="button" onClick={() => onEdit(message)}>
           Edit
         </button>
-        <button className="text-button" type="button" onClick={() => onRemove(message.id)}>
+        <button className="text-button" type="button" onClick={() => onRemove(message)}>
           Cancel
         </button>
       </div>
