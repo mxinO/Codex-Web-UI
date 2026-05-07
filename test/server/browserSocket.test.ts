@@ -290,6 +290,386 @@ describe('attachBrowserSocket session RPCs', () => {
     });
   });
 
+  it('keeps a newly started empty session active when history has no rollout yet', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/start') return { thread: { id: 'thread-empty', cwd: '/work/project' } } as T;
+      if (method === 'thread/turns/list') throw new Error('no rollout found for thread id thread-empty');
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 21, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    const [startResponse, hello] = await startMessages;
+
+    expect(startResponse).toEqual({
+      type: 'rpc/result',
+      id: 21,
+      result: { thread: { id: 'thread-empty', cwd: '/work/project' } },
+    });
+    expect(hello).toMatchObject({
+      type: 'server/hello',
+      state: { activeThreadId: 'thread-empty', activeCwd: '/work/project' },
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 22, method: 'thread/turns/list', params: { threadId: 'thread-empty' } }));
+    expect(await nextRpcResponse(ws, 22)).toEqual({
+      type: 'rpc/result',
+      id: 22,
+      result: { data: [], nextCursor: null },
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeCwd: '/work/project' });
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/start', 'thread/turns/list']);
+  });
+
+  it('keeps a newly started empty session active when initial history finishes after the first prompt starts', async () => {
+    const turns = deferred<unknown>();
+    const start = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/start') return Promise.resolve({ thread: { id: 'thread-empty', cwd: '/work/project' } } as T);
+      if (method === 'thread/turns/list') return turns.promise as Promise<T>;
+      if (method === 'turn/start') return start.promise as Promise<T>;
+      return Promise.reject(new Error(`unexpected method: ${method}`));
+    });
+    const { ws, stateStore } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 31, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await startMessages;
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 32, method: 'thread/turns/list', params: { threadId: 'thread-empty' } }));
+    await waitForRequestCalls(request, 2);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 33, method: 'webui/turn/start', params: { threadId: 'thread-empty', text: 'hello' } }));
+    await waitForRequestCalls(request, 3);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeTurnId: 'turn-start-pending:thread-empty' });
+
+    turns.reject(new Error('no rollout found for thread id thread-empty'));
+    expect(await nextRpcResponse(ws, 32)).toEqual({
+      type: 'rpc/result',
+      id: 32,
+      result: { data: [], nextCursor: null },
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeTurnId: 'turn-start-pending:thread-empty' });
+
+    start.resolve({ turn: { id: 'turn-real' } });
+    expect(await nextRpcResponse(ws, 33)).toEqual({ type: 'rpc/result', id: 33, result: { turn: { id: 'turn-real' } } });
+    await flushPromises();
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeTurnId: 'turn-real' });
+  });
+
+  it('does not let a stale empty-history failure clear the first real turn', async () => {
+    const turns = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/start') return Promise.resolve({ thread: { id: 'thread-empty', cwd: '/work/project' } } as T);
+      if (method === 'thread/turns/list') return turns.promise as Promise<T>;
+      if (method === 'turn/start') return Promise.resolve({ turn: { id: 'turn-real' } } as T);
+      return Promise.reject(new Error(`unexpected method: ${method}`));
+    });
+    const { ws, stateStore } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 37, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await startMessages;
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 38, method: 'thread/turns/list', params: { threadId: 'thread-empty' } }));
+    await waitForRequestCalls(request, 2);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 39, method: 'webui/turn/start', params: { threadId: 'thread-empty', text: 'hello' } }));
+    expect(await nextRpcResponse(ws, 39)).toEqual({ type: 'rpc/result', id: 39, result: { turn: { id: 'turn-real' } } });
+    await flushPromises();
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeTurnId: 'turn-real' });
+
+    turns.reject(new Error('no rollout found for thread id thread-empty'));
+    expect(await nextRpcResponse(ws, 38)).toEqual({
+      type: 'rpc/result',
+      id: 38,
+      result: { data: [], nextCursor: null },
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeTurnId: 'turn-real' });
+  });
+
+  it('does not hide a missing newly started session when Codex reports thread not found', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/start') return { thread: { id: 'thread-empty', cwd: '/work/project' } } as T;
+      if (method === 'thread/turns/list') throw new Error('thread not found');
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 26, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await startMessages;
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 27, method: 'thread/turns/list', params: { threadId: 'thread-empty' } }));
+    expect(await nextRpcResponse(ws, 27)).toEqual({
+      type: 'rpc/error',
+      id: 27,
+      error: 'thread not found',
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: null, activeTurnId: null });
+  });
+
+  it('does not let an unscoped unrelated terminal notification remove the empty-session marker', async () => {
+    const start = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/start') return Promise.resolve({ thread: { id: 'thread-empty', cwd: '/work/project' } } as T);
+      if (method === 'turn/start') return start.promise as Promise<T>;
+      if (method === 'thread/turns/list') return Promise.reject(new Error('no rollout found for thread id thread-empty'));
+      return Promise.reject(new Error(`unexpected method: ${method}`));
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 34, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await startMessages;
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 35, method: 'webui/turn/start', params: { threadId: 'thread-empty', text: 'hello' } }));
+    await waitForRequestCalls(request, 2);
+
+    notify('turn/completed', { turnId: 'turn-unrelated' });
+    start.reject(new Error('turn/start failed'));
+    expect(await nextRpcResponse(ws, 35)).toEqual({
+      type: 'rpc/error',
+      id: 35,
+      error: 'turn/start failed',
+    });
+    await waitForActiveTurnCleared(stateStore);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 36, method: 'thread/turns/list', params: { threadId: 'thread-empty' } }));
+    expect(await nextRpcResponse(ws, 36)).toEqual({
+      type: 'rpc/result',
+      id: 36,
+      result: { data: [], nextCursor: null },
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeTurnId: null });
+  });
+
+  it('does not let an unscoped unrelated task start remove the empty-session marker', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/start') return { thread: { id: 'thread-empty', cwd: '/work/project' } } as T;
+      if (method === 'thread/turns/list') throw new Error('no rollout found for thread id thread-empty');
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notifyRaw } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 40, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await startMessages;
+
+    notifyRaw({ jsonrpc: '2.0', method: 'event_msg', payload: { type: 'task_started', turn_id: 'turn-unrelated' } });
+    await flushPromises();
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeTurnId: null });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 41, method: 'thread/turns/list', params: { threadId: 'thread-empty' } }));
+    expect(await nextRpcResponse(ws, 41)).toEqual({
+      type: 'rpc/result',
+      id: 41,
+      result: { data: [], nextCursor: null },
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeTurnId: null });
+  });
+
+  it('keeps a started session active on no-rollout errors until history is readable', async () => {
+    const start = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/start') return Promise.resolve({ thread: { id: 'thread-empty', cwd: '/work/project' } } as T);
+      if (method === 'turn/start') return start.promise as Promise<T>;
+      if (method === 'thread/turns/list') return Promise.reject(new Error('no rollout found for thread id thread-empty'));
+      return Promise.reject(new Error(`unexpected method: ${method}`));
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 23, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await startMessages;
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 24, method: 'webui/turn/start', params: { threadId: 'thread-empty', text: 'hello' } }));
+    await waitForRequestCalls(request, 2);
+
+    notify('turn/started', { threadId: 'thread-empty', turnId: 'turn-real' });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeTurnId: 'turn-real' });
+
+    notify('turn/completed', { threadId: 'thread-empty', turnId: 'turn-real' });
+    await waitForActiveTurnCleared(stateStore);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 25, method: 'thread/turns/list', params: { threadId: 'thread-empty' } }));
+    expect(await nextRpcResponse(ws, 25)).toEqual({
+      type: 'rpc/result',
+      id: 25,
+      result: { data: [], nextCursor: null },
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeTurnId: null });
+
+    start.resolve({ turn: { id: 'turn-real' } });
+    expect(await nextRpcResponse(ws, 24)).toEqual({ type: 'rpc/result', id: 24, result: { turn: { id: 'turn-real' } } });
+  });
+
+  it('keeps a terminal-started session active on no-rollout errors until history is readable', async () => {
+    const start = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/start') return Promise.resolve({ thread: { id: 'thread-empty', cwd: '/work/project' } } as T);
+      if (method === 'turn/start') return start.promise as Promise<T>;
+      if (method === 'thread/turns/list') return Promise.reject(new Error('no rollout found for thread id thread-empty'));
+      return Promise.reject(new Error(`unexpected method: ${method}`));
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 28, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await startMessages;
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 29, method: 'webui/turn/start', params: { threadId: 'thread-empty', text: 'hello' } }));
+    await waitForRequestCalls(request, 2);
+
+    notify('turn/completed', { threadId: 'thread-empty', turnId: 'turn-terminal' });
+    start.reject(new Error('turn/start failed'));
+    expect(await nextRpcResponse(ws, 29)).toEqual({
+      type: 'rpc/error',
+      id: 29,
+      error: 'turn/start failed',
+    });
+    await waitForActiveTurnCleared(stateStore);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 30, method: 'thread/turns/list', params: { threadId: 'thread-empty' } }));
+    expect(await nextRpcResponse(ws, 30)).toEqual({
+      type: 'rpc/result',
+      id: 30,
+      result: { data: [], nextCursor: null },
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeTurnId: null });
+  });
+
+  it('stops hiding no-rollout errors after a newly started session history has loaded once', async () => {
+    let listCount = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/start') return { thread: { id: 'thread-empty', cwd: '/work/project' } } as T;
+      if (method === 'thread/turns/list') {
+        listCount += 1;
+        if (listCount === 1) return { data: [], nextCursor: null } as T;
+        throw new Error('no rollout found for thread id thread-empty');
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 42, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await startMessages;
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 43, method: 'thread/turns/list', params: { threadId: 'thread-empty' } }));
+    expect(await nextRpcResponse(ws, 43)).toEqual({
+      type: 'rpc/result',
+      id: 43,
+      result: { data: [], nextCursor: null },
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeTurnId: null });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 44, method: 'thread/turns/list', params: { threadId: 'thread-empty' } }));
+    expect(await nextRpcResponse(ws, 44)).toEqual({
+      type: 'rpc/error',
+      id: 44,
+      error: 'no rollout found for thread id thread-empty',
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: null, activeTurnId: null });
+  });
+
+  it('does not mask a stale no-rollout response after another history load succeeds', async () => {
+    const firstList = deferred<unknown>();
+    const secondList = deferred<unknown>();
+    let listCount = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/start') return Promise.resolve({ thread: { id: 'thread-empty', cwd: '/work/project' } } as T);
+      if (method === 'thread/turns/list') {
+        listCount += 1;
+        return (listCount === 1 ? firstList.promise : secondList.promise) as Promise<T>;
+      }
+      return Promise.reject(new Error(`unexpected method: ${method}`));
+    });
+    const { ws, stateStore } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 50, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await startMessages;
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 51, method: 'thread/turns/list', params: { threadId: 'thread-empty' } }));
+    ws.send(JSON.stringify({ type: 'rpc', id: 52, method: 'thread/turns/list', params: { threadId: 'thread-empty' } }));
+    await waitForRequestCalls(request, 3);
+
+    firstList.resolve({ data: [], nextCursor: null });
+    expect(await nextRpcResponse(ws, 51)).toEqual({
+      type: 'rpc/result',
+      id: 51,
+      result: { data: [], nextCursor: null },
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeTurnId: null });
+
+    secondList.reject(new Error('no rollout found for thread id thread-empty'));
+    expect(await nextRpcResponse(ws, 52)).toEqual({
+      type: 'rpc/error',
+      id: 52,
+      error: 'no rollout found for thread id thread-empty',
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: null, activeTurnId: null });
+  });
+
+  it('keeps a pending-rollout session active when resume reports no rollout during history load', async () => {
+    let listCount = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/start') return { thread: { id: 'thread-empty', cwd: '/work/project' } } as T;
+      if (method === 'thread/turns/list') {
+        listCount += 1;
+        if (listCount === 1) throw new Error('temporary history read failure');
+        return { data: [], nextCursor: null } as T;
+      }
+      if (method === 'thread/resume') throw new Error('no rollout found for thread id thread-empty');
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 45, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await startMessages;
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 46, method: 'thread/turns/list', params: { threadId: 'thread-empty' } }));
+    expect(await nextRpcResponse(ws, 46)).toEqual({
+      type: 'rpc/error',
+      id: 46,
+      error: 'temporary history read failure',
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeTurnId: null });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 47, method: 'thread/turns/list', params: { threadId: 'thread-empty' } }));
+    expect(await nextRpcResponse(ws, 47)).toEqual({
+      type: 'rpc/result',
+      id: 47,
+      result: { data: [], nextCursor: null },
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeTurnId: null });
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/start', 'thread/turns/list', 'thread/resume']);
+  });
+
+  it('does not mask no-rollout errors for a different thread id', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/start') return { thread: { id: 'thread-empty', cwd: '/work/project' } } as T;
+      if (method === 'thread/turns/list') throw new Error('no rollout found for thread id thread-other');
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 48, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await startMessages;
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 49, method: 'thread/turns/list', params: { threadId: 'thread-empty' } }));
+    expect(await nextRpcResponse(ws, 49)).toEqual({
+      type: 'rpc/error',
+      id: 49,
+      error: 'no rollout found for thread id thread-other',
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: null, activeTurnId: null });
+  });
+
   it('forwards run options when starting sessions', async () => {
     const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ thread: { id: 'thread-1', cwd: '/work/project' } });
     const { ws } = await makeHarness(request);

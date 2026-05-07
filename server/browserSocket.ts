@@ -1040,6 +1040,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const pendingTurnStartContexts: TurnContext[] = [];
   const pendingServerRequests = new Map<string, JsonRpcServerRequest>();
   const resumedThreadIds = new Set<string>();
+  const startedPendingRolloutThreadIds = new Set<string>();
   const resumeThreadPromises = new Map<string, Promise<void>>();
   const knownThreadPaths = new Map<string, string>();
   let appServerGeneration = 0;
@@ -1093,6 +1094,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const invalidateResumedThreads = () => {
     appServerGeneration += 1;
     resumedThreadIds.clear();
+    startedPendingRolloutThreadIds.clear();
     resumeThreadPromises.clear();
   };
 
@@ -1808,8 +1810,29 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     return /no rollout found for thread id|thread not found|thread .* not found/i.test(message);
   };
 
+  const noRolloutThreadIdFromError = (error: unknown): string | null => {
+    const message = error instanceof Error ? error.message : String(error);
+    return /no rollout found for thread id\s+([^\s'",}]+)/i.exec(message)?.[1] ?? null;
+  };
+
+  const isNoRolloutFoundError = (error: unknown, threadId?: string): boolean => {
+    const noRolloutThreadId = noRolloutThreadIdFromError(error);
+    if (!noRolloutThreadId) return false;
+    return threadId === undefined || noRolloutThreadId === threadId;
+  };
+
+  const shouldReturnEmptyTurnsForPendingRolloutThread = (threadId: string): boolean => {
+    const state = deps.stateStore.read();
+    return startedPendingRolloutThreadIds.has(threadId) && state.activeThreadId === threadId;
+  };
+
+  const markThreadRolloutObserved = (threadId: string | null | undefined): void => {
+    if (threadId) startedPendingRolloutThreadIds.delete(threadId);
+  };
+
   const clearMissingActiveThread = (threadId: string, error: unknown): HostRuntimeState => {
     resumedThreadIds.delete(threadId);
+    startedPendingRolloutThreadIds.delete(threadId);
     resumeThreadPromises.delete(threadId);
     knownThreadPaths.delete(threadId);
     const current = deps.stateStore.read();
@@ -1921,7 +1944,9 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       }
     })()
       .catch((error) => {
-        if (isMissingThreadError(error)) clearMissingActiveThread(threadId, error);
+        if (isMissingThreadError(error) && !(isNoRolloutFoundError(error, threadId) && shouldReturnEmptyTurnsForPendingRolloutThread(threadId))) {
+          clearMissingActiveThread(threadId, error);
+        }
         throw error;
       })
       .finally(() => {
@@ -2293,7 +2318,8 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     const notifiedThreadId = notificationThreadId(message);
     const pendingContext = takePendingTurnStartContext(notifiedThreadId);
     const current = deps.stateStore.read();
-    const threadId = notifiedThreadId ?? pendingContext?.threadId ?? current.activeThreadId;
+    const threadId = notifiedThreadId ?? pendingContext?.threadId ?? null;
+    if (!threadId) return;
     const threadPath =
       pendingContext?.threadPath ??
       (threadId && threadId === current.activeThreadId ? current.activeThreadPath : threadId ? knownThreadPaths.get(threadId) ?? null : null);
@@ -2455,7 +2481,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           const activeThreadPath = extractThreadPath(result);
           const runtimeStatus = runtimeStatusFromThreadResult(result, options);
           rememberKnownThreadPath(activeThreadId, activeThreadPath);
-          if (activeThreadId) resumedThreadIds.add(activeThreadId);
+          if (activeThreadId) {
+            resumedThreadIds.add(activeThreadId);
+            startedPendingRolloutThreadIds.add(activeThreadId);
+          }
           const state = deps.stateStore.update((state) => ({
             ...state,
             activeThreadId,
@@ -2757,10 +2786,23 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
               sortDirection: params.sortDirection,
             };
             result = await requestCodex('thread/turns/list', codexParams, THREAD_TURNS_LIST_RPC_TIMEOUT_MS);
+            markThreadRolloutObserved(params.threadId);
             const drain = drainPatchCaptureQueue();
             if (drain) await drain;
             result = augmentTurnListWithStoredFileSummaries(result, params.threadId);
           } catch (error) {
+            if (
+              isNoRolloutFoundError(error, params.threadId) &&
+              shouldReturnEmptyTurnsForPendingRolloutThread(params.threadId)
+            ) {
+              result = { data: [], nextCursor: null };
+              logWarn('Treating missing rollout for newly started empty thread as empty history', {
+                threadId: params.threadId,
+                error: error instanceof Error ? error.message : String(error),
+              });
+              send(ws, { type: 'rpc/result', id: request.id, result });
+              return;
+            }
             resumedThreadIds.delete(params.threadId);
             resumeThreadPromises.delete(params.threadId);
             if (isMissingThreadError(error)) clearMissingActiveThread(params.threadId, error);
