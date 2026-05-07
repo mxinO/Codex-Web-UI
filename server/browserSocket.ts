@@ -1807,7 +1807,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
   const isMissingThreadError = (error: unknown): boolean => {
     const message = error instanceof Error ? error.message : String(error);
-    return /no rollout found for thread id|failed to resolve rollout path|thread not found|thread .* not found/i.test(message);
+    return /no rollout found for thread id|failed to resolve rollout path|thread .* is not materialized yet|thread not found|thread .* not found/i.test(message);
   };
 
   const noRolloutThreadIdFromError = (error: unknown): string | null => {
@@ -1820,8 +1820,13 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     return /rollout-[^/\\`'"]*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl/i.exec(message)?.[1] ?? null;
   };
 
+  const unmaterializedThreadIdFromError = (error: unknown): string | null => {
+    const message = error instanceof Error ? error.message : String(error);
+    return /thread\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s+is not materialized yet/i.exec(message)?.[1] ?? null;
+  };
+
   const missingRolloutThreadIdFromError = (error: unknown): string | null =>
-    noRolloutThreadIdFromError(error) ?? rolloutPathThreadIdFromError(error);
+    noRolloutThreadIdFromError(error) ?? rolloutPathThreadIdFromError(error) ?? unmaterializedThreadIdFromError(error);
 
   const isNoRolloutFoundError = (error: unknown, threadId?: string): boolean => {
     const noRolloutThreadId = missingRolloutThreadIdFromError(error);

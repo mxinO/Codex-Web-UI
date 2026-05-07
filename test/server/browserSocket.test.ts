@@ -346,6 +346,30 @@ describe('attachBrowserSocket session RPCs', () => {
     expect(stateStore.read()).toMatchObject({ activeThreadId: threadId, activeCwd: '/work/project' });
   });
 
+  it('keeps a newly started empty session active when Codex says the thread is not materialized yet', async () => {
+    const threadId = '019e017f-2bbf-7d70-b603-7c0058b00d21';
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/start') return { thread: { id: threadId, cwd: '/work/project' } } as T;
+      if (method === 'thread/turns/list') {
+        throw new Error(`thread ${threadId} is not materialized yet; thread/turns/list is unavailable before first user message`);
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 223, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await startMessages;
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 224, method: 'thread/turns/list', params: { threadId } }));
+    expect(await nextRpcResponse(ws, 224)).toEqual({
+      type: 'rpc/result',
+      id: 224,
+      result: { data: [], nextCursor: null },
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: threadId, activeCwd: '/work/project' });
+  });
+
   it('keeps a newly started empty session active when initial history finishes after the first prompt starts', async () => {
     const turns = deferred<unknown>();
     const start = deferred<unknown>();
@@ -717,6 +741,31 @@ describe('attachBrowserSocket session RPCs', () => {
       type: 'rpc/error',
       id: 54,
       error: `failed to resolve rollout path \`/home/mxin/.codex/sessions/2026/05/07/rollout-2026-05-07T01-03-43-${otherThreadId}.jsonl\`: No such file or directory (os error 2)`,
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: null, activeTurnId: null });
+  });
+
+  it('does not mask not-materialized errors for a different thread id', async () => {
+    const activeThreadId = '019e017f-2bbf-7d70-b603-7c0058b00d21';
+    const otherThreadId = '019e0180-7803-7823-b889-f23b10627d14';
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/start') return { thread: { id: activeThreadId, cwd: '/work/project' } } as T;
+      if (method === 'thread/turns/list') {
+        throw new Error(`thread ${otherThreadId} is not materialized yet; thread/turns/list is unavailable before first user message`);
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 55, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await startMessages;
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 56, method: 'thread/turns/list', params: { threadId: activeThreadId } }));
+    expect(await nextRpcResponse(ws, 56)).toEqual({
+      type: 'rpc/error',
+      id: 56,
+      error: `thread ${otherThreadId} is not materialized yet; thread/turns/list is unavailable before first user message`,
     });
     expect(stateStore.read()).toMatchObject({ activeThreadId: null, activeTurnId: null });
   });
