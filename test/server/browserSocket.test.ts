@@ -322,6 +322,30 @@ describe('attachBrowserSocket session RPCs', () => {
     expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/start', 'thread/turns/list']);
   });
 
+  it('keeps a newly started empty session active when Codex reports a missing rollout file', async () => {
+    const threadId = '019e0176-cb05-71b2-9a45-1b3e1578e88f';
+    const missingRolloutError =
+      'failed to resolve rollout path `/home/mxin/.codex/sessions/2026/05/07/rollout-2026-05-07T01-03-43-019e0176-cb05-71b2-9a45-1b3e1578e88f.jsonl`: No such file or directory (os error 2)';
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/start') return { thread: { id: threadId, cwd: '/work/project' } } as T;
+      if (method === 'thread/turns/list') throw new Error(missingRolloutError);
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 221, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await startMessages;
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 222, method: 'thread/turns/list', params: { threadId } }));
+    expect(await nextRpcResponse(ws, 222)).toEqual({
+      type: 'rpc/result',
+      id: 222,
+      result: { data: [], nextCursor: null },
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: threadId, activeCwd: '/work/project' });
+  });
+
   it('keeps a newly started empty session active when initial history finishes after the first prompt starts', async () => {
     const turns = deferred<unknown>();
     const start = deferred<unknown>();
@@ -666,6 +690,33 @@ describe('attachBrowserSocket session RPCs', () => {
       type: 'rpc/error',
       id: 49,
       error: 'no rollout found for thread id thread-other',
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: null, activeTurnId: null });
+  });
+
+  it('does not mask missing rollout file errors for a different thread id', async () => {
+    const activeThreadId = '019e0176-cb05-71b2-9a45-1b3e1578e88f';
+    const otherThreadId = '019e0176-e292-7400-953e-e61fd9d8cc7c';
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/start') return { thread: { id: activeThreadId, cwd: '/work/project' } } as T;
+      if (method === 'thread/turns/list') {
+        throw new Error(
+          `failed to resolve rollout path \`/home/mxin/.codex/sessions/2026/05/07/rollout-2026-05-07T01-03-43-${otherThreadId}.jsonl\`: No such file or directory (os error 2)`,
+        );
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 53, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await startMessages;
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 54, method: 'thread/turns/list', params: { threadId: activeThreadId } }));
+    expect(await nextRpcResponse(ws, 54)).toEqual({
+      type: 'rpc/error',
+      id: 54,
+      error: `failed to resolve rollout path \`/home/mxin/.codex/sessions/2026/05/07/rollout-2026-05-07T01-03-43-${otherThreadId}.jsonl\`: No such file or directory (os error 2)`,
     });
     expect(stateStore.read()).toMatchObject({ activeThreadId: null, activeTurnId: null });
   });
