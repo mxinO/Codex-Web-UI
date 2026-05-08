@@ -111,6 +111,21 @@ describe('ChatTimeline', () => {
     expect(onJumpToLatest).toHaveBeenCalledTimes(1);
   });
 
+  it('restores latest mode when the user scrolls back to bottom after viewing older messages', () => {
+    const onJumpToLatest = vi.fn();
+    const items = Array.from({ length: INITIAL_RENDERED_GROUP_LIMIT + 5 }, (_, index) => userItem(index));
+
+    render(<ChatTimeline {...baseProps} items={items} showJumpToLatest onJumpToLatest={onJumpToLatest} />);
+
+    const scroller = document.querySelector<HTMLDivElement>('.chat-scroll');
+    setScrollMetrics(scroller!, { scrollTop: 700, scrollHeight: 1000, clientHeight: 300 });
+    act(() => {
+      scroller?.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    expect(onJumpToLatest).toHaveBeenCalledTimes(1);
+  });
+
   it('loads older messages when scrolling near the top', () => {
     const onLoadOlder = vi.fn();
 

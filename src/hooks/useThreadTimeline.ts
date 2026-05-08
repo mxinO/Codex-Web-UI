@@ -239,6 +239,7 @@ export function useThreadTimeline(
     setLoading(true);
     setLoadError(null);
     setRetryScheduled(false);
+    if (mode === 'replace') setIsViewingLatest(true);
     try {
       const result = await fetchLatestPage(threadId);
       if (!isCurrentRequest(threadId, generation)) return;
@@ -247,7 +248,6 @@ export function useThreadTimeline(
       setLoadedThreadId(threadId);
       const nextCursor = getNextCursor(result);
       setCursor((currentCursor) => (mode === 'replace' || isViewingLatestRef.current ? nextCursor : currentCursor));
-      if (mode === 'replace') setIsViewingLatest(true);
       setLoadError(null);
     } catch (error) {
       if (!isCurrentRequest(threadId, generation)) return;

@@ -859,6 +859,7 @@ describe('useThreadTimeline', () => {
     await act(async () => {
       currentTimeline?.jumpToLatest();
     });
+    expect((currentTimeline as HookResult & { isViewingLatest?: boolean })?.isViewingLatest).toBe(true);
     expect(rpc).toHaveBeenLastCalledWith('thread/turns/list', {
       threadId: 'thread-1',
       limit: 12,

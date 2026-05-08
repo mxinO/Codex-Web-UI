@@ -97,6 +97,7 @@ export default function ChatTimeline({
   const stickToBottomRef = useRef(true);
   const previousGroupLengthRef = useRef(0);
   const scrollPreservationRef = useRef<ScrollPreservation | null>(null);
+  const restoreLatestRequestedRef = useRef(false);
   const [visibleGroupCount, setVisibleGroupCount] = useState(INITIAL_RENDERED_GROUP_LIMIT);
   const groups = useMemo(() => groupTimelineItems(items), [items]);
   const hiddenLoadedGroupCount = Math.max(0, groups.length - visibleGroupCount);
@@ -144,6 +145,10 @@ export default function ChatTimeline({
   }, [groups.length, showJumpToLatest]);
 
   useEffect(() => {
+    if (!showJumpToLatest) restoreLatestRequestedRef.current = false;
+  }, [showJumpToLatest]);
+
+  useEffect(() => {
     const scroller = scrollerRef.current;
     const column = columnRef.current;
     if (!scroller || !column || typeof ResizeObserver === 'undefined') return;
@@ -182,10 +187,18 @@ export default function ChatTimeline({
   const collapseOlderLoadedGroupsAtBottom = (scroller: HTMLDivElement) => {
     if (visibleGroupCount <= INITIAL_RENDERED_GROUP_LIMIT) {
       if (scrollPreservationRef.current?.mode === 'server-prepend') scrollPreservationRef.current = null;
+      if (showJumpToLatest && !restoreLatestRequestedRef.current) {
+        restoreLatestRequestedRef.current = true;
+        onJumpToLatest();
+      }
       return;
     }
     preserveScrollForPrepend(scroller, 'next-layout');
     setVisibleGroupCount(INITIAL_RENDERED_GROUP_LIMIT);
+    if (showJumpToLatest && !restoreLatestRequestedRef.current) {
+      restoreLatestRequestedRef.current = true;
+      onJumpToLatest();
+    }
   };
 
   const handleScroll = (event: UIEvent<HTMLDivElement>) => {
