@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import http from 'node:http';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, truncateSync, writeFileSync } from 'node:fs';
 import fs from 'node:fs/promises';
@@ -203,6 +204,29 @@ async function waitForActiveTurnCleared(stateStore: HostStateStore): Promise<voi
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
   }
   throw new Error(`active turn was not cleared: ${stateStore.read().activeTurnId ?? '<null>'}`);
+}
+
+function git(cwd: string, args: string[], stdin?: string): string {
+  return execFileSync('git', args, { cwd, input: stdin, encoding: 'utf8' });
+}
+
+function initGitRepo(workspace: string, name = 'repo'): string {
+  const repo = join(workspace, name);
+  mkdirSync(repo);
+  git(repo, ['init']);
+  git(repo, ['config', 'user.name', 'Test User']);
+  git(repo, ['config', 'user.email', 'test@example.com']);
+  writeFileSync(join(repo, 'tracked.txt'), 'initial\n');
+  git(repo, ['add', 'tracked.txt']);
+  git(repo, ['commit', '-m', 'initial']);
+  return repo;
+}
+
+async function addRepoViaRpc(ws: WebSocket, repo: string, id = 349): Promise<{ repoId: string }> {
+  ws.send(JSON.stringify({ type: 'rpc', id, method: 'webui/git/repos/add', params: { path: repo } }));
+  const response = await nextRpcResponse(ws, id);
+  if (response.type !== 'rpc/result') throw new Error(`failed to add repo: ${response.error ?? '<unknown error>'}`);
+  return { repoId: (response.result as { repo: { id: string } }).repo.id };
 }
 
 afterEach(() => {
@@ -3088,6 +3112,341 @@ describe('attachBrowserSocket fs RPC wrappers', () => {
 
     expect(request).not.toHaveBeenCalled();
     expect(response).toEqual({ type: 'rpc/error', id: 34, error: 'unsupported RPC method: fs/readFile' });
+  });
+});
+
+describe('attachBrowserSocket workspace and git RPCs', () => {
+  it('browses workspace directories and rejects traversal above the active cwd', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request);
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-workspace-browse-'));
+    mkdirSync(join(workspace, 'src'));
+    const target = join(workspace, 'target');
+    mkdirSync(target);
+    symlinkSync(target, join(workspace, 'linked-target'), 'dir');
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    stateStore.write({ ...stateStore.read(), activeCwd: workspace });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 350, method: 'webui/fs/browseWorkspaceDirectory', params: { path: workspace } }));
+    expect(await nextRpcResponse(ws, 350)).toEqual({
+      type: 'rpc/result',
+      id: 350,
+      result: {
+        path: workspace,
+        parent: workspace,
+        truncated: false,
+        entries: [
+          { name: 'linked-target', path: join(workspace, 'linked-target'), isDirectory: true },
+          { name: 'src', path: join(workspace, 'src'), isDirectory: true },
+          { name: 'target', path: target, isDirectory: true },
+        ],
+      },
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 351, method: 'webui/fs/browseWorkspaceDirectory', params: { path: '..' } }));
+    expect(await nextRpcResponse(ws, 351)).toEqual({ type: 'rpc/error', id: 351, error: 'path is outside active workspace' });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('keeps workspace browse paths under a symlinked active cwd', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const realParent = mkdtempSync(join(tmpdir(), 'codex-webui-real-browse-'));
+    const linkParent = mkdtempSync(join(tmpdir(), 'codex-webui-link-browse-'));
+    const realWorkspace = join(realParent, 'workspace');
+    const linkedWorkspace = join(linkParent, 'workspace-link');
+    mkdirSync(realWorkspace);
+    mkdirSync(join(realWorkspace, 'repo'));
+    mkdirSync(join(realWorkspace, 'src'));
+    symlinkSync(realWorkspace, linkedWorkspace, 'dir');
+    cleanups.push(() => rmSync(realParent, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(linkParent, { recursive: true, force: true }));
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeCwd: linkedWorkspace });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 368, method: 'webui/fs/browseWorkspaceDirectory', params: { path: linkedWorkspace } }));
+    expect(await nextRpcResponse(ws, 368)).toEqual({
+      type: 'rpc/result',
+      id: 368,
+      result: {
+        path: linkedWorkspace,
+        parent: linkedWorkspace,
+        truncated: false,
+        entries: [
+          { name: 'repo', path: join(linkedWorkspace, 'repo'), isDirectory: true },
+          { name: 'src', path: join(linkedWorkspace, 'src'), isDirectory: true },
+        ],
+      },
+    });
+  });
+
+  it('rejects absolute workspace browse paths outside the active cwd', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-browse-absolute-'));
+    const outside = mkdtempSync(join(tmpdir(), 'codex-webui-browse-outside-'));
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(outside, { recursive: true, force: true }));
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeCwd: workspace });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 369, method: 'webui/fs/browseWorkspaceDirectory', params: { path: outside } }));
+    expect(await nextRpcResponse(ws, 369)).toEqual({ type: 'rpc/error', id: 369, error: 'path is outside active workspace' });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('rejects non-string workspace browse paths instead of browsing the active cwd', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-browse-invalid-'));
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeCwd: workspace });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 371, method: 'webui/fs/browseWorkspaceDirectory', params: { path: 42 } }));
+    expect(await nextRpcResponse(ws, 371)).toEqual({ type: 'rpc/error', id: 371, error: 'path is required' });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('does not list symlinked workspace browse children that escape the active cwd', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-browse-escape-'));
+    const outside = mkdtempSync(join(tmpdir(), 'codex-webui-browse-escape-outside-'));
+    mkdirSync(join(workspace, 'inside'));
+    mkdirSync(join(outside, 'external'));
+    symlinkSync(join(outside, 'external'), join(workspace, 'external-link'), 'dir');
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(outside, { recursive: true, force: true }));
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeCwd: workspace });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 370, method: 'webui/fs/browseWorkspaceDirectory', params: { path: workspace } }));
+    expect(await nextRpcResponse(ws, 370)).toEqual({
+      type: 'rpc/result',
+      id: 370,
+      result: {
+        path: workspace,
+        parent: workspace,
+        truncated: false,
+        entries: [{ name: 'inside', path: join(workspace, 'inside'), isDirectory: true }],
+      },
+    });
+  });
+
+  it('lists git repos only for the active cwd and rejects missing active cwd', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const workspaceA = mkdtempSync(join(tmpdir(), 'codex-webui-git-a-'));
+    const workspaceB = mkdtempSync(join(tmpdir(), 'codex-webui-git-b-'));
+    const repoA = initGitRepo(workspaceA, 'repo-a');
+    const repoB = initGitRepo(workspaceB, 'repo-b');
+    cleanups.push(() => rmSync(workspaceA, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(workspaceB, { recursive: true, force: true }));
+    const { ws, stateStore } = await makeHarness(request);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 352, method: 'webui/git/repos/list' }));
+    expect(await nextRpcResponse(ws, 352)).toEqual({ type: 'rpc/error', id: 352, error: 'no active cwd' });
+
+    const trackedA = { id: 'repo:a', path: repoA, label: 'repo-a', addedAt: 1 };
+    const trackedB = { id: 'repo:b', path: repoB, label: 'repo-b', addedAt: 2 };
+    stateStore.write({
+      ...stateStore.read(),
+      activeCwd: workspaceA,
+      gitWorkspaces: [
+        { cwd: workspaceA, repos: [trackedA] },
+        { cwd: workspaceB, repos: [trackedB] },
+      ],
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 353, method: 'webui/git/repos/list' }));
+    expect(await nextRpcResponse(ws, 353)).toEqual({ type: 'rpc/result', id: 353, result: { cwd: workspaceA, repos: [trackedA] } });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('adds git repos under the active cwd and deduplicates by repo root', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-git-add-'));
+    const repo = initGitRepo(workspace);
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeCwd: workspace });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 354, method: 'webui/git/repos/add', params: { path: repo } }));
+    const first = await nextRpcResponse(ws, 354);
+    expect(first).toMatchObject({ type: 'rpc/result', id: 354, result: { repo: { path: repo, label: 'repo', untrackedMode: 'normal' } } });
+    const repoId = (first.result as { repo: { id: string } }).repo.id;
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 355, method: 'webui/git/repos/add', params: { path: join(repo, '.') } }));
+    expect(await nextRpcResponse(ws, 355)).toMatchObject({
+      type: 'rpc/result',
+      id: 355,
+      result: { repo: { id: repoId, path: repo }, repos: [{ id: repoId, path: repo }] },
+    });
+    expect(stateStore.read().gitWorkspaces.find((workspaceState) => workspaceState.cwd === workspace)?.repos).toHaveLength(1);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('removes git repos only from the active-cwd workspace', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const workspaceA = mkdtempSync(join(tmpdir(), 'codex-webui-git-remove-a-'));
+    const workspaceB = mkdtempSync(join(tmpdir(), 'codex-webui-git-remove-b-'));
+    const repoA = initGitRepo(workspaceA, 'repo');
+    const repoB = initGitRepo(workspaceB, 'repo');
+    cleanups.push(() => rmSync(workspaceA, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(workspaceB, { recursive: true, force: true }));
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeCwd: workspaceA,
+      gitWorkspaces: [
+        { cwd: workspaceA, repos: [{ id: 'repo:same', path: repoA, label: 'repo', addedAt: 1 }] },
+        { cwd: workspaceB, repos: [{ id: 'repo:same', path: repoB, label: 'repo', addedAt: 2 }] },
+      ],
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 356, method: 'webui/git/repos/remove', params: { repoId: 'repo:same' } }));
+    expect(await nextRpcResponse(ws, 356)).toEqual({ type: 'rpc/result', id: 356, result: { repos: [] } });
+    expect(stateStore.read().gitWorkspaces.find((workspaceState) => workspaceState.cwd === workspaceB)?.repos).toHaveLength(1);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('returns git status entries from a temp repo', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-git-status-'));
+    const repo = initGitRepo(workspace);
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeCwd: workspace });
+    const { repoId } = await addRepoViaRpc(ws, repo);
+
+    writeFileSync(join(repo, 'tracked.txt'), 'changed\n');
+    writeFileSync(join(repo, 'staged.txt'), 'staged\n');
+    git(repo, ['add', 'staged.txt']);
+    writeFileSync(join(repo, 'notes.md'), 'untracked\n');
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 357, method: 'webui/git/status', params: { repoId } }));
+    const response = await nextRpcResponse(ws, 357);
+    expect(response.type).toBe('rpc/result');
+    expect((response.result as { entries: unknown[] }).entries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ path: 'tracked.txt', kind: 'unstaged', worktreeStatus: 'M' }),
+        expect.objectContaining({ path: 'staged.txt', kind: 'staged', indexStatus: 'A' }),
+        expect.objectContaining({ path: 'notes.md', kind: 'untracked' }),
+      ]),
+    );
+  });
+
+  it('returns staged, unstaged, and untracked git diffs', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-git-diff-'));
+    const repo = initGitRepo(workspace);
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeCwd: workspace });
+    const { repoId } = await addRepoViaRpc(ws, repo);
+
+    writeFileSync(join(repo, 'tracked.txt'), 'unstaged\n');
+    writeFileSync(join(repo, 'staged.txt'), 'staged\n');
+    git(repo, ['add', 'staged.txt']);
+    writeFileSync(join(repo, 'untracked.txt'), 'untracked\n');
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 358, method: 'webui/git/diff', params: { repoId, path: 'staged.txt', scope: 'staged' } }));
+    expect(await nextRpcResponse(ws, 358)).toMatchObject({
+      type: 'rpc/result',
+      id: 358,
+      result: { repoId, path: 'staged.txt', scope: 'staged', patch: expect.stringContaining('+staged') },
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 359, method: 'webui/git/diff', params: { repoId, path: 'tracked.txt', scope: 'unstaged' } }));
+    expect(await nextRpcResponse(ws, 359)).toMatchObject({
+      type: 'rpc/result',
+      id: 359,
+      result: { repoId, path: 'tracked.txt', scope: 'unstaged', patch: expect.stringContaining('+unstaged') },
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 360, method: 'webui/git/diff', params: { repoId, path: 'untracked.txt', scope: 'untracked' } }));
+    expect(await nextRpcResponse(ws, 360)).toMatchObject({
+      type: 'rpc/result',
+      id: 360,
+      result: { repoId, path: 'untracked.txt', scope: 'untracked', patch: expect.stringContaining('+untracked') },
+    });
+  });
+
+  it('preserves leading and trailing spaces in git diff paths', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-git-diff-spaces-'));
+    const repo = initGitRepo(workspace);
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeCwd: workspace });
+    const { repoId } = await addRepoViaRpc(ws, repo);
+    const spacedPath = ' spaced.txt ';
+    writeFileSync(join(repo, spacedPath), 'initial spaced\n');
+    git(repo, ['add', spacedPath]);
+    git(repo, ['commit', '-m', 'add spaced path']);
+    writeFileSync(join(repo, spacedPath), 'changed spaced\n');
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 372, method: 'webui/git/diff', params: { repoId, path: spacedPath, scope: 'unstaged' } }));
+    expect(await nextRpcResponse(ws, 372)).toMatchObject({
+      type: 'rpc/result',
+      id: 372,
+      result: { repoId, path: spacedPath, scope: 'unstaged', patch: expect.stringContaining('+changed spaced') },
+    });
+  });
+
+  it('stages, unstages, and commits through git RPCs', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-git-mutate-'));
+    const repo = initGitRepo(workspace);
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeCwd: workspace });
+    const { repoId } = await addRepoViaRpc(ws, repo);
+
+    writeFileSync(join(repo, 'tracked.txt'), 'changed\n');
+    ws.send(JSON.stringify({ type: 'rpc', id: 361, method: 'webui/git/stage', params: { repoId, paths: ['tracked.txt'] } }));
+    expect(await nextRpcResponse(ws, 361)).toEqual({ type: 'rpc/result', id: 361, result: { ok: true } });
+    expect(git(repo, ['diff', '--cached', '--name-only']).trim()).toBe('tracked.txt');
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 362, method: 'webui/git/unstage', params: { repoId, paths: ['tracked.txt'] } }));
+    expect(await nextRpcResponse(ws, 362)).toEqual({ type: 'rpc/result', id: 362, result: { ok: true } });
+    expect(git(repo, ['diff', '--cached', '--name-only']).trim()).toBe('');
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 363, method: 'webui/git/stage', params: { repoId, paths: ['tracked.txt'] } }));
+    expect(await nextRpcResponse(ws, 363)).toEqual({ type: 'rpc/result', id: 363, result: { ok: true } });
+    ws.send(JSON.stringify({ type: 'rpc', id: 364, method: 'webui/git/commit', params: { repoId, message: 'browser commit' } }));
+    expect(await nextRpcResponse(ws, 364)).toMatchObject({ type: 'rpc/result', id: 364, result: { ok: true, commit: expect.any(String) } });
+    expect(git(repo, ['status', '--porcelain'])).toBe('');
+  });
+
+  it('rejects git mutation RPCs while a turn is active', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const workspace = mkdtempSync(join(tmpdir(), 'codex-webui-git-active-turn-'));
+    const repo = initGitRepo(workspace);
+    cleanups.push(() => rmSync(workspace, { recursive: true, force: true }));
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeCwd: workspace });
+    const { repoId } = await addRepoViaRpc(ws, repo);
+    writeFileSync(join(repo, 'tracked.txt'), 'changed\n');
+    stateStore.write({ ...stateStore.read(), activeTurnId: 'turn-1' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 365, method: 'webui/git/stage', params: { repoId, paths: ['tracked.txt'] } }));
+    expect(await nextRpcResponse(ws, 365)).toEqual({
+      type: 'rpc/error',
+      id: 365,
+      error: 'git mutation is disabled while a turn is active',
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 366, method: 'webui/git/unstage', params: { repoId, paths: ['tracked.txt'] } }));
+    expect(await nextRpcResponse(ws, 366)).toEqual({
+      type: 'rpc/error',
+      id: 366,
+      error: 'git mutation is disabled while a turn is active',
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 367, method: 'webui/git/commit', params: { repoId, message: 'blocked' } }));
+    expect(await nextRpcResponse(ws, 367)).toEqual({
+      type: 'rpc/error',
+      id: 367,
+      error: 'git mutation is disabled while a turn is active',
+    });
+    expect(git(repo, ['diff', '--cached', '--name-only']).trim()).toBe('');
   });
 });
 

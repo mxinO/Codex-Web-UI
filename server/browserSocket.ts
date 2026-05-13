@@ -10,6 +10,16 @@ import { isInteractiveCommandBlocked, runBangCommand } from './bangCommand.js';
 import type { ServerConfig } from './config.js';
 import { FileEditStore, sessionFileEditDbPath } from './fileEditStore.js';
 import {
+  addGitRepo,
+  gitCommit,
+  gitDiffForRepo,
+  gitStagePaths,
+  gitStatusForRepo,
+  gitUnstagePaths,
+  listGitRepos,
+  removeGitRepo,
+} from './gitTracker.js';
+import {
   assertPathInsideRoot,
   openExistingFileInsideRoot,
   readOpenedFileFully,
@@ -21,7 +31,7 @@ import type { HostStateStore } from './hostState.js';
 import type { JsonRpcServerRequest } from './jsonRpc.js';
 import { logWarn } from './logger.js';
 import { enqueueMessage, removeQueuedMessage, shiftQueuedMessage, updateQueuedMessage } from './queue.js';
-import type { CodexCollaborationMode, CodexReasoningEffort, CodexRunOptions, CodexSandboxMode, HostRuntimeState, QueuedMessage } from './types.js';
+import type { CodexCollaborationMode, CodexReasoningEffort, CodexRunOptions, CodexSandboxMode, GitDiffResult, HostRuntimeState, QueuedMessage } from './types.js';
 
 interface BrowserSocketDeps {
   config: ServerConfig;
@@ -138,9 +148,30 @@ function getString(params: unknown, key: string): string | null {
   return params[key];
 }
 
+function getRequiredRawString(params: unknown, key: string): string | null {
+  if (!isRecord(params) || typeof params[key] !== 'string') return null;
+  return params[key].length > 0 ? params[key] : null;
+}
+
+function getOptionalRawString(params: unknown, key: string): string | undefined {
+  if (!isRecord(params) || !hasOwn(params, key)) return undefined;
+  const value = params[key];
+  if (value === null || value === undefined) return undefined;
+  if (typeof value !== 'string') throw new Error(`${key} must be a string`);
+  if (value.length === 0) throw new Error(`${key} is required`);
+  return value;
+}
+
+function getRequiredStringArray(params: unknown, key: string): string[] | null {
+  if (!isRecord(params) || !Array.isArray(params[key])) return null;
+  const values = params[key];
+  return values.every((value) => typeof value === 'string') ? values : null;
+}
+
 const REASONING_EFFORTS = new Set<CodexReasoningEffort>(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
 const SANDBOX_MODES = new Set<CodexSandboxMode>(['read-only', 'workspace-write', 'danger-full-access']);
 const COLLABORATION_MODES = new Set<CodexCollaborationMode>(['default', 'plan']);
+const GIT_DIFF_SCOPES = new Set<GitDiffResult['scope']>(['staged', 'unstaged', 'untracked']);
 const BROWSE_DIRECTORY_LIMIT = 500;
 export const LEGACY_READ_FILE_MAX_BYTES = 5 * 1024 * 1024;
 const FILE_DIFF_SNAPSHOT_MAX_BYTES = 1024 * 1024;
@@ -475,6 +506,10 @@ function activeWorkspaceRoot(deps: BrowserSocketDeps): string {
   return activeCwd;
 }
 
+function assertNoActiveTurnForGitMutation(deps: BrowserSocketDeps): void {
+  if (deps.stateStore.read().activeTurnId) throw new Error('git mutation is disabled while a turn is active');
+}
+
 async function resolveReadableRpcPath(deps: BrowserSocketDeps, filePath: string): Promise<string> {
   return resolveExistingPathInsideRoot(activeWorkspaceRoot(deps), filePath);
 }
@@ -576,6 +611,36 @@ async function browseDirectory(deps: BrowserSocketDeps, requestedPath: string) {
   };
 }
 
+async function browseWorkspaceDirectory(deps: BrowserSocketDeps, requestedPath: string) {
+  const root = activeWorkspaceRoot(deps);
+  const lexicalRoot = nodePath.resolve(root);
+  const lexicalResolvedPath = assertPathInsideRoot(root, requestedPath);
+  const [realRoot, realResolvedPath] = await Promise.all([fs.realpath(root), resolveExistingPathInsideRoot(root, lexicalResolvedPath)]);
+  const stats = await fs.stat(realResolvedPath);
+  if (!stats.isDirectory()) throw new Error('path is not a directory');
+
+  const entries: Array<{ name: string; path: string; isDirectory: true }> = [];
+  const directory = await fs.opendir(realResolvedPath);
+  let truncated = false;
+  for await (const entry of directory) {
+    const realEntryPath = nodePath.join(realResolvedPath, entry.name);
+    if (!(await isBrowsableWorkspaceDirectoryEntry(realRoot, entry, realEntryPath))) continue;
+    if (entries.length >= BROWSE_DIRECTORY_LIMIT) {
+      truncated = true;
+      break;
+    }
+    entries.push({ name: entry.name, path: nodePath.join(lexicalResolvedPath, entry.name), isDirectory: true });
+  }
+
+  const parent = nodePath.dirname(lexicalResolvedPath);
+  return {
+    path: lexicalResolvedPath,
+    parent: isPathInsideRoot(lexicalRoot, parent) ? parent : lexicalResolvedPath,
+    truncated,
+    entries: entries.sort((a, b) => a.name.localeCompare(b.name)),
+  };
+}
+
 async function readDirectory(deps: BrowserSocketDeps, requestedPath: string) {
   const { lexicalPath, realPath } = await resolveReadableRpcPaths(deps, requestedPath);
   const stats = await fs.stat(realPath);
@@ -663,6 +728,17 @@ async function isBrowsableDirectoryEntry(entry: fsSync.Dirent, entryPath: string
 
   try {
     return (await fs.stat(entryPath)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+async function isBrowsableWorkspaceDirectoryEntry(realRoot: string, entry: fsSync.Dirent, entryPath: string): Promise<boolean> {
+  if (!entry.isDirectory() && !entry.isSymbolicLink()) return false;
+
+  try {
+    const [entryStats, realEntryPath] = await Promise.all([fs.stat(entryPath), fs.realpath(entryPath)]);
+    return entryStats.isDirectory() && isPathInsideRoot(realRoot, realEntryPath);
   } catch {
     return false;
   }
@@ -2776,6 +2852,140 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         if (request.method === 'webui/fs/browseDirectory') {
           const filePath = getRequiredString(request.params, 'path') ?? browseBasePath(deps);
           const result = await browseDirectory(deps, filePath);
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/fs/browseWorkspaceDirectory') {
+          let filePath = activeWorkspaceRoot(deps);
+          if (isRecord(request.params) && hasOwn(request.params, 'path')) {
+            const value = request.params.path;
+            if (typeof value !== 'string' || value.trim().length === 0) {
+              send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+              return;
+            }
+            filePath = value;
+          }
+          const result = await browseWorkspaceDirectory(deps, filePath);
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/git/repos/list') {
+          const result = await listGitRepos(deps.stateStore.read());
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/git/repos/add') {
+          const repoPath = getRequiredString(request.params, 'path');
+          if (!repoPath) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+            return;
+          }
+
+          const result = await addGitRepo(deps.stateStore.read(), deps.stateStore, repoPath);
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/git/repos/remove') {
+          const repoId = getRequiredString(request.params, 'repoId');
+          if (!repoId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'repoId is required' });
+            return;
+          }
+
+          const result = removeGitRepo(deps.stateStore.read(), deps.stateStore, repoId);
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/git/status') {
+          const repoId = getRequiredString(request.params, 'repoId');
+          if (!repoId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'repoId is required' });
+            return;
+          }
+
+          const result = await gitStatusForRepo(deps.stateStore.read(), repoId);
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/git/diff') {
+          const repoId = getRequiredString(request.params, 'repoId');
+          const filePath = getRequiredRawString(request.params, 'path');
+          const scope = getOptionalEnum(request.params, 'scope', GIT_DIFF_SCOPES);
+          if (!repoId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'repoId is required' });
+            return;
+          }
+          if (!filePath) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+            return;
+          }
+          if (!scope) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'scope is required' });
+            return;
+          }
+
+          const originalPath = getOptionalRawString(request.params, 'originalPath');
+          const result = await gitDiffForRepo(deps.stateStore.read(), { repoId, path: filePath, originalPath, scope });
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/git/stage') {
+          assertNoActiveTurnForGitMutation(deps);
+          const repoId = getRequiredString(request.params, 'repoId');
+          const paths = getRequiredStringArray(request.params, 'paths');
+          if (!repoId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'repoId is required' });
+            return;
+          }
+          if (!paths) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'paths are required' });
+            return;
+          }
+
+          const result = await gitStagePaths(deps.stateStore.read(), { repoId, paths }, deps.stateStore.read.bind(deps.stateStore));
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/git/unstage') {
+          assertNoActiveTurnForGitMutation(deps);
+          const repoId = getRequiredString(request.params, 'repoId');
+          const paths = getRequiredStringArray(request.params, 'paths');
+          if (!repoId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'repoId is required' });
+            return;
+          }
+          if (!paths) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'paths are required' });
+            return;
+          }
+
+          const result = await gitUnstagePaths(deps.stateStore.read(), { repoId, paths }, deps.stateStore.read.bind(deps.stateStore));
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/git/commit') {
+          assertNoActiveTurnForGitMutation(deps);
+          const repoId = getRequiredString(request.params, 'repoId');
+          const message = getString(request.params, 'message');
+          if (!repoId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'repoId is required' });
+            return;
+          }
+          if (message === null) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'message is required' });
+            return;
+          }
+
+          const result = await gitCommit(deps.stateStore.read(), { repoId, message }, deps.stateStore.read.bind(deps.stateStore));
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
