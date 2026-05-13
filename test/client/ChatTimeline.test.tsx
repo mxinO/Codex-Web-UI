@@ -53,6 +53,23 @@ function setScrollMetrics(scroller: HTMLDivElement, metrics: { scrollTop: number
   Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: metrics.clientHeight });
 }
 
+function setDynamicClampedScrollMetrics(scroller: HTMLDivElement, metrics: { scrollTop: number; clientHeight: number; rowHeight: number }) {
+  let scrollTop = metrics.scrollTop;
+  const maxScrollTop = () => Math.max(0, scroller.scrollHeight - metrics.clientHeight);
+  Object.defineProperty(scroller, 'scrollTop', {
+    configurable: true,
+    get: () => Math.max(0, Math.min(scrollTop, maxScrollTop())),
+    set: (value) => {
+      scrollTop = value;
+    },
+  });
+  Object.defineProperty(scroller, 'scrollHeight', {
+    configurable: true,
+    get: () => document.querySelectorAll('.chat-row').length * metrics.rowHeight,
+  });
+  Object.defineProperty(scroller, 'clientHeight', { configurable: true, value: metrics.clientHeight });
+}
+
 afterEach(() => {
   act(() => {
     root?.unmount();
@@ -206,6 +223,36 @@ describe('ChatTimeline', () => {
     expect(document.body.textContent).not.toContain('message 0');
   });
 
+  it('does not cycle into another older-page load after browser-clamped bottom collapse', () => {
+    const onLoadOlder = vi.fn();
+    const items = Array.from({ length: INITIAL_RENDERED_GROUP_LIMIT + RENDERED_GROUP_INCREMENT + 10 }, (_, index) => userItem(index));
+
+    render(<ChatTimeline {...baseProps} items={items} hasOlder onLoadOlder={onLoadOlder} />);
+
+    const scroller = document.querySelector<HTMLDivElement>('.chat-scroll');
+    setDynamicClampedScrollMetrics(scroller!, { scrollTop: 24, clientHeight: 700, rowHeight: 30 });
+    act(() => {
+      scroller?.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    expect(document.querySelectorAll('.chat-row--user')).toHaveLength(INITIAL_RENDERED_GROUP_LIMIT + RENDERED_GROUP_INCREMENT);
+    expect(onLoadOlder).not.toHaveBeenCalled();
+
+    act(() => {
+      scroller!.scrollTop = scroller!.scrollHeight;
+      scroller?.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    expect(document.querySelectorAll('.chat-row--user')).toHaveLength(INITIAL_RENDERED_GROUP_LIMIT);
+    expect(scroller?.scrollTop).toBe(scroller!.scrollHeight - scroller!.clientHeight);
+
+    act(() => {
+      scroller?.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    expect(onLoadOlder).not.toHaveBeenCalled();
+  });
+
   it('preserves the viewport when an older server page is prepended', () => {
     const onLoadOlder = vi.fn();
     const currentItems = Array.from({ length: INITIAL_RENDERED_GROUP_LIMIT }, (_, index) => userItem(index + 10));
@@ -289,7 +336,6 @@ describe('ChatTimeline', () => {
       />,
     );
 
-    expect(scroller?.scrollTop).toBe(700);
     expect(document.body.textContent).not.toContain('message 0');
   });
 

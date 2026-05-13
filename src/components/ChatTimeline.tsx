@@ -28,7 +28,8 @@ export const RENDERED_GROUP_INCREMENT = 40;
 
 type ScrollPreservation =
   | { mode: 'next-layout'; scrollHeight: number }
-  | { mode: 'server-prepend'; scrollHeight: number; oldestGroupKey: string | null; sawLoading: boolean };
+  | { mode: 'server-prepend'; scrollHeight: number; oldestGroupKey: string | null; sawLoading: boolean }
+  | { mode: 'bottom-collapse' };
 
 function isActivityItem(item: TimelineItem): boolean {
   return (
@@ -114,6 +115,11 @@ export default function ChatTimeline({
     if (!scroller) return;
     const preservation = scrollPreservationRef.current;
     if (preservation) {
+      if (preservation.mode === 'bottom-collapse') {
+        scrollPreservationRef.current = null;
+        scrollToBottom(scroller);
+        return;
+      }
       if (preservation.mode === 'server-prepend') {
         const prependedHistory = oldestGroupKey !== preservation.oldestGroupKey;
         if (!prependedHistory) {
@@ -193,7 +199,8 @@ export default function ChatTimeline({
       }
       return;
     }
-    preserveScrollForPrepend(scroller, 'next-layout');
+    scrollPreservationRef.current = { mode: 'bottom-collapse' };
+    stickToBottomRef.current = true;
     setVisibleGroupCount(INITIAL_RENDERED_GROUP_LIMIT);
     if (showJumpToLatest && !restoreLatestRequestedRef.current) {
       restoreLatestRequestedRef.current = true;
