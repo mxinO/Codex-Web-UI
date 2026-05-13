@@ -1,4 +1,4 @@
-import { List, Moon, Plus, Sun } from 'lucide-react';
+import { List, Moon, Plus, RefreshCw, Sun } from 'lucide-react';
 import type { ReactNode } from 'react';
 import type { AppServerHealth, ConnectionState } from '../hooks/useCodexSocket';
 
@@ -17,6 +17,8 @@ interface HeaderProps {
   sessionError?: string | null;
   onOpenSessions?: () => void;
   onNewSession?: () => void;
+  onRestartCodex?: () => void;
+  codexRestarting?: boolean;
   sessionPicker?: ReactNode;
   appServerHealth?: AppServerHealth | null;
 }
@@ -71,6 +73,16 @@ export default function Header(props: HeaderProps) {
           {appServerLabel}
         </span>
       )}
+      <button
+        className={`icon-button icon-button--square${props.codexRestarting ? ' icon-button--spinning' : ''}`}
+        type="button"
+        onClick={props.onRestartCodex}
+        disabled={!props.onRestartCodex || props.codexRestarting || !props.appServerHealth}
+        title="Restart Codex app-server"
+        aria-label="Restart Codex"
+      >
+        <RefreshCw size={16} aria-hidden="true" />
+      </button>
       <button className="icon-button icon-button--square" type="button" onClick={props.onToggleTheme} title="Toggle theme" aria-label="Toggle theme">
         {props.theme === 'dark' ? <Sun size={16} aria-hidden="true" /> : <Moon size={16} aria-hidden="true" />}
       </button>

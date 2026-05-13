@@ -69,4 +69,22 @@ describe('Header', () => {
     expect(appStatus?.textContent).toBe('App stopped');
     expect(appStatus?.getAttribute('title')).toBe('Codex app-server exited');
   });
+
+  it('exposes a restart Codex action in the top bar', () => {
+    const onRestartCodex = vi.fn();
+    renderHeader({
+      appServerHealth: { connected: true, dead: false, error: null, readyzUrl: 'http://127.0.0.1:1/readyz', url: 'ws://127.0.0.1:1' },
+      onRestartCodex,
+    });
+
+    const restart = document.querySelector<HTMLButtonElement>('[aria-label="Restart Codex"]');
+    expect(restart).toBeInstanceOf(HTMLButtonElement);
+    expect(restart?.disabled).toBe(false);
+
+    act(() => {
+      restart?.click();
+    });
+
+    expect(onRestartCodex).toHaveBeenCalledTimes(1);
+  });
 });

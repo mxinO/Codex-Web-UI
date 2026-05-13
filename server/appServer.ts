@@ -33,6 +33,7 @@ export class CodexAppServer {
   private readyzUrl: string | null = null;
   private deadError: Error | null = null;
   private startPromise: Promise<CodexInitializeResponse | void> | null = null;
+  private restartPromise: Promise<CodexInitializeResponse | void> | null = null;
   private initialized = false;
   private lifecycleId = 0;
   private readonly healthHandlers = new Set<() => void>();
@@ -42,6 +43,7 @@ export class CodexAppServer {
   constructor(private readonly options: CodexAppServerOptions) {}
 
   start(): Promise<CodexInitializeResponse | void> {
+    if (this.restartPromise) return this.restartPromise;
     if (this.isConnected()) return Promise.resolve();
     if (this.startPromise) return this.startPromise;
 
@@ -146,6 +148,25 @@ export class CodexAppServer {
       logInfo('Stopping Codex app-server child', { pid: child.pid });
       child.kill();
     }
+    this.emitHealthChange();
+  }
+
+  async restart(): Promise<CodexInitializeResponse | void> {
+    if (this.restartPromise) return this.restartPromise;
+
+    let restart: Promise<CodexInitializeResponse | void>;
+    const operation = (async () => {
+      const child = this.child;
+      this.stop();
+      if (child) await this.waitForChildExit(child);
+      this.restartPromise = null;
+      return this.start();
+    })();
+    restart = operation.finally(() => {
+      if (this.restartPromise === restart) this.restartPromise = null;
+    });
+    this.restartPromise = restart;
+    return this.restartPromise;
   }
 
   private startReal(): Promise<CodexInitializeResponse> {
@@ -373,6 +394,33 @@ export class CodexAppServer {
     if (!child.killed) {
       child.kill();
     }
+  }
+
+  private waitForChildExit(child: ChildProcessByStdio<null, Readable, Readable>, timeoutMs = 3000): Promise<void> {
+    if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let killTimer: NodeJS.Timeout | null = null;
+      let forceResolveTimer: NodeJS.Timeout | null = null;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        if (killTimer) clearTimeout(killTimer);
+        if (forceResolveTimer) clearTimeout(forceResolveTimer);
+        child.off('exit', finish);
+        resolve();
+      };
+      killTimer = setTimeout(() => {
+        if (child.exitCode === null && child.signalCode === null) {
+          logWarn('Force killing Codex app-server child after restart timeout', { pid: child.pid });
+          child.kill('SIGKILL');
+        }
+        forceResolveTimer = setTimeout(finish, 1000);
+      }, timeoutMs);
+
+      child.once('exit', finish);
+    });
   }
 
   private closeSockets(): void {

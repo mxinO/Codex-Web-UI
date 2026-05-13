@@ -312,6 +312,15 @@ function applyRunOptionsToRuntimeState(state: HostRuntimeState, options?: CodexR
   };
 }
 
+function runOptionsFromRuntimeState(state: HostRuntimeState): CodexRunOptions | undefined {
+  const options: CodexRunOptions = {};
+  if (state.model) options.model = state.model;
+  if (state.effort) options.effort = state.effort;
+  if (state.sandbox) options.sandbox = state.sandbox;
+  if (state.mode && state.model) options.mode = state.mode;
+  return Object.keys(options).length > 0 ? options : undefined;
+}
+
 function notificationPayload(message: { params?: unknown; payload?: unknown }): unknown {
   if (isRecord(message.params) && isRecord(message.params.payload)) return message.params.payload;
   if (isRecord(message.payload)) return message.payload;
@@ -1044,6 +1053,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const resumeThreadPromises = new Map<string, Promise<void>>();
   const knownThreadPaths = new Map<string, string>();
   let appServerGeneration = 0;
+  let restartInFlight: Promise<unknown> | null = null;
   const timedOutQueuedStarts = new Map<string, QueuedMessage>();
   const deferredQueuedMessagesByThread = new Map<string, QueuedMessage[]>();
   const recentNotifications: Array<{ seq: number; message: unknown; bytes: number }> = [];
@@ -1094,7 +1104,6 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const invalidateResumedThreads = () => {
     appServerGeneration += 1;
     resumedThreadIds.clear();
-    startedPendingRolloutThreadIds.clear();
     resumeThreadPromises.clear();
   };
 
@@ -1957,6 +1966,13 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       }
     })()
       .catch((error) => {
+        if (isNoRolloutFoundError(error, threadId) && shouldReturnEmptyTurnsForPendingRolloutThread(threadId)) {
+          logWarn('Continuing newly started active Codex thread without rollout during resume', {
+            threadId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return;
+        }
         if (isMissingThreadError(error) && !(isNoRolloutFoundError(error, threadId) && shouldReturnEmptyTurnsForPendingRolloutThread(threadId))) {
           clearMissingActiveThread(threadId, error);
         }
@@ -1976,7 +1992,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     const context = startContextForThread(threadId);
     pendingTurnStartContexts.push(context);
     try {
-      return await requestCodex<{ turn: { id: string } }>(
+      const result = await requestCodex<{ turn: { id: string } }>(
         'turn/start',
         applyTurnRunOptions(
           {
@@ -1988,6 +2004,9 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         ),
         TURN_START_RPC_TIMEOUT_MS,
       );
+      const health = deps.codex.health();
+      if (health.connected && !health.dead) resumedThreadIds.add(threadId);
+      return result;
     } finally {
       const index = pendingTurnStartContexts.indexOf(context);
       if (index >= 0) pendingTurnStartContexts.splice(index, 1);
@@ -2463,6 +2482,103 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       }
 
       try {
+        if (request.method === 'webui/codex/restart') {
+          const current = deps.stateStore.read();
+          if (current.activeTurnId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'cannot restart Codex while a turn is active' });
+            return;
+          }
+
+          if (restartInFlight) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'Codex restart is already in progress' });
+            return;
+          }
+
+          const operation = (async () => {
+            const activeThreadId = current.activeThreadId;
+            const activeThreadPath = current.activeThreadPath;
+            const options = runOptionsFromRuntimeState(current);
+            const resumePath = activeThreadId ? resumePathForThread(activeThreadId, activeThreadPath) : null;
+
+            pendingServerRequests.clear();
+            invalidateResumedThreads();
+            await deps.codex.restart();
+
+            let state = deps.stateStore.update((state) => ({
+              ...state,
+              appServerUrl: deps.codex.getUrl(),
+              appServerPid: deps.codex.getPid(),
+            }));
+            broadcastHello(state);
+
+            let resumeResult: unknown = null;
+            if (activeThreadId) {
+              let skippedPendingRolloutResume = false;
+              const params = applyThreadRunOptions<SessionResumeParams & { experimentalRawEvents: boolean; persistExtendedHistory: boolean; [key: string]: unknown }>({
+                threadId: activeThreadId,
+                ...(resumePath ? { path: resumePath } : {}),
+                experimentalRawEvents: true,
+                persistExtendedHistory: true,
+                excludeTurns: true,
+              }, options);
+              const generation = appServerGeneration;
+              resumeResult = await Promise.resolve(deps.codex.request('thread/resume', params, THREAD_TURNS_LIST_RPC_TIMEOUT_MS)).catch((error) => {
+                if (isNoRolloutFoundError(error, activeThreadId) && shouldReturnEmptyTurnsForPendingRolloutThread(activeThreadId)) {
+                  logWarn('Preserving newly started active Codex thread without rollout after app-server restart', {
+                    threadId: activeThreadId,
+                    error: error instanceof Error ? error.message : String(error),
+                  });
+                  skippedPendingRolloutResume = true;
+                  return null;
+                }
+                if (isMissingThreadError(error)) clearMissingActiveThread(activeThreadId, error);
+                throw error;
+              });
+              const health = deps.codex.health();
+              if (!skippedPendingRolloutResume && generation === appServerGeneration && health.connected && !health.dead) resumedThreadIds.add(activeThreadId);
+
+              const activeCwd = extractThreadCwd(resumeResult) ?? current.activeCwd;
+              const resultThreadPath = extractThreadPath(resumeResult);
+              const nextThreadPath = resultThreadPath ?? resumePath ?? activeThreadPath;
+              const runtimeStatus = runtimeStatusFromThreadResult(resumeResult, options);
+              rememberKnownThreadPath(activeThreadId, nextThreadPath);
+              state = deps.stateStore.update((state) =>
+                state.activeThreadId === activeThreadId
+                  ? {
+                      ...state,
+                      activeThreadPath: nextThreadPath,
+                      activeTurnId: null,
+                      activeCwd,
+                      ...runtimeStatus,
+                      recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
+                    }
+                  : state,
+              );
+              broadcastHello(state);
+            }
+
+            return {
+              ok: true,
+              resumedThreadId: activeThreadId,
+              thread: sanitizeThreadHistory(resumeResult),
+              appServerHealth: deps.codex.health(),
+            };
+          })();
+
+          restartInFlight = operation;
+          try {
+            send(ws, { type: 'rpc/result', id: request.id, result: await operation });
+          } finally {
+            if (restartInFlight === operation) restartInFlight = null;
+          }
+          return;
+        }
+
+        if (restartInFlight) {
+          send(ws, { type: 'rpc/error', id: request.id, error: 'Codex restart is in progress' });
+          return;
+        }
+
         if (request.method === 'webui/session/list') {
           const result = await requestCodex('thread/list', {
             limit: 50,

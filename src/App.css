@@ -224,6 +224,10 @@ input:focus-visible {
   opacity: 0.55;
 }
 
+.icon-button--spinning svg {
+  animation: activity-running-spin 1.2s linear infinite;
+}
+
 .status {
   flex: 0 0 auto;
   text-transform: capitalize;

@@ -187,6 +187,7 @@ export default function App() {
   const [sessionPickerOpen, setSessionPickerOpen] = useState(false);
   const [cwdPickerOpen, setCwdPickerOpen] = useState(false);
   const [sessionLoading, setSessionLoading] = useState(false);
+  const [codexRestarting, setCodexRestarting] = useState(false);
   const [sessionError, setSessionError] = useState<string | null>(null);
   const [detailItem, setDetailItem] = useState<TimelineItem | null>(null);
   const [composerDraft, setComposerDraft] = useState<string | null>(null);
@@ -224,6 +225,7 @@ export default function App() {
     activeTurnId: state?.activeTurnId ?? null,
     queue: state?.queue ?? [],
   });
+  const transientSessionMessageTimerRef = useRef<number | null>(null);
   const manuallyRemovedQueuedIdsRef = useRef(new Set<string>());
   const finalizedFileSummaryFetchesRef = useRef(new Set<string>());
   const liveNotificationWindowRef = useRef({ activeThreadId, activeTurnId: state?.activeTurnId ?? null, startCount: socket.notificationCount });
@@ -251,7 +253,16 @@ export default function App() {
   useEffect(() => {
     return () => {
       fileOpenAbortRef.current?.abort();
+      if (transientSessionMessageTimerRef.current !== null) window.clearTimeout(transientSessionMessageTimerRef.current);
     };
+  }, []);
+  const showTransientSessionMessage = useCallback((message: string, durationMs = 3000) => {
+    if (transientSessionMessageTimerRef.current !== null) window.clearTimeout(transientSessionMessageTimerRef.current);
+    setSessionError(message);
+    transientSessionMessageTimerRef.current = window.setTimeout(() => {
+      setSessionError((current) => (current === message ? null : current));
+      transientSessionMessageTimerRef.current = null;
+    }, durationMs);
   }, []);
   const liveNotificationActiveTurnId = liveNotificationWindowRef.current.activeTurnId;
   const liveNotificationStartCount = liveNotificationWindowRef.current.startCount;
@@ -357,6 +368,25 @@ export default function App() {
     [visibleLiveTurnItems],
   );
   const showActivityRunning = isRunning && !hasActiveStreamingText;
+
+  const restartCodex = useCallback(async () => {
+    if (isRunning) {
+      setSessionError('Stop the active turn before restarting Codex');
+      return;
+    }
+
+    setCodexRestarting(true);
+    setSessionError('Restarting Codex app-server...');
+    try {
+      await socket.rpc('webui/codex/restart', undefined, 120_000);
+      showTransientSessionMessage('Codex app-server restarted');
+      if (activeThreadId) void timeline.reload();
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setCodexRestarting(false);
+    }
+  }, [activeThreadId, isRunning, showTransientSessionMessage, socket.rpc, timeline.reload]);
 
   const updateRetainedLiveTurnItems = useCallback((historyItems: TimelineItem[], additions: TimelineItem[] = []) => {
     setRetainedLiveTurnItems((current) => {
@@ -987,6 +1017,8 @@ export default function App() {
         sessionError={sessionError}
         onOpenSessions={socket.connectionState === 'connected' ? () => void loadSessions() : undefined}
         onNewSession={socket.connectionState === 'connected' ? openNewSessionPicker : undefined}
+        onRestartCodex={socket.connectionState === 'connected' && !isRunning ? () => void restartCodex() : undefined}
+        codexRestarting={codexRestarting}
         sessionPicker={
           <SessionPicker
             threads={threads}
@@ -1036,7 +1068,7 @@ export default function App() {
               activeCwd={state?.activeCwd ?? null}
               runOptions={runOptions}
               draftOverride={composerDraft}
-              disabled={socket.connectionState !== 'connected'}
+              disabled={socket.connectionState !== 'connected' || codexRestarting}
               onDraftConsumed={() => setComposerDraft(null)}
               onEnqueue={enqueue}
               onDirectSubmit={addPendingUserMessage}

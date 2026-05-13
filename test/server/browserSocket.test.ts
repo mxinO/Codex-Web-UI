@@ -80,9 +80,11 @@ async function makeHarness(
   let healthHandler: (() => void) | null = null;
   const respond = vi.fn<CodexAppServer['respond']>();
   const start = vi.fn<CodexAppServer['start']>().mockResolvedValue(undefined);
+  const restart = vi.fn<CodexAppServer['restart']>().mockResolvedValue(undefined);
   const health = vi.fn<CodexAppServer['health']>().mockReturnValue({ connected: true, dead: false, error: null, readyzUrl: 'http://127.0.0.1:1/readyz', url: 'ws://127.0.0.1:1' });
   const codex = {
     start,
+    restart,
     request,
     respond,
     health,
@@ -138,7 +140,7 @@ async function makeHarness(
     healthHandler?.();
   };
 
-  return { ws, stateStore, notify, notifyRaw, requestFromServer, emitHealthChange, respond, start, health, port, initialHello };
+  return { ws, stateStore, notify, notifyRaw, requestFromServer, emitHealthChange, respond, start, restart, health, port, initialHello };
 }
 
 function nextMessage(ws: WebSocket): Promise<RpcMessage> {
@@ -694,7 +696,7 @@ describe('attachBrowserSocket session RPCs', () => {
       result: { data: [], nextCursor: null },
     });
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-empty', activeTurnId: null });
-    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/start', 'thread/turns/list', 'thread/resume']);
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/start', 'thread/turns/list', 'thread/resume', 'thread/turns/list']);
   });
 
   it('does not mask no-rollout errors for a different thread id', async () => {
@@ -3384,6 +3386,154 @@ describe('attachBrowserSocket app-server lifecycle', () => {
       appServerHealth: { connected: false, dead: true, error: 'Codex app-server WebSocket closed' },
     });
     expect(request).not.toHaveBeenCalled();
+  });
+
+  it('restarts the app-server and resumes the active session', async () => {
+    const threadPath = '/home/user/.codex/sessions/2026/05/05/rollout-thread-1.jsonl';
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({
+      thread: { id: 'thread-1', cwd: '/work/project', path: threadPath },
+      model: 'gpt-5.5',
+      reasoningEffort: 'high',
+      sandbox: { type: 'workspaceWrite' },
+    });
+    const { ws, stateStore, restart } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: threadPath,
+        activeCwd: '/work/project',
+        model: 'gpt-5.5',
+        effort: 'high',
+        mode: 'plan',
+        sandbox: 'workspace-write',
+      },
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 412, method: 'webui/codex/restart' }));
+    const response = await nextRpcResponse(ws, 412);
+
+    expect(response).toMatchObject({ type: 'rpc/result', id: 412, result: { ok: true, resumedThreadId: 'thread-1' } });
+    expect(restart).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledWith('thread/resume', {
+      threadId: 'thread-1',
+      path: threadPath,
+      experimentalRawEvents: true,
+      persistExtendedHistory: true,
+      excludeTurns: true,
+      model: 'gpt-5.5',
+      sandbox: 'workspace-write',
+      config: { model_reasoning_effort: 'high' },
+    }, 120000);
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeThreadPath: threadPath,
+      activeCwd: '/work/project',
+      activeTurnId: null,
+      model: 'gpt-5.5',
+      effort: 'high',
+      mode: 'plan',
+      sandbox: 'workspace-write',
+    });
+  });
+
+  it('does not restart the app-server while a turn is active', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, restart, stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+        activeCwd: '/work/project',
+      },
+    });
+    stateStore.write({ ...stateStore.read(), activeTurnId: 'turn-1' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 413, method: 'webui/codex/restart' }));
+    const response = await nextRpcResponse(ws, 413);
+
+    expect(response).toEqual({ type: 'rpc/error', id: 413, error: 'cannot restart Codex while a turn is active' });
+    expect(restart).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('blocks turn starts while app-server restart is still in progress', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const restarting = deferred<void>();
+    const { ws, restart } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+        activeCwd: '/work/project',
+      },
+    });
+    restart.mockReturnValueOnce(restarting.promise);
+
+    const restartResponse = nextRpcResponse(ws, 414);
+    ws.send(JSON.stringify({ type: 'rpc', id: 414, method: 'webui/codex/restart' }));
+    await waitForRequest(restart);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 415, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'hello' } }));
+    expect(await nextRpcResponse(ws, 415)).toEqual({ type: 'rpc/error', id: 415, error: 'Codex restart is in progress' });
+
+    restarting.resolve(undefined);
+    expect(await restartResponse).toMatchObject({ type: 'rpc/result', id: 414, result: { ok: true, resumedThreadId: 'thread-1' } });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledWith('thread/resume', {
+      threadId: 'thread-1',
+      path: '/sessions/thread-1.jsonl',
+      experimentalRawEvents: true,
+      persistExtendedHistory: true,
+      excludeTurns: true,
+    }, 120000);
+  });
+
+  it('keeps a new empty session active when restart resume has no rollout yet', async () => {
+    const threadPath = '/home/user/.codex/sessions/2026/05/05/rollout-thread-empty.jsonl';
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/start') return { thread: { id: 'thread-empty', cwd: '/work/project', path: threadPath } } as T;
+      if (method === 'thread/resume') throw new Error('no rollout found for thread id thread-empty');
+      if (method === 'thread/turns/list') throw new Error('no rollout found for thread id thread-empty');
+      if (method === 'turn/start') return { turn: { id: 'turn-1' } } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, restart } = await makeHarness(request);
+
+    const startMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 416, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await startMessages;
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 417, method: 'webui/codex/restart' }));
+    const response = await nextRpcResponse(ws, 417);
+
+    expect(response).toMatchObject({ type: 'rpc/result', id: 417, result: { ok: true, resumedThreadId: 'thread-empty' } });
+    expect(restart).toHaveBeenCalledTimes(1);
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/start', 'thread/resume']);
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-empty',
+      activeThreadPath: threadPath,
+      activeCwd: '/work/project',
+      activeTurnId: null,
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 418, method: 'thread/turns/list', params: { threadId: 'thread-empty' } }));
+    expect(await nextRpcResponse(ws, 418)).toEqual({
+      type: 'rpc/result',
+      id: 418,
+      result: { data: [], nextCursor: null },
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 419, method: 'webui/turn/start', params: { threadId: 'thread-empty', text: 'hello' } }));
+    expect(await nextRpcResponse(ws, 419)).toEqual({ type: 'rpc/result', id: 419, result: { turn: { id: 'turn-1' } } });
+    expect(request.mock.calls.map(([method]) => method)).toEqual([
+      'thread/start',
+      'thread/resume',
+      'thread/resume',
+      'thread/turns/list',
+      'thread/resume',
+      'turn/start',
+    ]);
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-empty',
+      activeTurnId: 'turn-1',
+    });
   });
 
   it('resumes the active thread before starting a turn after app-server restart', async () => {

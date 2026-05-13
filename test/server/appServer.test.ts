@@ -1,3 +1,4 @@
+import { EventEmitter } from 'node:events';
 import { describe, expect, it, vi } from 'vitest';
 import { CodexAppServer } from '../../server/appServer.js';
 
@@ -52,5 +53,49 @@ describe('CodexAppServer lifecycle', () => {
     expect(kill).toHaveBeenCalledTimes(1);
     expect(server.health()).toMatchObject({ connected: false, dead: true, error: 'Codex app-server WebSocket closed' });
     expect(onHealthChange).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits for the old child to exit before starting again on restart', async () => {
+    const server = new CodexAppServer({ cwd: process.cwd(), mock: false });
+    const child = new EventEmitter() as EventEmitter & {
+      killed: boolean;
+      kill: ReturnType<typeof vi.fn>;
+      exitCode: number | null;
+      signalCode: NodeJS.Signals | null;
+      pid: number;
+    };
+    child.killed = false;
+    child.exitCode = null;
+    child.signalCode = null;
+    child.pid = 1234;
+    child.kill = vi.fn(() => {
+      child.killed = true;
+      return true;
+    });
+    const start = vi.fn().mockResolvedValue(undefined);
+
+    (server as unknown as { child: unknown; start: typeof start }).child = child;
+    (server as unknown as { child: unknown; start: typeof start }).start = start;
+
+    const restarting = server.restart();
+    await Promise.resolve();
+
+    expect(child.kill).toHaveBeenCalledTimes(1);
+    expect(start).not.toHaveBeenCalled();
+
+    child.exitCode = 0;
+    child.emit('exit', 0, null);
+    await restarting;
+
+    expect(start).toHaveBeenCalledTimes(1);
+  });
+
+  it('holds normal starts behind an active restart', () => {
+    const server = new CodexAppServer({ cwd: process.cwd(), mock: true });
+    const restartPromise = Promise.resolve(undefined);
+
+    (server as unknown as { restartPromise: Promise<unknown> | null }).restartPromise = restartPromise;
+
+    expect(server.start()).toBe(restartPromise);
   });
 });
