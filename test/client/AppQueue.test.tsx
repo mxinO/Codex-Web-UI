@@ -69,7 +69,7 @@ vi.mock('../../src/components/ChatTimeline', () => ({
 vi.mock('../../src/components/CwdPicker', () => ({ default: () => null }));
 vi.mock('../../src/components/DetailModal', () => ({ default: () => null }));
 vi.mock('../../src/components/FileChangeTray', () => ({ default: () => null }));
-vi.mock('../../src/components/FileExplorer', () => ({ default: () => null }));
+vi.mock('../../src/components/WorkspaceSidebar', () => ({ default: () => null }));
 vi.mock('../../src/components/Header', () => ({ default: () => <div data-testid="header" /> }));
 vi.mock('../../src/components/InputBox', () => ({
   default: ({ draftOverride }: { draftOverride: string | null }) => <div data-testid="input-draft">{draftOverride ?? ''}</div>,

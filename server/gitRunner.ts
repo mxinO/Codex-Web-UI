@@ -7,6 +7,7 @@ export interface GitRunOptions {
   timeoutMs: number;
   outputLimitBytes: number;
   readOnly?: boolean;
+  beforeSpawn?: () => void;
 }
 
 export interface GitRunResult {
@@ -58,6 +59,8 @@ function decodeOutput(output: CappedOutput): string {
 
 function runGitChild(options: GitRunOptions): Promise<GitRunResult> {
   return new Promise((resolve) => {
+    options.beforeSpawn?.();
+
     const stdout: CappedOutput = { chunks: [], bytes: 0, truncated: false };
     const stderr: CappedOutput = { chunks: [], bytes: 0, truncated: false };
     let timedOut = false;

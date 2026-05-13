@@ -112,4 +112,53 @@ setInterval(() => {}, 1000);
     await expect(jobs[jobs.length - 1]).rejects.toThrow('too many git jobs queued');
     await Promise.allSettled(jobs);
   });
+
+  it('runs beforeSpawn at the queued job spawn boundary', async () => {
+    makeFakeGit(`
+if (process.argv[2] === 'slow') {
+  setTimeout(() => process.exit(0), 80);
+} else {
+  process.stdout.write('fast');
+}
+`);
+
+    const slow = runGit({
+      args: ['slow'],
+      timeoutMs: 1_000,
+      outputLimitBytes: 100,
+    });
+    let checked = false;
+    const fast = runGit({
+      args: ['fast'],
+      timeoutMs: 1_000,
+      outputLimitBytes: 100,
+      beforeSpawn: () => {
+        checked = true;
+      },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(checked).toBe(false);
+
+    await slow;
+    await expect(fast).resolves.toMatchObject({ stdout: 'fast', exitCode: 0 });
+    expect(checked).toBe(true);
+  });
+
+  it('rejects without spawning when beforeSpawn fails', async () => {
+    makeFakeGit(`
+process.stdout.write('spawned');
+`);
+
+    await expect(
+      runGit({
+        args: ['status'],
+        timeoutMs: 1_000,
+        outputLimitBytes: 100,
+        beforeSpawn: () => {
+          throw new Error('blocked before spawn');
+        },
+      }),
+    ).rejects.toThrow('blocked before spawn');
+  });
 });

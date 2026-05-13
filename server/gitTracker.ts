@@ -84,9 +84,25 @@ function mutationAllowed(state: HostRuntimeState): void {
   if (state.activeTurnId) throw new Error('git mutation is disabled while a turn is active');
 }
 
-function mutationAllowedBeforeSpawn(state: HostRuntimeState, latestState?: MutationStateReader): void {
+function requireUnchangedMutationTarget(state: HostRuntimeState, latest: HostRuntimeState, lookup: RepoLookup): void {
+  if (latest.activeThreadId !== state.activeThreadId || latest.activeThreadPath !== state.activeThreadPath || latest.activeCwd !== lookup.activeCwd) {
+    throw new Error('git mutation target changed');
+  }
+
+  const workspace = workspaceFor(latest, lookup.activeCwd);
+  const latestRepo = workspace.repos.find((candidate) => candidate.id === lookup.repo.id);
+  if (!latestRepo || latestRepo.path !== lookup.repo.path) {
+    throw new Error('git mutation target changed');
+  }
+}
+
+function mutationAllowedBeforeSpawn(state: HostRuntimeState, lookup: RepoLookup, latestState?: MutationStateReader): void {
   mutationAllowed(state);
-  if (latestState) mutationAllowed(latestState());
+  if (latestState) {
+    const latest = latestState();
+    mutationAllowed(latest);
+    requireUnchangedMutationTarget(state, latest, lookup);
+  }
 }
 
 export function normalizeRepoRelativePath(input: string): string {
@@ -334,12 +350,13 @@ export async function gitStagePaths(state: HostRuntimeState, params: { repoId: s
   await assertExistingPathsInsideActive(lookup, normalized);
   await rejectDirectoryPaths(lookup.repo.path, normalized);
 
-  mutationAllowedBeforeSpawn(state, latestState);
+  mutationAllowedBeforeSpawn(state, lookup, latestState);
   const result = await runGit({
     args: ['--literal-pathspecs', '-C', lookup.realRepoPath, 'add', '--pathspec-from-file=-', '--pathspec-file-nul'],
     stdin,
     timeoutMs: MUTATION_TIMEOUT_MS,
     outputLimitBytes: COMMIT_OUTPUT_LIMIT_BYTES,
+    beforeSpawn: () => mutationAllowedBeforeSpawn(state, lookup, latestState),
   });
   if (result.timedOut) throw new Error('git add timed out');
   if (result.exitCode !== 0) throw new Error(result.stderr.trim() || 'git add failed');
@@ -353,12 +370,13 @@ export async function gitUnstagePaths(state: HostRuntimeState, params: { repoId:
   await assertExistingPathsInsideActive(lookup, normalized);
   await rejectDirectoryPaths(lookup.repo.path, normalized);
 
-  mutationAllowedBeforeSpawn(state, latestState);
+  mutationAllowedBeforeSpawn(state, lookup, latestState);
   const result = await runGit({
     args: ['--literal-pathspecs', '-C', lookup.realRepoPath, 'restore', '--staged', '--pathspec-from-file=-', '--pathspec-file-nul'],
     stdin,
     timeoutMs: MUTATION_TIMEOUT_MS,
     outputLimitBytes: COMMIT_OUTPUT_LIMIT_BYTES,
+    beforeSpawn: () => mutationAllowedBeforeSpawn(state, lookup, latestState),
   });
   if (result.timedOut) throw new Error('git restore timed out');
   if (result.exitCode !== 0) throw new Error(result.stderr.trim() || 'git restore failed');
@@ -377,12 +395,13 @@ export async function gitCommit(
   }
 
   const lookup = await revalidateRepo(state, params.repoId);
-  mutationAllowedBeforeSpawn(state, latestState);
+  mutationAllowedBeforeSpawn(state, lookup, latestState);
   const result = await runGit({
     args: ['-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgSign=false', '-C', lookup.realRepoPath, 'commit', '--file=-'],
     stdin: params.message,
     timeoutMs: COMMIT_TIMEOUT_MS,
     outputLimitBytes: COMMIT_OUTPUT_LIMIT_BYTES,
+    beforeSpawn: () => mutationAllowedBeforeSpawn(state, lookup, latestState),
   });
   const output = `${result.stdout}${result.stderr}`;
   if (result.timedOut) throw new Error('git commit timed out');

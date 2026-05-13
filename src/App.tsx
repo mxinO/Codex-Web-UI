@@ -5,7 +5,7 @@ import CwdPicker from './components/CwdPicker';
 import DetailModal from './components/DetailModal';
 import FileChangeTray, { type ActiveFileSummary } from './components/FileChangeTray';
 import FileEditorModal from './components/FileEditorModal';
-import FileExplorer from './components/FileExplorer';
+import WorkspaceSidebar from './components/WorkspaceSidebar';
 import Header from './components/Header';
 import ImageViewerModal from './components/ImageViewerModal';
 import InputBox from './components/InputBox';
@@ -1033,7 +1033,7 @@ export default function App() {
       <main className="main-panel">
         {socket.connectionState === 'disconnected' && <div className="disconnect-banner">Connection lost - reconnecting...</div>}
         <div className="workspace-layout">
-          {state?.activeCwd && <FileExplorer root={state.activeCwd} rpc={socket.rpc} onOpenFile={(path, readOnly) => void openFile(path, readOnly)} />}
+          {state?.activeCwd && <WorkspaceSidebar root={state.activeCwd} rpc={socket.rpc} onOpenFile={(path, readOnly) => void openFile(path, readOnly)} />}
           <section className="workspace-main" aria-label="Chat workspace">
             <div className="main-content">
               {activeThreadId ? (

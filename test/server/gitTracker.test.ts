@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { HostStateStore } from '../../server/hostState.js';
+import { runGit } from '../../server/gitRunner.js';
 import {
   addGitRepo,
   gitCommit,
@@ -255,6 +256,7 @@ describe('gitTracker', () => {
 
   it('checks latest runtime state before mutating git', async () => {
     const workspace = tempRoot();
+    const otherWorkspace = tempRoot();
     const repo = initRepo(workspace);
     const context = makeContext(workspace);
     const { repo: trackedRepo } = await addGitRepo(context.stateStore.read(), context.stateStore, repo);
@@ -265,6 +267,45 @@ describe('gitTracker', () => {
     await expect(
       gitStagePaths(state, { repoId: trackedRepo.id, paths: ['tracked.txt'] }, () => ({ ...state, activeTurnId: 'turn-latest' })),
     ).rejects.toThrow('git mutation is disabled while a turn is active');
+    expect(git(repo, ['diff', '--cached', '--name-only']).trim()).toBe('');
+
+    await expect(gitStagePaths(state, { repoId: trackedRepo.id, paths: ['tracked.txt'] }, () => ({ ...state, activeCwd: otherWorkspace }))).rejects.toThrow(
+      'git mutation target changed',
+    );
+    expect(git(repo, ['diff', '--cached', '--name-only']).trim()).toBe('');
+
+    await expect(
+      gitStagePaths(state, { repoId: trackedRepo.id, paths: ['tracked.txt'] }, () => ({ ...state, gitWorkspaces: [{ cwd: workspace, repos: [] }] })),
+    ).rejects.toThrow('git mutation target changed');
+    expect(git(repo, ['diff', '--cached', '--name-only']).trim()).toBe('');
+
+    await gitStagePaths(state, { repoId: trackedRepo.id, paths: ['tracked.txt'] });
+    await expect(gitCommit(state, { repoId: trackedRepo.id, message: 'stale commit' }, () => ({ ...state, activeCwd: otherWorkspace }))).rejects.toThrow(
+      'git mutation target changed',
+    );
+    expect(git(repo, ['diff', '--cached', '--name-only']).trim()).toBe('tracked.txt');
+  });
+
+  it('checks latest runtime state at the queued git spawn boundary before mutating git', async () => {
+    const workspace = tempRoot();
+    const otherWorkspace = tempRoot();
+    const repo = initRepo(workspace);
+    const context = makeContext(workspace);
+    const { repo: trackedRepo } = await addGitRepo(context.stateStore.read(), context.stateStore, repo);
+    const state = context.stateStore.read();
+
+    writeFileSync(join(repo, 'tracked.txt'), 'changed\n');
+    const blocker = runGit({
+      args: ['-c', 'alias.pause=!sleep 0.15', 'pause'],
+      timeoutMs: 1_000,
+      outputLimitBytes: 100,
+    });
+    const queuedMutation = gitStagePaths(state, { repoId: trackedRepo.id, paths: ['tracked.txt'] }, () => context.stateStore.read());
+    const queuedMutationExpectation = expect(queuedMutation).rejects.toThrow('git mutation target changed');
+    context.stateStore.write({ ...context.stateStore.read(), activeCwd: otherWorkspace });
+
+    await blocker;
+    await queuedMutationExpectation;
     expect(git(repo, ['diff', '--cached', '--name-only']).trim()).toBe('');
   });
 

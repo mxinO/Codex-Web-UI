@@ -81,7 +81,7 @@ vi.mock('../../src/components/Header', () => ({
 }));
 vi.mock('../../src/components/InputBox', () => ({ default: () => <div data-testid="input-box" /> }));
 vi.mock('../../src/components/SessionPicker', () => ({ default: () => null }));
-vi.mock('../../src/components/FileExplorer', () => ({
+vi.mock('../../src/components/WorkspaceSidebar', () => ({
   default: ({ onOpenFile }: { onOpenFile: (path: string, readOnly: boolean) => void }) => (
     <div>
       <button type="button" onClick={() => onOpenFile('/repo/src/app.py', true)}>
