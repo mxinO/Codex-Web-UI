@@ -238,6 +238,19 @@ async function trackedDiffSnapshot(
   return { before, after };
 }
 
+async function repoHasHead(repoPath: string): Promise<boolean> {
+  const result = await runGit({
+    args: ['-C', repoPath, 'rev-parse', '--verify', '--quiet', 'HEAD'],
+    timeoutMs: MUTATION_TIMEOUT_MS,
+    outputLimitBytes: 64 * 1024,
+    readOnly: true,
+  });
+  if (result.timedOut) throw new Error('git HEAD check timed out');
+  if (result.exitCode === 0) return true;
+  if (result.exitCode === 1) return false;
+  throw new Error(result.stderr.trim() || 'git HEAD check failed');
+}
+
 export async function listGitRepos(state: HostRuntimeState): Promise<{ cwd: string; repos: GitTrackedRepo[] }> {
   const cwd = requireActiveCwd(state);
   return { cwd, repos: [...workspaceFor(state, cwd).repos] };
@@ -425,15 +438,19 @@ export async function gitUnstagePaths(state: HostRuntimeState, params: { repoId:
   await rejectDirectoryPaths(lookup.repo.path, normalized);
 
   mutationAllowedBeforeSpawn(state, lookup, latestState);
+  const hasHead = await repoHasHead(lookup.realRepoPath);
+  mutationAllowedBeforeSpawn(state, lookup, latestState);
   const result = await runGit({
-    args: ['--literal-pathspecs', '-C', lookup.realRepoPath, 'restore', '--staged', '--pathspec-from-file=-', '--pathspec-file-nul'],
+    args: hasHead
+      ? ['--literal-pathspecs', '-C', lookup.realRepoPath, 'restore', '--staged', '--pathspec-from-file=-', '--pathspec-file-nul']
+      : ['--literal-pathspecs', '-C', lookup.realRepoPath, 'rm', '--cached', '-f', '--ignore-unmatch', '--pathspec-from-file=-', '--pathspec-file-nul'],
     stdin,
     timeoutMs: MUTATION_TIMEOUT_MS,
     outputLimitBytes: COMMIT_OUTPUT_LIMIT_BYTES,
     beforeSpawn: () => mutationAllowedBeforeSpawn(state, lookup, latestState),
   });
-  if (result.timedOut) throw new Error('git restore timed out');
-  if (result.exitCode !== 0) throw new Error(result.stderr.trim() || 'git restore failed');
+  if (result.timedOut) throw new Error('git unstage timed out');
+  if (result.exitCode !== 0) throw new Error(result.stderr.trim() || 'git unstage failed');
   return { ok: true };
 }
 

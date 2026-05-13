@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -283,6 +283,29 @@ describe('gitTracker', () => {
     await expect(gitStagePaths(state, { repoId: trackedRepo.id, paths: ['scratch/'] })).rejects.toThrow(
       'cannot stage directory paths',
     );
+  });
+
+  it('unstages files in an unborn repository without requiring HEAD', async () => {
+    const workspace = tempRoot();
+    const repo = join(workspace, 'repo');
+    mkdirSync(repo);
+    git(repo, ['init']);
+    git(repo, ['config', 'user.name', 'Test User']);
+    git(repo, ['config', 'user.email', 'test@example.com']);
+    const context = makeContext(workspace);
+    const { repo: trackedRepo } = await addGitRepo(context.stateStore.read(), context.stateStore, repo);
+    const state = context.stateStore.read();
+
+    writeFileSync(join(repo, 'first.txt'), 'first\n');
+    await gitStagePaths(state, { repoId: trackedRepo.id, paths: ['first.txt'] });
+    expect(git(repo, ['diff', '--cached', '--name-only']).trim()).toBe('first.txt');
+    writeFileSync(join(repo, 'first.txt'), 'first modified\n');
+
+    await gitUnstagePaths(state, { repoId: trackedRepo.id, paths: ['first.txt'] });
+
+    expect(git(repo, ['diff', '--cached', '--name-only']).trim()).toBe('');
+    expect(git(repo, ['status', '--porcelain=v1']).trim()).toBe('?? first.txt');
+    expect(readFileSync(join(repo, 'first.txt'), 'utf8')).toBe('first modified\n');
   });
 
   it('checks latest runtime state before mutating git', async () => {
