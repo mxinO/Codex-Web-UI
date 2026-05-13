@@ -9,9 +9,46 @@ interface GitDiffModalProps {
   onClose: () => void;
 }
 
+function languageFromPath(filePath: string): string {
+  const extension = filePath.split('.').pop()?.toLowerCase();
+  if (extension === 'ts' || extension === 'tsx') return 'typescript';
+  if (extension === 'js' || extension === 'jsx') return 'javascript';
+  if (extension === 'json') return 'json';
+  if (extension === 'css') return 'css';
+  if (extension === 'md' || extension === 'markdown') return 'markdown';
+  if (extension === 'py') return 'python';
+  if (extension === 'sh' || extension === 'bash') return 'shell';
+  return 'plaintext';
+}
+
+function hunkOnlyPatch(patch: string): string {
+  const rows: string[] = [];
+  let inHunk = false;
+
+  for (const line of patch.split('\n')) {
+    if (line.startsWith('@@ ')) {
+      inHunk = true;
+      rows.push(line);
+      continue;
+    }
+
+    if (line.startsWith('diff --git ')) {
+      inHunk = false;
+      continue;
+    }
+
+    if (inHunk) rows.push(line);
+  }
+
+  while (rows.at(-1) === '') rows.pop();
+  return rows.length > 0 ? rows.join('\n') : 'No textual changes to display.';
+}
+
 export default function GitDiffModal({ diff, onClose }: GitDiffModalProps) {
   const [DiffViewer, setDiffViewer] = useState<DiffViewerComponent | null>(null);
   const showCompactState = diff.binary === true || diff.truncated === true;
+  const showTwoWayDiff = !showCompactState && typeof diff.before === 'string' && typeof diff.after === 'string';
+  const language = languageFromPath(diff.path);
 
   useEffect(() => {
     if (showCompactState) return;
@@ -42,7 +79,16 @@ export default function GitDiffModal({ diff, onClose }: GitDiffModalProps) {
               {diff.truncated && <span>Diff output was truncated.</span>}
             </div>
           )}
-          {!showCompactState && (DiffViewer ? <DiffViewer patch={diff.patch} /> : <div className="detail-loading">Loading diff...</div>)}
+          {!showCompactState &&
+            (DiffViewer ? (
+              showTwoWayDiff ? (
+                <DiffViewer before={diff.before} after={diff.after} language={language} />
+              ) : (
+                <DiffViewer patch={hunkOnlyPatch(diff.patch)} language={language} />
+              )
+            ) : (
+              <div className="detail-loading">Loading diff...</div>
+            ))}
         </div>
       </div>
     </div>

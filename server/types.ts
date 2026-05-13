@@ -63,6 +63,8 @@ export interface GitDiffResult {
   patch: string;
   truncated: boolean;
   binary?: boolean;
+  before?: string;
+  after?: string;
 }
 
 export interface HostRuntimeState {

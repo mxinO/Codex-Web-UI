@@ -172,10 +172,20 @@ describe('gitTracker', () => {
     expect(unstaged.patch).toContain('+Binary files this and that differ');
     expect(unstaged.binary).toBe(false);
     expect(unstaged.truncated).toBe(false);
+    expect(unstaged.before).toBe('initial\n');
+    expect(unstaged.after).toBe('Binary files this and that differ\n');
+
+    git(repo, ['add', 'tracked.txt']);
+    const stagedModify = await gitDiffForRepo(state, { repoId: trackedRepo.id, path: 'tracked.txt', scope: 'staged' });
+    expect(stagedModify.before).toBe('initial\n');
+    expect(stagedModify.after).toBe('Binary files this and that differ\n');
+    git(repo, ['restore', '--staged', 'tracked.txt']);
 
     const untracked = await gitDiffForRepo(state, { repoId: trackedRepo.id, path: 'new.txt', scope: 'untracked' });
     expect(untracked.patch).toContain('new file mode 100644');
     expect(untracked.patch).toContain('+hello');
+    expect(untracked.before).toBe('');
+    expect(untracked.after).toBe('hello\nworld\n');
 
     symlinkSync(join(workspace, 'outside.txt'), join(repo, 'linked.txt'));
     writeFileSync(join(workspace, 'outside.txt'), 'outside\n');
@@ -231,6 +241,27 @@ describe('gitTracker', () => {
     expect(diff.patch).toContain('rename from tracked.txt');
     expect(diff.patch).toContain('rename to renamed.txt');
     expect(diff.patch).not.toContain('new file mode');
+    expect(diff.before).toBe('initial\n');
+    expect(diff.after).toBe('initial\n');
+  });
+
+  it('returns before and after snapshots for staged added and deleted files', async () => {
+    const workspace = tempRoot();
+    const repo = initRepo(workspace);
+    const context = makeContext(workspace);
+    const { repo: trackedRepo } = await addGitRepo(context.stateStore.read(), context.stateStore, repo);
+    const state = context.stateStore.read();
+
+    writeFileSync(join(repo, 'added.ts'), 'export const value = 1;\n');
+    git(repo, ['add', 'added.ts']);
+    const added = await gitDiffForRepo(state, { repoId: trackedRepo.id, path: 'added.ts', scope: 'staged' });
+    expect(added.before).toBe('');
+    expect(added.after).toBe('export const value = 1;\n');
+
+    git(repo, ['rm', 'tracked.txt']);
+    const deleted = await gitDiffForRepo(state, { repoId: trackedRepo.id, path: 'tracked.txt', scope: 'staged' });
+    expect(deleted.before).toBe('initial\n');
+    expect(deleted.after).toBe('');
   });
 
   it('stages, unstages, and rejects untracked directories', async () => {

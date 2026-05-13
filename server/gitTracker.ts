@@ -190,6 +190,54 @@ function isBinaryGitDiff(output: string): boolean {
   return output.split(/\r?\n/).some((line) => line.startsWith('Binary files ') || line.startsWith('Binary file ') || line === 'GIT binary patch' || line.startsWith('GIT binary patch '));
 }
 
+function textFromBuffer(buffer: Buffer): string | null {
+  if (buffer.includes(0)) return null;
+  return buffer.toString('utf8');
+}
+
+async function gitObjectText(repoPath: string, ref: 'HEAD' | 'index', repoRelativePath: string, missingAsEmpty = false): Promise<string | null> {
+  const revision = ref === 'HEAD' ? `HEAD:${repoRelativePath}` : `:${repoRelativePath}`;
+  const result = await runGit({
+    args: ['-C', repoPath, 'show', revision],
+    timeoutMs: DIFF_TIMEOUT_MS,
+    outputLimitBytes: GIT_DIFF_OUTPUT_LIMIT_BYTES,
+    readOnly: true,
+  });
+  if (result.timedOut || result.stdoutTruncated) return null;
+  if (result.exitCode !== 0) return missingAsEmpty ? '' : null;
+  return result.stdout.includes('\0') ? null : result.stdout;
+}
+
+async function worktreeText(lookup: RepoLookup, repoRelativePath: string): Promise<string | null> {
+  const target = path.resolve(lookup.repo.path, repoRelativePath);
+  let opened: Awaited<ReturnType<typeof openExistingFileInsideRoot>> | null = null;
+  try {
+    opened = await openExistingFileInsideRoot(lookup.activeCwd, target);
+    if (!opened.stats.isFile() || opened.stats.size > GIT_DIFF_OUTPUT_LIMIT_BYTES) return null;
+    const content = await readOpenedFileFully(opened.handle, opened.stats.size);
+    return textFromBuffer(content);
+  } catch (error) {
+    if (typeof error === 'object' && error !== null && (error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+    return null;
+  } finally {
+    if (opened) await opened.handle.close().catch(() => undefined);
+  }
+}
+
+async function trackedDiffSnapshot(
+  lookup: RepoLookup,
+  scope: Exclude<GitDiffResult['scope'], 'untracked'>,
+  repoPath: string,
+  originalRepoPath: string | null,
+): Promise<{ before: string; after: string } | null> {
+  const beforePath = originalRepoPath ?? repoPath;
+  const before =
+    scope === 'staged' ? await gitObjectText(lookup.realRepoPath, 'HEAD', beforePath, true) : await gitObjectText(lookup.realRepoPath, 'index', beforePath, true);
+  const after = scope === 'staged' ? await gitObjectText(lookup.realRepoPath, 'index', repoPath, true) : await worktreeText(lookup, repoPath);
+  if (before === null || after === null) return null;
+  return { before, after };
+}
+
 export async function listGitRepos(state: HostRuntimeState): Promise<{ cwd: string; repos: GitTrackedRepo[] }> {
   const cwd = requireActiveCwd(state);
   return { cwd, repos: [...workspaceFor(state, cwd).repos] };
@@ -305,12 +353,16 @@ export async function gitDiffForRepo(
       if (!opened.stats.isFile()) throw new Error('untracked diff target must be a regular file');
       if (opened.stats.size > GIT_DIFF_OUTPUT_LIMIT_BYTES) throw new Error('diff is too large');
       const content = await readOpenedFileFully(opened.handle, opened.stats.size);
+      const text = textFromBuffer(content);
+      if (text === null) throw new Error('binary diff is not shown');
       return {
         repoId: params.repoId,
         path: repoPath,
         scope: 'untracked',
         patch: syntheticUntrackedPatch(repoPath, content),
         truncated: false,
+        before: '',
+        after: text,
       };
     } finally {
       await opened.handle.close().catch(() => undefined);
@@ -333,6 +385,7 @@ export async function gitDiffForRepo(
   if (result.exitCode !== 0) throw new Error(result.stderr.trim() || 'git diff failed');
 
   const binary = isBinaryGitDiff(result.stdout);
+  const snapshot = !binary && !result.stdoutTruncated ? await trackedDiffSnapshot(lookup, params.scope, repoPath, originalRepoPath) : null;
   return {
     repoId: params.repoId,
     path: repoPath,
@@ -340,6 +393,7 @@ export async function gitDiffForRepo(
     patch: binary ? '' : result.stdout,
     truncated: result.stdoutTruncated,
     binary,
+    ...(snapshot ? { before: snapshot.before, after: snapshot.after } : {}),
   };
 }
 
