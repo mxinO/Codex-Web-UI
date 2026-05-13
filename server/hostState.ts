@@ -1,6 +1,7 @@
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import type { CodexRunOptions, HostRuntimeState, QueuedMessage } from './types.js';
+import type { CodexRunOptions, GitTrackedRepo, GitUntrackedMode, GitWorkspaceState, HostRuntimeState, QueuedMessage } from './types.js';
 
 interface HostStateStoreOptions {
   maxQueueItems?: number;
@@ -11,9 +12,15 @@ interface HostStateStoreOptions {
 const DEFAULT_MAX_QUEUE_ITEMS = 20;
 const DEFAULT_MAX_RECENT_CWDS = 20;
 const DEFAULT_MAX_STATE_FILE_BYTES = 256_000;
+const MAX_GIT_WORKSPACES = 20;
+const MAX_GIT_REPOS_PER_WORKSPACE = 20;
+const MAX_PATH_LENGTH = 4096;
+const MAX_LABEL_LENGTH = 256;
+const MAX_REPO_ID_LENGTH = 256;
 const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
 const SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
 const COLLABORATION_MODES = new Set(['default', 'plan']);
+const GIT_UNTRACKED_MODES = new Set(['normal', 'all', 'no']);
 
 function safeHost(hostname: string): string {
   return hostname.replace(/[^A-Za-z0-9_.-]/g, '_');
@@ -35,6 +42,7 @@ function defaultState(hostname: string): HostRuntimeState {
     appServerPid: null,
     queue: [],
     recentCwds: [],
+    gitWorkspaces: [],
     theme: 'dark',
   };
 }
@@ -86,6 +94,62 @@ function sanitizeStringArray(value: unknown, limit: number): string[] {
   return value.filter((item): item is string => typeof item === 'string').slice(-limit);
 }
 
+function sanitizeBoundedString(value: unknown, maxLength: number): string | null {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim().slice(0, maxLength);
+  return trimmed ? trimmed : null;
+}
+
+function repoIdForPath(repoPath: string): string {
+  return `repo:${createHash('sha1').update(repoPath).digest('hex')}`;
+}
+
+function sanitizeGitRepo(value: unknown): GitTrackedRepo | null {
+  if (!value || typeof value !== 'object') return null;
+  const candidate = value as Partial<GitTrackedRepo>;
+  const repoPath = sanitizeBoundedString(candidate.path, MAX_PATH_LENGTH);
+  const label = sanitizeBoundedString(candidate.label, MAX_LABEL_LENGTH);
+  if (!repoPath || !label || typeof candidate.addedAt !== 'number' || !Number.isFinite(candidate.addedAt)) {
+    return null;
+  }
+
+  const id = sanitizeBoundedString(candidate.id, MAX_REPO_ID_LENGTH) ?? repoIdForPath(repoPath);
+  const repo: GitTrackedRepo = {
+    id,
+    path: repoPath,
+    label,
+    addedAt: candidate.addedAt,
+  };
+
+  const untrackedMode = optionalEnum(candidate.untrackedMode, GIT_UNTRACKED_MODES);
+  if (untrackedMode) repo.untrackedMode = untrackedMode as GitUntrackedMode;
+
+  return repo;
+}
+
+function sanitizeGitWorkspaces(value: unknown): GitWorkspaceState[] {
+  if (!Array.isArray(value)) return [];
+
+  const workspaces: GitWorkspaceState[] = [];
+  for (const item of value) {
+    if (workspaces.length >= MAX_GIT_WORKSPACES) break;
+    if (!item || typeof item !== 'object') continue;
+
+    const candidate = item as Partial<GitWorkspaceState>;
+    const cwd = sanitizeBoundedString(candidate.cwd, MAX_PATH_LENGTH);
+    if (!cwd || !Array.isArray(candidate.repos)) continue;
+
+    const repos = candidate.repos
+      .map(sanitizeGitRepo)
+      .filter((repo): repo is GitTrackedRepo => Boolean(repo))
+      .slice(0, MAX_GIT_REPOS_PER_WORKSPACE);
+
+    workspaces.push({ cwd, repos });
+  }
+
+  return workspaces;
+}
+
 function sanitizeState(
   hostname: string,
   value: unknown,
@@ -113,6 +177,7 @@ function sanitizeState(
           .slice(-maxQueueItems)
       : [],
     recentCwds: sanitizeStringArray(candidate.recentCwds, maxRecentCwds),
+    gitWorkspaces: sanitizeGitWorkspaces(candidate.gitWorkspaces),
   };
 }
 

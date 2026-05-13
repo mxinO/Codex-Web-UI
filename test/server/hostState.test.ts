@@ -1,8 +1,13 @@
+import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { HostStateStore } from '../../server/hostState.js';
+
+function repoIdForPath(repoPath: string): string {
+  return `repo:${createHash('sha1').update(repoPath).digest('hex')}`;
+}
 
 describe('HostStateStore', () => {
   it('namespaces state by hostname', () => {
@@ -30,6 +35,7 @@ describe('HostStateStore', () => {
         model: null,
         effort: null,
         queue: [],
+        gitWorkspaces: [],
       });
     } finally {
       rmSync(dir, { recursive: true, force: true });
@@ -142,15 +148,113 @@ describe('HostStateStore', () => {
         hostname: 'login-node',
         activeThreadId: null,
         queue: [],
+        gitWorkspaces: [],
       });
       expect(new HostStateStore(oversizedDir, 'login-node', { maxStateFileBytes: 10 }).read()).toMatchObject({
         hostname: 'login-node',
         activeThreadId: null,
         queue: [],
+        gitWorkspaces: [],
       });
     } finally {
       rmSync(malformedDir, { recursive: true, force: true });
       rmSync(oversizedDir, { recursive: true, force: true });
+    }
+  });
+
+  it('sanitizes git workspace metadata', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codex-webui-state-'));
+    try {
+      writeFileSync(
+        join(dir, 'login-node.runtime.json'),
+        JSON.stringify({
+          gitWorkspaces: [
+            {
+              cwd: ' /workspace ',
+              ignored: true,
+              repos: [
+                {
+                  path: ' /workspace/repo-a ',
+                  label: ' repo-a ',
+                  addedAt: 1000,
+                  untrackedMode: 'normal',
+                  extra: { nested: true },
+                },
+                {
+                  id: 'repo:kept',
+                  path: '/workspace/repo-b',
+                  label: '/workspace/repo-b'.repeat(100),
+                  addedAt: 2000,
+                  untrackedMode: 'everything',
+                  extra: 'drop me',
+                },
+                { id: 'missing-path', label: 'bad', addedAt: 1 },
+                { path: '/workspace/no-label', addedAt: 1 },
+                { path: '/workspace/no-added-at', label: 'bad' },
+                { path: 42, label: 'bad', addedAt: 1 },
+              ],
+            },
+            { cwd: 42, repos: [] },
+            { cwd: '/workspace/no-repos' },
+            'bad',
+          ],
+        }),
+      );
+
+      const state = new HostStateStore(dir, 'login-node').read();
+
+      expect(state.gitWorkspaces).toEqual([
+        {
+          cwd: '/workspace',
+          repos: [
+            {
+              id: repoIdForPath('/workspace/repo-a'),
+              path: '/workspace/repo-a',
+              label: 'repo-a',
+              addedAt: 1000,
+              untrackedMode: 'normal',
+            },
+            {
+              id: 'repo:kept',
+              path: '/workspace/repo-b',
+              label: '/workspace/repo-b'.repeat(100).slice(0, 256),
+              addedAt: 2000,
+            },
+          ],
+        },
+      ]);
+      expect(state.gitWorkspaces[0]).not.toHaveProperty('ignored');
+      expect(state.gitWorkspaces[0].repos[0]).not.toHaveProperty('extra');
+      expect(state.gitWorkspaces[0].repos[1]).not.toHaveProperty('untrackedMode');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('bounds persisted git workspace and repo metadata', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codex-webui-state-'));
+    try {
+      const gitWorkspaces = Array.from({ length: 25 }, (_, workspaceIdx) => ({
+        cwd: `/workspace/${workspaceIdx}`,
+        repos: Array.from({ length: 25 }, (_, repoIdx) => ({
+          id: `repo:${workspaceIdx}:${repoIdx}`,
+          path: `/workspace/${workspaceIdx}/repo-${repoIdx}`,
+          label: `repo-${repoIdx}`,
+          addedAt: repoIdx,
+        })),
+      }));
+      writeFileSync(join(dir, 'login-node.runtime.json'), JSON.stringify({ gitWorkspaces }));
+
+      const state = new HostStateStore(dir, 'login-node').read();
+
+      expect(state.gitWorkspaces).toHaveLength(20);
+      expect(state.gitWorkspaces[0].cwd).toBe('/workspace/0');
+      expect(state.gitWorkspaces[19].cwd).toBe('/workspace/19');
+      expect(state.gitWorkspaces[0].repos).toHaveLength(20);
+      expect(state.gitWorkspaces[0].repos[0].id).toBe('repo:0:0');
+      expect(state.gitWorkspaces[0].repos[19].id).toBe('repo:0:19');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

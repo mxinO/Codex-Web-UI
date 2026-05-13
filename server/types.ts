@@ -16,6 +16,55 @@ export interface QueuedMessage {
   options?: CodexRunOptions;
 }
 
+export type GitUntrackedMode = 'normal' | 'all' | 'no';
+
+export interface GitTrackedRepo {
+  id: string;
+  path: string;
+  label: string;
+  addedAt: number;
+  untrackedMode?: GitUntrackedMode;
+}
+
+export interface GitWorkspaceState {
+  cwd: string;
+  repos: GitTrackedRepo[];
+}
+
+export type GitStatusKind = 'staged' | 'unstaged' | 'untracked' | 'ignored' | 'conflict';
+
+export interface GitStatusEntry {
+  path: string;
+  originalPath?: string;
+  indexStatus: string;
+  worktreeStatus: string;
+  kind: GitStatusKind;
+  isDirectory?: boolean;
+  submodule?: string;
+}
+
+export interface GitStatusResult {
+  repoId: string;
+  path: string;
+  branch: string | null;
+  headOid: string | null;
+  upstream: string | null;
+  ahead: number | null;
+  behind: number | null;
+  entries: GitStatusEntry[];
+  refreshedAt: number;
+  truncated: boolean;
+}
+
+export interface GitDiffResult {
+  repoId: string;
+  path: string;
+  scope: 'staged' | 'unstaged' | 'untracked';
+  patch: string;
+  truncated: boolean;
+  binary?: boolean;
+}
+
 export interface HostRuntimeState {
   hostname: string;
   activeThreadId: string | null;
@@ -31,6 +80,7 @@ export interface HostRuntimeState {
   appServerPid: number | null;
   queue: QueuedMessage[];
   recentCwds: string[];
+  gitWorkspaces: GitWorkspaceState[];
   theme: 'dark' | 'light';
 }
 
