@@ -1,6 +1,7 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
+import os from 'node:os';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import WebSocket from 'ws';
@@ -15,22 +16,78 @@ const PLATFORM_PACKAGE_BY_TARGET = {
     'aarch64-pc-windows-msvc': '@openai/codex-win32-arm64',
 };
 const NODE_FETCH_MEMORY_OPTION = '--no-experimental-fetch';
+const NODE_WEBSOCKET_MEMORY_OPTION = '--no-experimental-websocket';
+const NODE_WEB_API_MEMORY_OPTIONS = [NODE_FETCH_MEMORY_OPTION, NODE_WEBSOCKET_MEMORY_OPTION];
 function truthyEnv(value) {
     return /^(1|true|yes)$/i.test(value ?? '');
 }
-function appendNodeOption(options, option) {
+function preserveNodeWebApis(env) {
+    return truthyEnv(env.CODEX_WEB_UI_PRESERVE_NODE_FETCH) || truthyEnv(env.CODEX_WEB_UI_PRESERVE_NODE_WEB_APIS);
+}
+function appendNodeOptions(options, nextOptions) {
     const trimmed = options?.trim();
-    if (!trimmed)
-        return option;
-    const tokens = trimmed.split(/\s+/);
-    return tokens.includes(option) ? trimmed : `${trimmed} ${option}`;
+    const tokens = trimmed ? trimmed.split(/\s+/) : [];
+    for (const option of nextOptions) {
+        if (!tokens.includes(option))
+            tokens.push(option);
+    }
+    return tokens.join(' ');
 }
 function codexChildBaseEnv(env) {
     const childEnv = { ...env };
-    if (!truthyEnv(childEnv.CODEX_WEB_UI_PRESERVE_NODE_FETCH)) {
-        childEnv.NODE_OPTIONS = appendNodeOption(childEnv.NODE_OPTIONS, NODE_FETCH_MEMORY_OPTION);
+    if (!preserveNodeWebApis(childEnv)) {
+        childEnv.NODE_OPTIONS = appendNodeOptions(childEnv.NODE_OPTIONS, NODE_WEB_API_MEMORY_OPTIONS);
     }
     return childEnv;
+}
+function shellQuote(value) {
+    return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+function createNodeWrapper(realNode, platform = process.platform) {
+    if (!realNode || !path.isAbsolute(realNode) || !fs.existsSync(realNode))
+        return null;
+    const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-webui-node-'));
+    const wrapperPath = path.join(directory, platform === 'win32' ? 'node.cmd' : 'node');
+    const options = NODE_WEB_API_MEMORY_OPTIONS.join(' ');
+    const content = platform === 'win32'
+        ? `@echo off\r\nset "NODE_OPTIONS=%NODE_OPTIONS% ${options}"\r\n"${realNode}" %*\r\n`
+        : `#!/bin/sh
+add_node_option() {
+  case " \${NODE_OPTIONS:-} " in
+    *" $1 "*) ;;
+    *) NODE_OPTIONS="\${NODE_OPTIONS:+$NODE_OPTIONS }$1" ;;
+  esac
+}
+add_node_option ${NODE_FETCH_MEMORY_OPTION}
+add_node_option ${NODE_WEBSOCKET_MEMORY_OPTION}
+export NODE_OPTIONS
+exec ${shellQuote(realNode)} "$@"
+`;
+    fs.writeFileSync(wrapperPath, content, { encoding: 'utf8', mode: platform === 'win32' ? 0o600 : 0o700 });
+    if (platform !== 'win32')
+        fs.chmodSync(wrapperPath, 0o700);
+    return {
+        directory,
+        path: wrapperPath,
+        cleanup: () => {
+            fs.rmSync(directory, { recursive: true, force: true });
+        },
+    };
+}
+export function prepareCodexChildRuntimeEnv(env, platform = process.platform, realNode = process.execPath) {
+    if (preserveNodeWebApis(env))
+        return { env, nodeWrapperPath: null, cleanup: () => undefined };
+    const wrapper = createNodeWrapper(realNode, platform);
+    if (!wrapper)
+        return { env, nodeWrapperPath: null, cleanup: () => undefined };
+    return {
+        env: {
+            ...env,
+            PATH: [wrapper.directory, ...pathEntries(env)].join(path.delimiter),
+        },
+        nodeWrapperPath: wrapper.path,
+        cleanup: wrapper.cleanup,
+    };
 }
 function targetTripleFor(platform = process.platform, arch = process.arch) {
     if (platform === 'linux' || platform === 'android') {
@@ -279,17 +336,34 @@ export class CodexAppServer {
         return new Promise((resolve, reject) => {
             const lifecycleId = ++this.lifecycleId;
             const codexSpawn = resolveCodexSpawnConfig();
+            const runtimeEnv = prepareCodexChildRuntimeEnv(codexSpawn.env);
+            let runtimeCleaned = false;
+            const cleanupRuntime = () => {
+                if (runtimeCleaned)
+                    return;
+                runtimeCleaned = true;
+                runtimeEnv.cleanup();
+            };
             logInfo('Starting Codex app-server child', {
                 cwd: this.options.cwd,
                 command: codexSpawn.command,
                 source: codexSpawn.source,
-                nodeFetch: codexSpawn.env.NODE_OPTIONS?.split(/\s+/).includes(NODE_FETCH_MEMORY_OPTION) ? 'disabled' : 'default',
+                nodeWebApis: NODE_WEB_API_MEMORY_OPTIONS.every((option) => runtimeEnv.env.NODE_OPTIONS?.split(/\s+/).includes(option)) ? 'disabled' : 'default',
+                nodeWrapper: runtimeEnv.nodeWrapperPath ? 'enabled' : 'disabled',
             });
-            const child = spawn(codexSpawn.command, ['app-server', '--listen', 'ws://127.0.0.1:0'], {
-                cwd: this.options.cwd,
-                env: codexSpawn.env,
-                stdio: ['ignore', 'pipe', 'pipe'],
-            });
+            let child;
+            try {
+                child = spawn(codexSpawn.command, ['app-server', '--listen', 'ws://127.0.0.1:0'], {
+                    cwd: this.options.cwd,
+                    env: runtimeEnv.env,
+                    stdio: ['ignore', 'pipe', 'pipe'],
+                });
+            }
+            catch (error) {
+                cleanupRuntime();
+                reject(error instanceof Error ? error : new Error(String(error)));
+                return;
+            }
             this.child = child;
             logInfo('Codex app-server child spawned', { pid: child.pid });
             let settled = false;
@@ -336,6 +410,7 @@ export class CodexAppServer {
             };
             const onError = (error) => {
                 if (!settled) {
+                    cleanupRuntime();
                     fail(error);
                     return;
                 }
@@ -368,6 +443,7 @@ export class CodexAppServer {
             child.stdout.on('data', onStdoutOutput);
             child.stderr.on('data', onStderrOutput);
             child.on('error', onError);
+            child.once('exit', cleanupRuntime);
             child.once('exit', onStartupExit);
             child.once('exit', (code, signal) => {
                 if (!this.isCurrentLifecycle(lifecycleId, child))

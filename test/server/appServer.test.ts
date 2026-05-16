@@ -1,9 +1,10 @@
+import { execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { CodexAppServer, resolveCodexSpawnConfig } from '../../server/appServer.js';
+import { CodexAppServer, prepareCodexChildRuntimeEnv, resolveCodexSpawnConfig } from '../../server/appServer.js';
 
 const tempDirs: string[] = [];
 
@@ -48,6 +49,7 @@ describe('CodexAppServer lifecycle', () => {
     expect(resolved.env.PATH?.split(':')[0]).toBe(helperPathDir);
     expect(resolved.env.CODEX_MANAGED_BY_NPM).toBe('1');
     expect(nodeOptions(resolved.env)).toContain('--no-experimental-fetch');
+    expect(nodeOptions(resolved.env)).toContain('--no-experimental-websocket');
   });
 
   it('resolves native Codex binaries from the launcher local vendor layout', () => {
@@ -72,6 +74,7 @@ describe('CodexAppServer lifecycle', () => {
     expect(resolved.env.CODEX_MANAGED_BY_BUN).toBe('1');
     expect(resolved.env.CODEX_MANAGED_BY_NPM).toBeUndefined();
     expect(nodeOptions(resolved.env)).toContain('--no-experimental-fetch');
+    expect(nodeOptions(resolved.env)).toContain('--no-experimental-websocket');
   });
 
   it('falls back to the codex launcher when a native package cannot be resolved', () => {
@@ -85,6 +88,7 @@ describe('CodexAppServer lifecycle', () => {
 
     expect(resolved).toMatchObject({ command: join(binDir, 'codex'), source: 'path' });
     expect(nodeOptions(resolved.env)).toContain('--no-experimental-fetch');
+    expect(nodeOptions(resolved.env)).toContain('--no-experimental-websocket');
   });
 
   it('falls back to the codex launcher on unsupported native platforms', () => {
@@ -98,6 +102,7 @@ describe('CodexAppServer lifecycle', () => {
 
     expect(resolved).toMatchObject({ command: join(binDir, 'codex'), source: 'path' });
     expect(nodeOptions(resolved.env)).toContain('--no-experimental-fetch');
+    expect(nodeOptions(resolved.env)).toContain('--no-experimental-websocket');
   });
 
   it('allows an explicit Codex binary override', () => {
@@ -108,18 +113,23 @@ describe('CodexAppServer lifecycle', () => {
       source: 'env',
     });
     expect(nodeOptions(resolved.env)).toContain('--no-experimental-fetch');
+    expect(nodeOptions(resolved.env)).toContain('--no-experimental-websocket');
   });
 
   it('preserves existing child NODE_OPTIONS while disabling Node global fetch by default', () => {
     const resolved = resolveCodexSpawnConfig({ CODEX_WEB_UI_CODEX_BIN: '/opt/codex-native', NODE_OPTIONS: '--max-old-space-size=256' }, 'linux', 'x64');
 
-    expect(nodeOptions(resolved.env)).toEqual(['--max-old-space-size=256', '--no-experimental-fetch']);
+    expect(nodeOptions(resolved.env)).toEqual(['--max-old-space-size=256', '--no-experimental-fetch', '--no-experimental-websocket']);
   });
 
-  it('does not duplicate the child Node fetch option', () => {
-    const resolved = resolveCodexSpawnConfig({ CODEX_WEB_UI_CODEX_BIN: '/opt/codex-native', NODE_OPTIONS: '--no-experimental-fetch' }, 'linux', 'x64');
+  it('does not duplicate the child Node web API options', () => {
+    const resolved = resolveCodexSpawnConfig(
+      { CODEX_WEB_UI_CODEX_BIN: '/opt/codex-native', NODE_OPTIONS: '--no-experimental-fetch --no-experimental-websocket' },
+      'linux',
+      'x64',
+    );
 
-    expect(nodeOptions(resolved.env)).toEqual(['--no-experimental-fetch']);
+    expect(nodeOptions(resolved.env)).toEqual(['--no-experimental-fetch', '--no-experimental-websocket']);
   });
 
   it('allows preserving Node global fetch for Codex child processes', () => {
@@ -136,6 +146,37 @@ describe('CodexAppServer lifecycle', () => {
     );
 
     expect(nodeOptions(resolved.env)).toEqual(['--max-old-space-size=256']);
+  });
+
+  it('supports the clearer web API preservation env alias', () => {
+    const resolved = resolveCodexSpawnConfig({ CODEX_WEB_UI_CODEX_BIN: '/opt/codex-native', CODEX_WEB_UI_PRESERVE_NODE_WEB_APIS: 'true' }, 'linux', 'x64');
+
+    expect(resolved.env.NODE_OPTIONS).toBeUndefined();
+  });
+
+  it('prepends a node wrapper for Codex-launched Node helpers', () => {
+    const root = tempRoot();
+    const realNode = join(root, 'node-real');
+    writeFileSync(realNode, '#!/bin/sh\nprintf "%s" "$NODE_OPTIONS"\n');
+    chmodSync(realNode, 0o755);
+
+    const runtime = prepareCodexChildRuntimeEnv({ PATH: '/usr/bin', NODE_OPTIONS: '--max-old-space-size=256' }, 'linux', realNode);
+    try {
+      expect(runtime.nodeWrapperPath).not.toBeNull();
+      expect(runtime.env.PATH?.split(':')[0]).toBe(runtime.nodeWrapperPath ? join(runtime.nodeWrapperPath, '..') : '');
+      const wrapper = readFileSync(runtime.nodeWrapperPath ?? '', 'utf8');
+      expect(wrapper).toContain('--no-experimental-fetch');
+      expect(wrapper).toContain('--no-experimental-websocket');
+      expect(wrapper).toContain(realNode);
+      const output = execFileSync(runtime.nodeWrapperPath ?? '', [], {
+        encoding: 'utf8',
+        env: { NODE_OPTIONS: '--max-old-space-size=256 --no-experimental-fetch' },
+      });
+      expect(output.trim().split(/\s+/)).toEqual(['--max-old-space-size=256', '--no-experimental-fetch', '--no-experimental-websocket']);
+    } finally {
+      runtime.cleanup();
+    }
+    expect(runtime.nodeWrapperPath ? existsSync(runtime.nodeWrapperPath) : false).toBe(false);
   });
 
   it('does not report connected until initialize has completed', () => {

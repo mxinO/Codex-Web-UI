@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.4 - 2026-05-16
+
+### Fixed
+
+- Further reduced Node undici startup memory pressure under Codex by also disabling Node's global WebSocket and prepending a lightweight `node` wrapper for Codex-launched Node helpers.
+
 ## 0.3.3 - 2026-05-16
 
 ### Fixed
