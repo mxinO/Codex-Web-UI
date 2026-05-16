@@ -13,6 +13,7 @@ import { writeFileInsideRoot } from './fileTransfer.js';
 import { HostStateStore } from './hostState.js';
 import { configureLogger, logError, logInfo, logWarn } from './logger.js';
 import { resolvePackageRoot, resolveStartCwd } from './paths.js';
+import { installProcessErrorHandlers, markProcessStartupComplete } from './processErrors.js';
 const config = readConfig();
 const packageRoot = resolvePackageRoot();
 const startCwd = resolveStartCwd();
@@ -21,6 +22,7 @@ const logFilePath = path.join(config.stateDir, `${safeHostname}.log`);
 const nodeWebApiOptions = ['--no-experimental-fetch', '--no-experimental-websocket', '--no-experimental-eventsource'].filter((option) => process.allowedNodeEnvironmentFlags.has(option));
 const nodeOptions = process.env.NODE_OPTIONS?.split(/\s+/).filter(Boolean) ?? [];
 configureLogger({ filePath: logFilePath });
+installProcessErrorHandlers();
 logInfo('Starting Codex Web UI server', {
     pid: process.pid,
     hostname: config.hostname,
@@ -138,6 +140,7 @@ server.listen(config.port, config.host, () => {
     console.log(`[info] Open in browser: ${url}`);
     logInfo('Open in browser URL printed to stdout', { host: config.host, port, auth: config.noAuth ? 'disabled' : 'token-required' });
     logInfo('Codex Web UI server listening', { host: config.host, port, logFilePath });
+    markProcessStartupComplete();
 });
 let shuttingDown = false;
 function shutdown(signal) {
@@ -156,15 +159,5 @@ function shutdown(signal) {
         process.exit(signal === 'SIGTERM' ? 143 : 130);
     }, 5000).unref();
 }
-process.on('uncaughtException', (error) => {
-    logError('Uncaught exception', error);
-    process.exit(1);
-});
-process.on('unhandledRejection', (reason) => {
-    logError('Unhandled rejection', reason);
-});
-process.on('exit', (code) => {
-    logInfo('Codex Web UI process exiting', { code, pid: process.pid });
-});
 process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('SIGTERM', () => shutdown('SIGTERM'));

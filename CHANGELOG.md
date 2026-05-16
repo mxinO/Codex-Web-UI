@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.8 - 2026-05-16
+
+### Fixed
+
+- Fixed Web UI startup on memory-limited Node 22 hosts where Node's internal undici WebAssembly allocation can reject during Codex app-server startup before the browser server begins listening.
+
 ## 0.3.7 - 2026-05-16
 
 ### Fixed
