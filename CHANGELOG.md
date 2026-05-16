@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.7 - 2026-05-16
+
+### Fixed
+
+- Improved opt-in Codex startup tracing to catch short-lived or same-PID Node helper changes, trace node-wrapper invocations, and allow `CODEX_WEB_UI_CODEX_LAUNCH_MODE=path` for comparing the native package binary against the Codex launcher.
+
 ## 0.3.6 - 2026-05-16
 
 ### Fixed

@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -39,6 +39,8 @@ describe('Codex process tracing', () => {
         '--token',
         'plain-token-value',
         'OPENAI_API_KEY=sk-envsecretsecretsecret',
+        'ghp_abcdefghijklmnopqrstuvwxyz123456',
+        'github_pat_abcdefghijklmnopqrstuvwxyz123456',
         'Authorization: Bearer bearer-secret',
         'safe-value',
       ]),
@@ -49,6 +51,8 @@ describe('Codex process tracing', () => {
       '--token',
       '<redacted>',
       'OPENAI_API_KEY=<redacted>',
+      '<redacted>',
+      '<redacted>',
       'Authorization: Bearer <redacted>',
       'safe-value',
     ]);
@@ -109,6 +113,29 @@ describe('CodexAppServer lifecycle', () => {
     expect(resolved.command).toBe(join(nativeDir, 'codex'));
     expect(resolved.env.CODEX_MANAGED_BY_BUN).toBe('1');
     expect(resolved.env.CODEX_MANAGED_BY_NPM).toBeUndefined();
+    expectNodeWebApiOptions(resolved.env);
+  });
+
+  it('can force the Codex launcher path instead of the native package binary', () => {
+    const root = tempRoot();
+    const packageRoot = join(root, 'lib', 'node_modules', '@openai', 'codex');
+    const launcherDir = join(packageRoot, 'bin');
+    const binDir = join(root, 'bin');
+    const platformPackageRoot = join(packageRoot, 'node_modules', '@openai', 'codex-linux-x64');
+    const nativeDir = join(platformPackageRoot, 'vendor', 'x86_64-unknown-linux-musl', 'codex');
+    mkdirSync(launcherDir, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(nativeDir, { recursive: true });
+    writeFileSync(join(launcherDir, 'codex.js'), '#!/usr/bin/env node\n');
+    chmodSync(join(launcherDir, 'codex.js'), 0o755);
+    writeFileSync(join(platformPackageRoot, 'package.json'), '{"name":"@openai/codex-linux-x64"}\n');
+    writeFileSync(join(nativeDir, 'codex'), '#!/bin/sh\n');
+    chmodSync(join(nativeDir, 'codex'), 0o755);
+    symlinkSync(join('..', 'lib', 'node_modules', '@openai', 'codex', 'bin', 'codex.js'), join(binDir, 'codex'));
+
+    const resolved = resolveCodexSpawnConfig({ PATH: binDir, CODEX_WEB_UI_CODEX_LAUNCH_MODE: 'path' }, 'linux', 'x64');
+
+    expect(resolved).toMatchObject({ command: join(binDir, 'codex'), source: 'path' });
     expectNodeWebApiOptions(resolved.env);
   });
 
@@ -208,6 +235,31 @@ describe('CodexAppServer lifecycle', () => {
       runtime.cleanup();
     }
     expect(runtime.nodeWrapperPath ? existsSync(runtime.nodeWrapperPath) : false).toBe(false);
+  });
+
+  it('logs sanitized node wrapper trace lines when process tracing is enabled', () => {
+    const root = tempRoot();
+    const realNode = join(root, 'node-real');
+    writeFileSync(realNode, '#!/bin/sh\nprintf "%s" "$NODE_OPTIONS"\n');
+    chmodSync(realNode, 0o755);
+
+    const runtime = prepareCodexChildRuntimeEnv({ PATH: '/usr/bin', NODE_OPTIONS: '--max-old-space-size=256', CODEX_WEB_UI_TRACE_CODEX_PROCESSES: '1' }, 'linux', realNode);
+    try {
+      const result = spawnSync(runtime.nodeWrapperPath ?? '', ['OPENAI_API_KEY=sk-testsecretsecretsecret'], {
+        encoding: 'utf8',
+        env: { ...runtime.env, NODE_OPTIONS: '--max-old-space-size=256\nOPENAI_API_KEY=sk-testsecretsecretsecret', CODEX_WEB_UI_TRACE_CODEX_PROCESSES: 'True' },
+      });
+
+      expect(result.status).toBe(0);
+      expect(result.stderr).toContain('[codex-web-ui-node-wrapper]');
+      expect(result.stderr).toContain(`real_node=${realNode}`);
+      expect(result.stderr).toContain('node_options=<redacted>');
+      expect(result.stderr).toContain('argc=1');
+      expect(result.stderr).toContain('first_arg=<redacted>');
+      expect(result.stderr).not.toContain('sk-testsecretsecretsecret');
+    } finally {
+      runtime.cleanup();
+    }
   });
 
   it('does not report connected until initialize has completed', () => {

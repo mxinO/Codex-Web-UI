@@ -35,6 +35,8 @@ export interface CodexSpawnConfig {
   source: 'env' | 'native-package' | 'path';
 }
 
+type CodexLaunchMode = 'auto' | 'native' | 'path';
+
 const PLATFORM_PACKAGE_BY_TARGET: Record<string, string> = {
   'x86_64-unknown-linux-musl': '@openai/codex-linux-x64',
   'aarch64-unknown-linux-musl': '@openai/codex-linux-arm64',
@@ -55,6 +57,11 @@ function truthyEnv(value: string | undefined): boolean {
 
 function preserveNodeWebApis(env: NodeJS.ProcessEnv): boolean {
   return truthyEnv(env.CODEX_WEB_UI_PRESERVE_NODE_FETCH) || truthyEnv(env.CODEX_WEB_UI_PRESERVE_NODE_WEB_APIS);
+}
+
+function codexLaunchMode(env: NodeJS.ProcessEnv): CodexLaunchMode {
+  const value = env.CODEX_WEB_UI_CODEX_LAUNCH_MODE?.trim().toLowerCase();
+  return value === 'native' || value === 'path' ? value : 'auto';
 }
 
 function appendNodeOptions(options: string | undefined, nextOptions: string[]): string {
@@ -97,6 +104,40 @@ add_node_option() {
 }
 ${posixAddOptions}
 export NODE_OPTIONS
+trace_enabled() {
+  case "\${CODEX_WEB_UI_TRACE_CODEX_PROCESSES:-}" in
+    1|[Tt][Rr][Uu][Ee]|[Yy][Ee][Ss]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+trace_sanitize_arg() {
+  lower_arg=$(printf '%s' "$1" | LC_ALL=C tr '[:upper:]' '[:lower:]')
+  case "$lower_arg" in
+    *api-key*|*api_key*|*apikey*|*token*|*secret*|*password*|*passwd*|*credential*|*authorization*|*cookie*|sk-*|ghp_*|gho_*|ghu_*|ghs_*|ghr_*|github_pat_*|github_pat-*|xox*|nvapi-*) printf '<redacted>' ;;
+    *) printf '%s' "$1" | LC_ALL=C tr '\\r\\n\\t' '   ' ;;
+  esac
+}
+trace_sanitize_text() {
+  printf '%s' "$1" | LC_ALL=C tr '\\r\\n\\t' '   '
+}
+if trace_enabled; then
+  path_head=''
+  old_ifs=$IFS
+  IFS=:
+  count=0
+  for dir in \${PATH:-}; do
+    count=$((count + 1))
+    [ "$count" -gt 5 ] && break
+    path_head="\${path_head}\${path_head:+|}$dir"
+  done
+  IFS=$old_ifs
+  first_arg=$(trace_sanitize_arg "\${1:-}")
+  real_node=$(trace_sanitize_text ${shellQuote(realNode)})
+  cwd=$(trace_sanitize_text "$(pwd -P 2>/dev/null || pwd)")
+  node_options=$(trace_sanitize_arg "\${NODE_OPTIONS:-}")
+  path_head=$(trace_sanitize_text "$path_head")
+  printf '[codex-web-ui-node-wrapper] pid=%s ppid=%s real_node=%s cwd=%s node_options=%s path_head=%s argc=%s first_arg=%s\\n' "$$" "$PPID" "$real_node" "$cwd" "$node_options" "$path_head" "$#" "$first_arg" >&2
+fi
 exec ${shellQuote(realNode)} "$@"
 `;
   fs.writeFileSync(wrapperPath, content, { encoding: 'utf8', mode: platform === 'win32' ? 0o600 : 0o700 });
@@ -151,6 +192,8 @@ function selectedTraceEnv(pid: number): Record<string, unknown> {
     if (key === 'npm_config_user_agent') result.npm_config_user_agent = value;
     if (key === 'CODEX_MANAGED_BY_NPM') result.CODEX_MANAGED_BY_NPM = value;
     if (key === 'CODEX_MANAGED_BY_BUN') result.CODEX_MANAGED_BY_BUN = value;
+    if (key === 'CODEX_WEB_UI_CODEX_LAUNCH_MODE') result.CODEX_WEB_UI_CODEX_LAUNCH_MODE = value;
+    if (key === 'CODEX_WEB_UI_TRACE_CODEX_PROCESSES') result.CODEX_WEB_UI_TRACE_CODEX_PROCESSES = value;
   }
   return result;
 }
@@ -162,7 +205,11 @@ function redactTraceArgValue(value: string): string {
     .replace(/(authorization:\s*bearer\s+)[^\s"']+/gi, '$1<redacted>')
     .replace(/(cookie:\s*)[^\s"']+/gi, '$1<redacted>')
     .replace(/((?:api[-_]?key|token|secret|password|passwd|credential)\s*[:=]\s*)[^\s"']+/gi, '$1<redacted>')
-    .replace(/(?:sk|gh[pousr]|github_pat|xox[baprs]|nvapi)-[A-Za-z0-9_=-]{16,}/g, '<redacted>');
+    .replace(/\bsk-[A-Za-z0-9_=-]{16,}/g, '<redacted>')
+    .replace(/\bgh[pousr]_[A-Za-z0-9_=-]{16,}/g, '<redacted>')
+    .replace(/\bgithub_pat_[A-Za-z0-9_=-]{16,}/g, '<redacted>')
+    .replace(/\bxox[baprs]-[A-Za-z0-9_=-]{16,}/g, '<redacted>')
+    .replace(/\bnvapi-[A-Za-z0-9_=-]{16,}/g, '<redacted>');
 }
 
 export function sanitizeProcessArgvForTrace(argv: string[]): string[] {
@@ -196,7 +243,19 @@ export function sanitizeProcessArgvForTrace(argv: string[]): string[] {
   return sanitized;
 }
 
-function readProcSnapshot(pid: number): { pid: number; ppid: number; comm: string; argv: string[]; exe: string | null } | null {
+interface ProcStatSnapshot {
+  pid: number;
+  ppid: number;
+  startTime: string;
+  comm: string;
+}
+
+interface ProcSnapshot extends ProcStatSnapshot {
+  argv: string[];
+  exe: string | null;
+}
+
+function readProcStatSnapshot(pid: number): ProcStatSnapshot | null {
   try {
     const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
     const close = stat.lastIndexOf(')');
@@ -205,17 +264,27 @@ function readProcSnapshot(pid: number): { pid: number; ppid: number; comm: strin
     const rest = stat.slice(close + 2).split(' ');
     const ppid = Number(rest[1]);
     if (!Number.isFinite(ppid)) return null;
-    const argv = sanitizeProcessArgvForTrace(fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean));
-    let exe: string | null = null;
-    try {
-      exe = fs.readlinkSync(`/proc/${pid}/exe`);
-    } catch {
-      exe = null;
-    }
-    return { pid, ppid, comm, argv, exe };
+    const startTime = rest[19] ?? '';
+    return { pid, ppid, startTime, comm };
   } catch {
     return null;
   }
+}
+
+function readProcSnapshot(stat: ProcStatSnapshot): ProcSnapshot {
+  let argv: string[] = [];
+  let exe: string | null = null;
+  try {
+    argv = sanitizeProcessArgvForTrace(fs.readFileSync(`/proc/${stat.pid}/cmdline`, 'utf8').split('\0').filter(Boolean));
+  } catch {
+    argv = [];
+  }
+  try {
+    exe = fs.readlinkSync(`/proc/${stat.pid}/exe`);
+  } catch {
+    exe = null;
+  }
+  return { ...stat, argv, exe };
 }
 
 function codexTraceDurationMs(env: NodeJS.ProcessEnv): number {
@@ -224,16 +293,23 @@ function codexTraceDurationMs(env: NodeJS.ProcessEnv): number {
   return Math.max(1000, Math.min(30000, parsed));
 }
 
+function codexTraceIntervalMs(env: NodeJS.ProcessEnv): number {
+  const parsed = Number(env.CODEX_WEB_UI_TRACE_CODEX_PROCESSES_INTERVAL_MS ?? 10);
+  if (!Number.isFinite(parsed)) return 10;
+  return Math.max(5, Math.min(1000, parsed));
+}
+
 function startCodexProcessTrace(rootPid: number | undefined, env: NodeJS.ProcessEnv = process.env): () => void {
   if (!rootPid || process.platform !== 'linux' || !truthyEnv(env.CODEX_WEB_UI_TRACE_CODEX_PROCESSES)) return () => undefined;
 
-  const seen = new Set<number>();
+  const seenIdentities = new Map<number, string>();
   const durationMs = codexTraceDurationMs(env);
+  const intervalMs = codexTraceIntervalMs(env);
   let stopped = false;
 
   const sample = () => {
     if (stopped) return;
-    const snapshots = new Map<number, NonNullable<ReturnType<typeof readProcSnapshot>>>();
+    const statSnapshots = new Map<number, ProcStatSnapshot>();
     let procEntries: string[];
     try {
       procEntries = fs.readdirSync('/proc');
@@ -243,15 +319,15 @@ function startCodexProcessTrace(rootPid: number | undefined, env: NodeJS.Process
     }
     for (const entry of procEntries) {
       if (!/^\d+$/.test(entry)) continue;
-      const snapshot = readProcSnapshot(Number(entry));
-      if (snapshot) snapshots.set(snapshot.pid, snapshot);
+      const snapshot = readProcStatSnapshot(Number(entry));
+      if (snapshot) statSnapshots.set(snapshot.pid, snapshot);
     }
 
     const descendants = new Set<number>([rootPid]);
     let changed = true;
     while (changed) {
       changed = false;
-      for (const snapshot of snapshots.values()) {
+      for (const snapshot of statSnapshots.values()) {
         if (!descendants.has(snapshot.pid) && descendants.has(snapshot.ppid)) {
           descendants.add(snapshot.pid);
           changed = true;
@@ -260,23 +336,28 @@ function startCodexProcessTrace(rootPid: number | undefined, env: NodeJS.Process
     }
 
     for (const pid of descendants) {
-      if (seen.has(pid)) continue;
-      const snapshot = snapshots.get(pid);
-      if (!snapshot) continue;
-      seen.add(pid);
+      const statSnapshot = statSnapshots.get(pid);
+      if (!statSnapshot) continue;
+      const snapshot = readProcSnapshot(statSnapshot);
+      const identity = [snapshot.startTime, snapshot.exe ?? '', ...snapshot.argv].join('\0');
+      const previousIdentity = seenIdentities.get(pid);
+      if (previousIdentity === identity) continue;
+      seenIdentities.set(pid, identity);
       logWarn('Codex process trace observed process', {
         pid: snapshot.pid,
         ppid: snapshot.ppid,
+        startTime: snapshot.startTime,
         comm: snapshot.comm,
         exe: snapshot.exe,
         argv: snapshot.argv,
         selectedEnv: selectedTraceEnv(snapshot.pid),
+        identityChanged: previousIdentity !== undefined,
       });
     }
   };
 
-  logWarn('Codex process tracing enabled', { rootPid, durationMs });
-  const interval = setInterval(sample, 50);
+  logWarn('Codex process tracing enabled', { rootPid, durationMs, intervalMs });
+  const interval = setInterval(sample, intervalMs);
   const timeout = setTimeout(stop, durationMs);
   interval.unref();
   timeout.unref();
@@ -287,7 +368,7 @@ function startCodexProcessTrace(rootPid: number | undefined, env: NodeJS.Process
     stopped = true;
     clearInterval(interval);
     clearTimeout(timeout);
-    logWarn('Codex process tracing stopped', { rootPid, observedProcesses: seen.size });
+    logWarn('Codex process tracing stopped', { rootPid, observedProcesses: seenIdentities.size });
   }
 
   return stop;
@@ -376,13 +457,14 @@ export function resolveCodexSpawnConfig(env: NodeJS.ProcessEnv = process.env, pl
   const baseEnv = codexChildBaseEnv(env);
   const override = env.CODEX_WEB_UI_CODEX_BIN?.trim();
   if (override) return { command: override, env: baseEnv, source: 'env' };
+  const launchMode = codexLaunchMode(env);
 
   const targetTriple = targetTripleFor(platform, arch);
   const platformPackage = targetTriple ? PLATFORM_PACKAGE_BY_TARGET[targetTriple] : null;
   const launcherPath = findOnPath('codex', baseEnv, platform);
   const binaryName = platform === 'win32' ? 'codex.exe' : 'codex';
 
-  if (targetTriple && platformPackage && launcherPath) {
+  if (launchMode !== 'path' && targetTriple && platformPackage && launcherPath) {
     const binaryPath = nativeBinaryFromCodexLauncher(launcherPath, targetTriple, platformPackage, binaryName);
     if (binaryPath) {
       const archRoot = path.dirname(path.dirname(binaryPath));
@@ -565,6 +647,7 @@ export class CodexAppServer {
         cwd: this.options.cwd,
         command: codexSpawn.command,
         source: codexSpawn.source,
+        launchMode: codexLaunchMode(process.env),
         nodeWebApis:
           ACTIVE_NODE_WEB_API_MEMORY_OPTIONS.length > 0 && ACTIVE_NODE_WEB_API_MEMORY_OPTIONS.every((option) => runtimeNodeOptions.includes(option)) ? 'disabled' : 'default',
         nodeWrapper: runtimeEnv.nodeWrapperPath ? 'enabled' : 'disabled',
