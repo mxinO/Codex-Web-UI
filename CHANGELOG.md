@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.5 - 2026-05-16
+
+### Fixed
+
+- Disabled Node's built-in fetch and WebSocket APIs for the installed Web UI server process itself, not only for the Codex app-server child.
+
 ## 0.3.4 - 2026-05-16
 
 ### Fixed

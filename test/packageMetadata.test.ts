@@ -30,6 +30,8 @@ describe('package metadata', () => {
   it('starts installed servers from precompiled JavaScript instead of tsx', () => {
     expect(cliLauncher).toContain("dist-server', 'scripts', 'start.js");
     expect(cliLauncher).toContain('process.execPath');
+    expect(cliLauncher).toContain('--no-experimental-fetch');
+    expect(cliLauncher).toContain('--no-experimental-websocket');
     expect(cliLauncher).not.toContain("node_modules', '.bin'");
     expect(cliLauncher).not.toContain('--tsconfig');
   });

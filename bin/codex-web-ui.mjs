@@ -8,6 +8,28 @@ import { runUpdate } from './update.mjs';
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
+const NODE_WEB_API_MEMORY_OPTIONS = ['--no-experimental-fetch', '--no-experimental-websocket'];
+
+function truthyEnv(value) {
+  return /^(1|true|yes)$/i.test(value ?? '');
+}
+
+function preserveNodeWebApis(env = process.env) {
+  return truthyEnv(env.CODEX_WEB_UI_PRESERVE_NODE_FETCH) || truthyEnv(env.CODEX_WEB_UI_PRESERVE_NODE_WEB_APIS);
+}
+
+function appendNodeOptions(options, nextOptions) {
+  const tokens = options?.trim() ? options.trim().split(/\s+/) : [];
+  for (const option of nextOptions) {
+    if (process.allowedNodeEnvironmentFlags.has(option) && !tokens.includes(option)) tokens.push(option);
+  }
+  return tokens.join(' ');
+}
+
+function serverNodeOptions(env = process.env) {
+  if (preserveNodeWebApis(env)) return env.NODE_OPTIONS;
+  return appendNodeOptions(env.NODE_OPTIONS, NODE_WEB_API_MEMORY_OPTIONS);
+}
 
 function readPackageVersion() {
   try {
@@ -75,6 +97,9 @@ const env = {
   CODEX_WEB_UI_START_CWD: process.env.CODEX_WEB_UI_START_CWD || process.cwd(),
   CODEX_WEB_UI_STATE_DIR: process.env.CODEX_WEB_UI_STATE_DIR || defaultStateDir(),
 };
+const nextNodeOptions = serverNodeOptions(process.env);
+if (nextNodeOptions) env.NODE_OPTIONS = nextNodeOptions;
+else delete env.NODE_OPTIONS;
 
 const child = spawn(process.execPath, [scriptPath, ...args], {
   cwd: process.cwd(),

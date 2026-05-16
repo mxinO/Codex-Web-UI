@@ -27,6 +27,7 @@ logInfo('Starting Codex Web UI server', {
     stateDir: config.stateDir,
     startCwd,
     logFilePath,
+    nodeWebApis: typeof fetch === 'undefined' && typeof WebSocket === 'undefined' ? 'disabled' : 'default',
 });
 const app = express();
 const server = http.createServer(app);
