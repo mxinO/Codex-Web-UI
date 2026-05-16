@@ -1,0 +1,3100 @@
+import { createHash, randomUUID } from 'node:crypto';
+import fsSync from 'node:fs';
+import fs from 'node:fs/promises';
+import nodePath from 'node:path';
+import { WebSocket, WebSocketServer } from 'ws';
+import { authScopeFromHostHeader, isTokenValid, parseTokenFromCookieScopes } from './auth.js';
+import { isInteractiveCommandBlocked, runBangCommand } from './bangCommand.js';
+import { FileEditStore, sessionFileEditDbPath } from './fileEditStore.js';
+import { addGitRepo, gitCommit, gitDiffForRepo, gitStagePaths, gitStatusForRepo, gitUnstagePaths, listGitRepos, removeGitRepo, } from './gitTracker.js';
+import { assertPathInsideRoot, openExistingFileInsideRoot, readOpenedFileFully, resolveExistingPathInsideRoot, resolveWritablePathInsideRoot, writeFileInsideRoot, } from './fileTransfer.js';
+import { logWarn } from './logger.js';
+import { enqueueMessage, removeQueuedMessage, shiftQueuedMessage, updateQueuedMessage } from './queue.js';
+function send(ws, payload) {
+    if (ws.readyState === WebSocket.OPEN)
+        ws.send(JSON.stringify(payload));
+}
+function parseBrowserRequest(raw) {
+    try {
+        const parsed = JSON.parse(String(raw));
+        return parsed && typeof parsed === 'object' ? parsed : null;
+    }
+    catch {
+        return null;
+    }
+}
+function authScopesForRequest(hostHeader, fallbackScope) {
+    const requestScope = authScopeFromHostHeader(hostHeader, fallbackScope) ?? fallbackScope;
+    if (!requestScope)
+        return [];
+    if (!fallbackScope || requestScope === fallbackScope)
+        return [requestScope];
+    return [requestScope, fallbackScope];
+}
+function authorized(deps, queryToken, cookieHeader, hostHeader) {
+    if (deps.config.noAuth)
+        return true;
+    return (isTokenValid(deps.token, queryToken) ||
+        isTokenValid(deps.token, parseTokenFromCookieScopes(cookieHeader, authScopesForRequest(hostHeader, deps.authCookieScope))));
+}
+function closeClient(ws) {
+    if (ws.readyState === WebSocket.CLOSED)
+        return;
+    if (ws.readyState === WebSocket.CONNECTING || ws.readyState === WebSocket.CLOSING) {
+        ws.terminate();
+        return;
+    }
+    ws.close(1001, 'server shutting down');
+    ws.terminate();
+}
+function isRecord(value) {
+    return typeof value === 'object' && value !== null;
+}
+function hasOwn(value, key) {
+    return Object.prototype.hasOwnProperty.call(value, key);
+}
+function requestKey(id) {
+    return `${typeof id}:${String(id)}`;
+}
+function getRequiredString(params, key) {
+    if (!isRecord(params) || typeof params[key] !== 'string')
+        return null;
+    const value = params[key].trim();
+    return value.length > 0 ? value : null;
+}
+function getString(params, key) {
+    if (!isRecord(params) || typeof params[key] !== 'string')
+        return null;
+    return params[key];
+}
+function getRequiredRawString(params, key) {
+    if (!isRecord(params) || typeof params[key] !== 'string')
+        return null;
+    return params[key].length > 0 ? params[key] : null;
+}
+function getOptionalRawString(params, key) {
+    if (!isRecord(params) || !hasOwn(params, key))
+        return undefined;
+    const value = params[key];
+    if (value === null || value === undefined)
+        return undefined;
+    if (typeof value !== 'string')
+        throw new Error(`${key} must be a string`);
+    if (value.length === 0)
+        throw new Error(`${key} is required`);
+    return value;
+}
+function getRequiredStringArray(params, key) {
+    if (!isRecord(params) || !Array.isArray(params[key]))
+        return null;
+    const values = params[key];
+    return values.every((value) => typeof value === 'string') ? values : null;
+}
+const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
+const SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
+const COLLABORATION_MODES = new Set(['default', 'plan']);
+const GIT_DIFF_SCOPES = new Set(['staged', 'unstaged', 'untracked']);
+const BROWSE_DIRECTORY_LIMIT = 500;
+export const LEGACY_READ_FILE_MAX_BYTES = 5 * 1024 * 1024;
+const FILE_DIFF_SNAPSHOT_MAX_BYTES = 1024 * 1024;
+const FILE_DIFF_SNAPSHOT_TTL_MS = 10 * 60 * 1000;
+const FILE_DIFF_SNAPSHOT_MAX_ENTRIES = 50;
+const FILE_DIFF_PATCH_MAX_PATCHES_PER_FILE = 100;
+const FILE_DIFF_PATCH_MAX_BYTES_PER_FILE = FILE_DIFF_SNAPSHOT_MAX_BYTES;
+const FILE_DIFF_PATCH_MAX_PENDING_NOTIFICATIONS = 100;
+const FILE_DIFF_PATCH_MAX_INCOMPLETE_TURNS = 200;
+const COMPACTION_PENDING_TURN_PREFIX = 'compact-pending:';
+const TURN_START_PENDING_TURN_PREFIX = 'turn-start-pending:';
+const THREAD_TURNS_LIST_RPC_TIMEOUT_MS = 2 * 60 * 1000;
+const TURN_START_RPC_TIMEOUT_MS = 10 * 60 * 1000;
+const TURN_STEER_RPC_TIMEOUT_MS = 10 * 60 * 1000;
+const RECENT_NOTIFICATION_MAX_ENTRIES = 500;
+const RECENT_NOTIFICATION_MAX_BYTES = 2 * 1024 * 1024;
+const RECENT_NOTIFICATION_SINGLE_MAX_BYTES = 256 * 1024;
+function getOptionalString(params, key) {
+    if (!isRecord(params) || !hasOwn(params, key))
+        return null;
+    const value = params[key];
+    if (value === null || value === undefined)
+        return null;
+    if (typeof value !== 'string')
+        throw new Error(`${key} must be a string`);
+    const trimmed = value.trim();
+    return trimmed ? trimmed : null;
+}
+function getOptionalEnum(params, key, allowed) {
+    const value = getOptionalString(params, key);
+    if (!value)
+        return undefined;
+    if (!allowed.has(value))
+        throw new Error(`unsupported ${key}: ${value}`);
+    return value;
+}
+function runOptionsFromParams(params) {
+    const source = isRecord(params) && isRecord(params.options) ? params.options : params;
+    if (!isRecord(source))
+        return undefined;
+    const options = {};
+    const model = getOptionalString(source, 'model');
+    if (model)
+        options.model = model;
+    const effort = getOptionalEnum(source, 'effort', REASONING_EFFORTS);
+    if (effort)
+        options.effort = effort;
+    const mode = getOptionalEnum(source, 'mode', COLLABORATION_MODES);
+    if (mode && options.model)
+        options.mode = mode;
+    const sandbox = getOptionalEnum(source, 'sandbox', SANDBOX_MODES);
+    if (sandbox)
+        options.sandbox = sandbox;
+    return Object.keys(options).length > 0 ? options : undefined;
+}
+function collaborationMode(options) {
+    if (!options.mode)
+        return null;
+    if (!options.model)
+        return null;
+    return {
+        mode: options.mode,
+        settings: {
+            model: options.model,
+            reasoning_effort: options.effort ?? null,
+            developer_instructions: null,
+        },
+    };
+}
+function applyThreadRunOptions(params, options) {
+    if (!options)
+        return params;
+    const next = params;
+    if (options.model)
+        next.model = options.model;
+    if (options.sandbox)
+        next.sandbox = options.sandbox;
+    if (options.effort) {
+        const existingConfig = isRecord(next.config) ? next.config : {};
+        next.config = { ...existingConfig, model_reasoning_effort: options.effort };
+    }
+    return params;
+}
+function sandboxPolicy(mode, cwd) {
+    if (mode === 'danger-full-access')
+        return { type: 'dangerFullAccess' };
+    if (mode === 'read-only') {
+        return {
+            type: 'readOnly',
+            access: { type: 'fullAccess' },
+            networkAccess: false,
+        };
+    }
+    return {
+        type: 'workspaceWrite',
+        writableRoots: cwd ? [cwd] : [],
+        readOnlyAccess: { type: 'fullAccess' },
+        networkAccess: false,
+        excludeTmpdirEnvVar: false,
+        excludeSlashTmp: false,
+    };
+}
+function applyTurnRunOptions(params, options, cwd) {
+    if (!options)
+        return params;
+    const next = params;
+    if (options.model)
+        next.model = options.model;
+    if (options.effort)
+        next.effort = options.effort;
+    if (options.sandbox)
+        next.sandboxPolicy = sandboxPolicy(options.sandbox, cwd);
+    const mode = collaborationMode(options);
+    if (mode)
+        next.collaborationMode = mode;
+    return params;
+}
+function getStringPath(value, path) {
+    let current = value;
+    for (const key of path) {
+        if (!isRecord(current))
+            return null;
+        current = current[key];
+    }
+    return typeof current === 'string' && current.trim() ? current.trim() : null;
+}
+function getValuePath(value, path) {
+    let current = value;
+    for (const key of path) {
+        if (!isRecord(current))
+            return undefined;
+        current = current[key];
+    }
+    return current;
+}
+function enumValue(value, allowed) {
+    return typeof value === 'string' && allowed.has(value) ? value : null;
+}
+function sandboxModeFromPolicy(value) {
+    const type = getStringPath(value, ['type']);
+    if (type === 'dangerFullAccess')
+        return 'danger-full-access';
+    if (type === 'readOnly')
+        return 'read-only';
+    if (type === 'workspaceWrite')
+        return 'workspace-write';
+    return enumValue(value, SANDBOX_MODES);
+}
+function runtimeStatusFromThreadResult(result, fallback) {
+    const model = getStringPath(result, ['model']) ?? getStringPath(result, ['data', 'model']) ?? fallback?.model ?? null;
+    const effort = enumValue(getValuePath(result, ['reasoningEffort']), REASONING_EFFORTS) ??
+        enumValue(getValuePath(result, ['reasoning_effort']), REASONING_EFFORTS) ??
+        enumValue(getValuePath(result, ['effort']), REASONING_EFFORTS) ??
+        fallback?.effort ??
+        null;
+    const sandbox = sandboxModeFromPolicy(getValuePath(result, ['sandbox'])) ??
+        sandboxModeFromPolicy(getValuePath(result, ['data', 'sandbox'])) ??
+        fallback?.sandbox ??
+        null;
+    return {
+        model,
+        effort,
+        mode: fallback?.mode ?? null,
+        sandbox,
+    };
+}
+function applyRunOptionsToRuntimeState(state, options) {
+    if (!options)
+        return state;
+    return {
+        ...state,
+        model: options.model ?? state.model,
+        effort: options.effort ?? state.effort,
+        mode: options.mode ?? state.mode,
+        sandbox: options.sandbox ?? state.sandbox,
+    };
+}
+function runOptionsFromRuntimeState(state) {
+    const options = {};
+    if (state.model)
+        options.model = state.model;
+    if (state.effort)
+        options.effort = state.effort;
+    if (state.sandbox)
+        options.sandbox = state.sandbox;
+    if (state.mode && state.model)
+        options.mode = state.mode;
+    return Object.keys(options).length > 0 ? options : undefined;
+}
+function notificationPayload(message) {
+    if (isRecord(message.params) && isRecord(message.params.payload))
+        return message.params.payload;
+    if (isRecord(message.payload))
+        return message.payload;
+    if (isRecord(message.params))
+        return message.params;
+    return null;
+}
+function notificationThreadId(message) {
+    const payload = notificationPayload(message);
+    return (getStringPath(message.params, ['threadId']) ??
+        getStringPath(message.params, ['thread_id']) ??
+        getStringPath(message.params, ['thread', 'id']) ??
+        getStringPath(message.params, ['thread', 'threadId']) ??
+        getStringPath(message.params, ['thread', 'thread_id']) ??
+        getStringPath(message.params, ['turn', 'threadId']) ??
+        getStringPath(message.params, ['turn', 'thread_id']) ??
+        getStringPath(message.params, ['turn', 'thread', 'id']) ??
+        getStringPath(payload, ['threadId']) ??
+        getStringPath(payload, ['thread_id']) ??
+        getStringPath(payload, ['thread', 'id']) ??
+        getStringPath(payload, ['turn', 'threadId']) ??
+        getStringPath(payload, ['turn', 'thread_id']));
+}
+function notificationTurnId(message) {
+    const payload = notificationPayload(message);
+    return (getStringPath(message.params, ['turnId']) ??
+        getStringPath(message.params, ['turn_id']) ??
+        getStringPath(message.params, ['turn', 'id']) ??
+        getStringPath(payload, ['turnId']) ??
+        getStringPath(payload, ['turn_id']) ??
+        getStringPath(payload, ['turn', 'id']));
+}
+function queuedRunOptionsMatchActiveTurn(state, message) {
+    const options = message.options;
+    if (!options)
+        return true;
+    if (options.model && options.model !== state.model)
+        return false;
+    if (options.effort && options.effort !== state.effort)
+        return false;
+    if (options.mode && options.mode !== state.mode)
+        return false;
+    if (options.sandbox && options.sandbox !== state.sandbox)
+        return false;
+    return true;
+}
+function taskTerminalDisposition(message) {
+    if (message.method !== 'event_msg')
+        return null;
+    const payload = notificationPayload(message);
+    const type = getStringPath(payload, ['type']);
+    if (type === 'task_complete')
+        return 'advance-queue';
+    if (type === 'task_failed' || type === 'task_interrupted')
+        return 'barrier';
+    return null;
+}
+function notificationTerminalDisposition(message) {
+    if (message.method === 'turn/completed' || message.method === 'thread/compacted')
+        return 'advance-queue';
+    if (message.method === 'turn/failed' || message.method === 'turn/interrupted')
+        return 'barrier';
+    return taskTerminalDisposition(message);
+}
+function isTaskStartedEvent(message) {
+    if (message.method !== 'event_msg')
+        return false;
+    const payload = notificationPayload(message);
+    return getStringPath(payload, ['type']) === 'task_started';
+}
+function extractThreadId(result) {
+    return (getStringPath(result, ['thread', 'id']) ??
+        getStringPath(result, ['data', 'id']) ??
+        getStringPath(result, ['id']) ??
+        getStringPath(result, ['threadId']));
+}
+function extractThreadCwd(result) {
+    return getStringPath(result, ['thread', 'cwd']) ?? getStringPath(result, ['data', 'cwd']) ?? getStringPath(result, ['cwd']);
+}
+function extractThreadPath(result) {
+    return getStringPath(result, ['thread', 'path']) ?? getStringPath(result, ['data', 'path']) ?? getStringPath(result, ['path']);
+}
+function extractTurnId(result) {
+    return getStringPath(result, ['turn', 'id']) ?? getStringPath(result, ['data', 'id']) ?? getStringPath(result, ['id']) ?? getStringPath(result, ['turnId']);
+}
+function rememberCwd(cwds, cwd) {
+    return [cwd, ...cwds.filter((item) => item !== cwd)].slice(0, 20);
+}
+function sanitizeThreadHistory(value) {
+    if (Array.isArray(value))
+        return value.map((item) => sanitizeThreadHistory(item));
+    if (!isRecord(value))
+        return value;
+    const next = { ...value };
+    if (Array.isArray(next.turns))
+        next.turns = [];
+    for (const [key, child] of Object.entries(next)) {
+        if (key !== 'turns')
+            next[key] = sanitizeThreadHistory(child);
+    }
+    return next;
+}
+function approvalResponseForDecision(method, decision, params) {
+    if (method === 'item/commandExecution/requestApproval' || method === 'item/fileChange/requestApproval') {
+        return { decision };
+    }
+    if (method === 'mcpServer/elicitation/request') {
+        if (decision !== 'decline' && decision !== 'cancel') {
+            throw new Error('unsupported MCP elicitation decision');
+        }
+        return { action: decision, content: null, _meta: null };
+    }
+    if (method === 'item/tool/requestUserInput') {
+        return { answers: decision };
+    }
+    if (method === 'item/tool/call') {
+        return decision;
+    }
+    if (method === 'item/permissions/requestApproval') {
+        if (decision !== 'accept' && decision !== 'decline') {
+            throw new Error('unsupported permissions approval decision');
+        }
+        return { permissions: decision === 'accept' && isRecord(params) ? params.permissions : {}, scope: 'session' };
+    }
+    throw new Error(`unsupported approval request method: ${method}`);
+}
+function approvalRespondParams(params) {
+    if (!isRecord(params))
+        return 'approval response params are required';
+    const { requestId, method } = params;
+    if (typeof requestId !== 'string' && typeof requestId !== 'number')
+        return 'requestId is required';
+    if (!hasOwn(params, 'decision'))
+        return 'decision is required';
+    return { requestId, decision: params.decision, method: typeof method === 'string' ? method : null };
+}
+function activeWorkspaceRoot(deps) {
+    const activeCwd = deps.stateStore.read().activeCwd;
+    if (!activeCwd)
+        throw new Error('no active cwd');
+    return activeCwd;
+}
+function assertNoActiveTurnForGitMutation(deps) {
+    if (deps.stateStore.read().activeTurnId)
+        throw new Error('git mutation is disabled while a turn is active');
+}
+async function resolveReadableRpcPath(deps, filePath) {
+    return resolveExistingPathInsideRoot(activeWorkspaceRoot(deps), filePath);
+}
+async function resolveReadableRpcPaths(deps, filePath) {
+    const root = activeWorkspaceRoot(deps);
+    return {
+        lexicalPath: assertPathInsideRoot(root, filePath),
+        realPath: await resolveExistingPathInsideRoot(root, filePath),
+    };
+}
+async function resolveWritableRpcPath(deps, filePath) {
+    return resolveWritablePathInsideRoot(activeWorkspaceRoot(deps), filePath);
+}
+function pendingCompactionTurnId(threadId) {
+    return `${COMPACTION_PENDING_TURN_PREFIX}${threadId}`;
+}
+function isPendingCompactionTurnForThread(turnId, threadId) {
+    return Boolean(turnId && threadId && turnId === pendingCompactionTurnId(threadId));
+}
+function pendingTurnStartTurnId(threadId) {
+    return `${TURN_START_PENDING_TURN_PREFIX}${threadId}`;
+}
+function isPendingTurnStartForThread(turnId, threadId) {
+    return Boolean(turnId && threadId && turnId === pendingTurnStartTurnId(threadId));
+}
+function isPendingTurnForThread(turnId, threadId) {
+    return isPendingCompactionTurnForThread(turnId, threadId) || isPendingTurnStartForThread(turnId, threadId);
+}
+function completionMatchesActiveTurn(activeTurnId, activeThreadId, completedTurnId, options = { allowMissingTurnId: true }) {
+    if (!activeTurnId)
+        return false;
+    if (!completedTurnId)
+        return options.allowMissingTurnId && isPendingCompactionTurnForThread(activeTurnId, activeThreadId);
+    if (completedTurnId === activeTurnId)
+        return true;
+    return isPendingCompactionTurnForThread(activeTurnId, activeThreadId);
+}
+function isTurnStartTimeout(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return /timed out:\s*turn\/start|request timed out:\s*turn\/start/i.test(message);
+}
+function isTurnSteerTimeout(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return /timed out:\s*turn\/steer|request timed out:\s*turn\/steer/i.test(message);
+}
+function lastNotificationSeq(params) {
+    if (!isRecord(params))
+        return null;
+    const value = params.lastNotificationSeq;
+    return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
+}
+function lastNotificationStreamId(params) {
+    if (!isRecord(params))
+        return null;
+    const value = params.lastNotificationStreamId;
+    return typeof value === 'string' && value.trim() ? value : null;
+}
+function browseBasePath(deps) {
+    return deps.stateStore.read().activeCwd ?? deps.startCwd ?? process.env.HOME ?? process.cwd();
+}
+async function browseDirectory(deps, requestedPath) {
+    const basePath = browseBasePath(deps);
+    const candidate = nodePath.isAbsolute(requestedPath) ? requestedPath : nodePath.resolve(basePath, requestedPath);
+    const resolvedPath = await fs.realpath(candidate);
+    const stats = await fs.stat(resolvedPath);
+    if (!stats.isDirectory())
+        throw new Error('path is not a directory');
+    const entries = [];
+    const directory = await fs.opendir(resolvedPath);
+    let truncated = false;
+    for await (const entry of directory) {
+        const entryPath = nodePath.join(resolvedPath, entry.name);
+        if (!(await isBrowsableDirectoryEntry(entry, entryPath)))
+            continue;
+        if (entries.length >= BROWSE_DIRECTORY_LIMIT) {
+            truncated = true;
+            break;
+        }
+        entries.push({ name: entry.name, path: entryPath, isDirectory: true });
+    }
+    return {
+        path: resolvedPath,
+        parent: nodePath.dirname(resolvedPath),
+        truncated,
+        entries: entries.sort((a, b) => a.name.localeCompare(b.name)),
+    };
+}
+async function browseWorkspaceDirectory(deps, requestedPath) {
+    const root = activeWorkspaceRoot(deps);
+    const lexicalRoot = nodePath.resolve(root);
+    const lexicalResolvedPath = assertPathInsideRoot(root, requestedPath);
+    const [realRoot, realResolvedPath] = await Promise.all([fs.realpath(root), resolveExistingPathInsideRoot(root, lexicalResolvedPath)]);
+    const stats = await fs.stat(realResolvedPath);
+    if (!stats.isDirectory())
+        throw new Error('path is not a directory');
+    const entries = [];
+    const directory = await fs.opendir(realResolvedPath);
+    let truncated = false;
+    for await (const entry of directory) {
+        const realEntryPath = nodePath.join(realResolvedPath, entry.name);
+        if (!(await isBrowsableWorkspaceDirectoryEntry(realRoot, entry, realEntryPath)))
+            continue;
+        if (entries.length >= BROWSE_DIRECTORY_LIMIT) {
+            truncated = true;
+            break;
+        }
+        entries.push({ name: entry.name, path: nodePath.join(lexicalResolvedPath, entry.name), isDirectory: true });
+    }
+    const parent = nodePath.dirname(lexicalResolvedPath);
+    return {
+        path: lexicalResolvedPath,
+        parent: isPathInsideRoot(lexicalRoot, parent) ? parent : lexicalResolvedPath,
+        truncated,
+        entries: entries.sort((a, b) => a.name.localeCompare(b.name)),
+    };
+}
+async function readDirectory(deps, requestedPath) {
+    const { lexicalPath, realPath } = await resolveReadableRpcPaths(deps, requestedPath);
+    const stats = await fs.stat(realPath);
+    if (!stats.isDirectory())
+        throw new Error('path is not a directory');
+    const entries = [];
+    const directory = await fs.opendir(realPath);
+    let truncated = false;
+    for await (const entry of directory) {
+        const realEntryPath = nodePath.join(realPath, entry.name);
+        const lexicalEntryPath = nodePath.join(lexicalPath, entry.name);
+        let isDirectory = entry.isDirectory();
+        let isFile = entry.isFile();
+        if (entry.isSymbolicLink() || (!isDirectory && !isFile)) {
+            try {
+                const entryStats = await fs.stat(realEntryPath);
+                isDirectory = entryStats.isDirectory();
+                isFile = entryStats.isFile();
+            }
+            catch {
+                continue;
+            }
+        }
+        if (entries.length >= BROWSE_DIRECTORY_LIMIT) {
+            truncated = true;
+            break;
+        }
+        entries.push({ fileName: entry.name, name: entry.name, path: lexicalEntryPath, isDirectory, isFile });
+    }
+    entries.sort((a, b) => Number(b.isDirectory) - Number(a.isDirectory) || a.fileName.localeCompare(b.fileName));
+    return { entries, truncated };
+}
+async function readFile(deps, requestedPath) {
+    const opened = await openExistingFileInsideRoot(activeWorkspaceRoot(deps), requestedPath);
+    try {
+        if (opened.stats.size > LEGACY_READ_FILE_MAX_BYTES) {
+            throw new Error(`file is too large to read via legacy RPC (max ${LEGACY_READ_FILE_MAX_BYTES} bytes)`);
+        }
+        const data = await readOpenedFileFully(opened.handle, opened.stats.size);
+        return { dataBase64: data.toString('base64') };
+    }
+    finally {
+        await opened.handle.close().catch(() => undefined);
+    }
+}
+async function writeFile(deps, requestedPath, dataBase64) {
+    await writeFileInsideRoot(activeWorkspaceRoot(deps), requestedPath, Buffer.from(dataBase64, 'base64'));
+    return {};
+}
+async function createDirectory(deps, requestedPath) {
+    const resolvedPath = await resolveWritableRpcPath(deps, requestedPath);
+    await fs.mkdir(resolvedPath);
+    return {};
+}
+async function createBrowseDirectory(deps, requestedPath) {
+    const basePath = browseBasePath(deps);
+    const candidate = nodePath.isAbsolute(requestedPath) ? requestedPath : nodePath.resolve(basePath, requestedPath);
+    const targetParent = await fs.realpath(nodePath.dirname(candidate));
+    const targetName = nodePath.basename(candidate);
+    if (!targetName || targetName === '.' || targetName === '..')
+        throw new Error('directory name is required');
+    const resolvedPath = nodePath.join(targetParent, targetName);
+    await fs.mkdir(resolvedPath);
+    return { path: resolvedPath };
+}
+async function getMetadata(deps, requestedPath) {
+    const { lexicalPath, realPath } = await resolveReadableRpcPaths(deps, requestedPath);
+    const [stats, linkStats] = await Promise.all([fs.stat(realPath), fs.lstat(lexicalPath)]);
+    return {
+        isDirectory: stats.isDirectory(),
+        isFile: stats.isFile(),
+        isSymlink: linkStats.isSymbolicLink(),
+        createdAtMs: stats.birthtimeMs || 0,
+        modifiedAtMs: stats.mtimeMs || 0,
+    };
+}
+async function isBrowsableDirectoryEntry(entry, entryPath) {
+    if (entry.isDirectory())
+        return true;
+    if (!entry.isSymbolicLink())
+        return false;
+    try {
+        return (await fs.stat(entryPath)).isDirectory();
+    }
+    catch {
+        return false;
+    }
+}
+async function isBrowsableWorkspaceDirectoryEntry(realRoot, entry, entryPath) {
+    if (!entry.isDirectory() && !entry.isSymbolicLink())
+        return false;
+    try {
+        const [entryStats, realEntryPath] = await Promise.all([fs.stat(entryPath), fs.realpath(entryPath)]);
+        return entryStats.isDirectory() && isPathInsideRoot(realRoot, realEntryPath);
+    }
+    catch {
+        return false;
+    }
+}
+function turnListParams(params) {
+    if (!isRecord(params))
+        return 'thread list params are required';
+    const threadId = getRequiredString(params, 'threadId');
+    if (!threadId)
+        return 'threadId is required';
+    const threadPath = getOptionalString(params, 'threadPath');
+    const limit = typeof params.limit === 'number' && Number.isFinite(params.limit) ? Math.max(1, Math.min(100, Math.floor(params.limit))) : 50;
+    const sortDirection = params.sortDirection === 'asc' ? 'asc' : 'desc';
+    return {
+        threadId,
+        threadPath,
+        cursor: typeof params.cursor === 'string' ? params.cursor : null,
+        limit,
+        sortDirection,
+    };
+}
+function stringValue(value, key) {
+    if (!isRecord(value) || typeof value[key] !== 'string')
+        return null;
+    const text = value[key].trim();
+    return text ? text : null;
+}
+function changePath(change) {
+    return stringValue(change, 'path') ?? stringValue(change, 'file') ?? stringValue(change, 'filePath') ?? stringValue(change, 'file_path');
+}
+function fileChangePaths(value) {
+    const paths = new Set();
+    const direct = changePath(value);
+    if (direct)
+        paths.add(direct);
+    if (isRecord(value) && Array.isArray(value.changes)) {
+        for (const change of value.changes) {
+            const path = changePath(change);
+            if (path)
+                paths.add(path);
+        }
+    }
+    return Array.from(paths);
+}
+function fileDiffParams(params) {
+    if (!isRecord(params))
+        return 'file diff params are required';
+    const path = changePath(params) ?? (Array.isArray(params.changes) ? params.changes.map(changePath).find((item) => Boolean(item)) : null);
+    if (!path)
+        return 'path is required';
+    return {
+        threadId: stringValue(params, 'threadId') ?? stringValue(params, 'thread_id'),
+        threadPath: stringValue(params, 'threadPath') ?? stringValue(params, 'thread_path'),
+        turnId: stringValue(params, 'turnId') ?? stringValue(params, 'turn_id'),
+        path,
+        changes: Array.isArray(params.changes) ? params.changes.filter(isRecord) : [],
+    };
+}
+function snapshotKey(threadId, turnId, filePath) {
+    return `${threadId ?? ''}\0${turnId ?? ''}\0${filePath}`;
+}
+function readSnapshotFile(filePath) {
+    try {
+        const stats = fsSync.statSync(filePath);
+        if (!stats.isFile() || stats.size > FILE_DIFF_SNAPSHOT_MAX_BYTES)
+            return null;
+        return fsSync.readFileSync(filePath, 'utf8');
+    }
+    catch {
+        return null;
+    }
+}
+function isPathInsideRoot(resolvedRoot, resolvedTarget) {
+    const relative = nodePath.relative(resolvedRoot, resolvedTarget);
+    return relative === '' || (!relative.startsWith('..') && !nodePath.isAbsolute(relative));
+}
+function resolveSnapshotPathInsideRoot(root, target) {
+    const realRoot = fsSync.realpathSync(root);
+    const lexicalTarget = assertPathInsideRoot(root, target);
+    try {
+        const realTarget = fsSync.realpathSync(lexicalTarget);
+        if (!isPathInsideRoot(realRoot, realTarget))
+            throw new Error('path is outside active workspace');
+        return realTarget;
+    }
+    catch (error) {
+        if (typeof error !== 'object' || error === null || error.code !== 'ENOENT')
+            throw error;
+    }
+    const realParent = fsSync.realpathSync(nodePath.dirname(lexicalTarget));
+    if (!isPathInsideRoot(realRoot, realParent))
+        throw new Error('path is outside active workspace');
+    return lexicalTarget;
+}
+async function readCurrentFileForDiff(filePath) {
+    try {
+        const stats = await fs.stat(filePath);
+        if (!stats.isFile() || stats.size > FILE_DIFF_SNAPSHOT_MAX_BYTES)
+            return '';
+        return await fs.readFile(filePath, 'utf8');
+    }
+    catch (error) {
+        if (typeof error === 'object' && error !== null && error.code === 'ENOENT')
+            return '';
+        throw error;
+    }
+}
+async function resolveDiffPathInsideRoot(root, filePath) {
+    const resolvedPath = await resolveWritablePathInsideRoot(root, filePath);
+    try {
+        return await fs.realpath(resolvedPath);
+    }
+    catch (error) {
+        if (typeof error === 'object' && error !== null && error.code === 'ENOENT')
+            return resolvedPath;
+        throw error;
+    }
+}
+function normalizedAbsolutePath(filePath) {
+    return nodePath.isAbsolute(filePath) ? nodePath.resolve(filePath) : null;
+}
+function diffText(change) {
+    return getStringPath(change, ['diff']) ?? getStringPath(change, ['patch']) ?? getStringPath(change, ['unifiedDiff']) ?? getStringPath(change, ['unified_diff']);
+}
+function changeKindType(change) {
+    return getStringPath(change, ['kind', 'type']) ?? getStringPath(change, ['type']);
+}
+function isPatch(text) {
+    return /^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@/m.test(text);
+}
+function patchContentHash(text) {
+    return createHash('sha256').update(text).digest('hex');
+}
+function splitContentLines(text) {
+    if (!text)
+        return [];
+    const lines = text.split('\n');
+    if (lines.at(-1) === '')
+        lines.pop();
+    return lines;
+}
+function joinContentLines(lines, trailingNewline) {
+    if (lines.length === 0)
+        return '';
+    return `${lines.join('\n')}${trailingNewline ? '\n' : ''}`;
+}
+function applyUnifiedPatch(content, patch) {
+    const source = splitContentLines(content);
+    const output = [];
+    let sourceIndex = 0;
+    let trailingNewline = content.endsWith('\n');
+    const lines = patch.split('\n');
+    let index = 0;
+    let applied = false;
+    while (index < lines.length) {
+        const header = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(lines[index]);
+        if (!header) {
+            index += 1;
+            continue;
+        }
+        applied = true;
+        const oldStart = Number(header[1]);
+        const targetIndex = oldStart > 0 ? oldStart - 1 : 0;
+        while (sourceIndex < targetIndex && sourceIndex < source.length) {
+            output.push(source[sourceIndex]);
+            sourceIndex += 1;
+        }
+        if (sourceIndex < targetIndex)
+            return null;
+        index += 1;
+        while (index < lines.length && !lines[index].startsWith('@@ ')) {
+            const line = lines[index];
+            if (line === '\\ No newline at end of file') {
+                trailingNewline = false;
+                index += 1;
+                continue;
+            }
+            if (!line) {
+                index += 1;
+                continue;
+            }
+            const marker = line[0];
+            const text = line.slice(1);
+            if (marker === ' ') {
+                output.push(text);
+                sourceIndex += 1;
+            }
+            else if (marker === '-') {
+                sourceIndex += 1;
+            }
+            else if (marker === '+') {
+                output.push(text);
+                trailingNewline = true;
+            }
+            index += 1;
+        }
+    }
+    if (!applied)
+        return null;
+    while (sourceIndex < source.length) {
+        output.push(source[sourceIndex]);
+        sourceIndex += 1;
+    }
+    return joinContentLines(output, trailingNewline);
+}
+function reverseUnifiedPatch(content, patch) {
+    const source = splitContentLines(content);
+    const output = [];
+    let sourceIndex = 0;
+    let trailingNewline = content.endsWith('\n');
+    const lines = patch.split('\n');
+    let index = 0;
+    let applied = false;
+    while (index < lines.length) {
+        const header = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(lines[index]);
+        if (!header) {
+            index += 1;
+            continue;
+        }
+        applied = true;
+        const newStart = Number(header[1]);
+        const targetIndex = newStart > 0 ? newStart - 1 : 0;
+        if (targetIndex < sourceIndex)
+            return null;
+        while (sourceIndex < targetIndex && sourceIndex < source.length) {
+            output.push(source[sourceIndex]);
+            sourceIndex += 1;
+        }
+        if (sourceIndex < targetIndex)
+            return null;
+        index += 1;
+        while (index < lines.length && !lines[index].startsWith('@@ ')) {
+            const line = lines[index];
+            if (line === '\\ No newline at end of file') {
+                trailingNewline = false;
+                index += 1;
+                continue;
+            }
+            if (!line) {
+                index += 1;
+                continue;
+            }
+            const marker = line[0];
+            const text = line.slice(1);
+            if (marker === ' ') {
+                if (source[sourceIndex] !== text)
+                    return null;
+                output.push(text);
+                sourceIndex += 1;
+            }
+            else if (marker === '+') {
+                if (source[sourceIndex] !== text)
+                    return null;
+                sourceIndex += 1;
+            }
+            else if (marker === '-') {
+                output.push(text);
+                trailingNewline = true;
+            }
+            else {
+                return null;
+            }
+            index += 1;
+        }
+    }
+    if (!applied)
+        return null;
+    while (sourceIndex < source.length) {
+        output.push(source[sourceIndex]);
+        sourceIndex += 1;
+    }
+    return joinContentLines(output, trailingNewline);
+}
+function reconstructAddedFileDiff(changes) {
+    const first = changes[0];
+    const firstDiff = diffText(first);
+    if (changeKindType(first) !== 'add' || firstDiff === null || isPatch(firstDiff))
+        return null;
+    let after = firstDiff;
+    for (const change of changes.slice(1)) {
+        const patch = diffText(change);
+        if (!patch || !isPatch(patch))
+            continue;
+        const next = applyUnifiedPatch(after, patch);
+        if (next === null)
+            return null;
+        after = next;
+    }
+    return { before: '', after };
+}
+function firstTextAt(change, keys) {
+    for (const key of keys) {
+        const value = getStringPath(change, [key]);
+        if (value !== null)
+            return value;
+    }
+    return null;
+}
+function explicitBeforeAfterDiff(changes) {
+    const beforeKeys = ['before', 'oldText', 'old_text', 'previousText', 'previous_text', 'original', 'beforeContent', 'before_content'];
+    const afterKeys = ['after', 'newText', 'new_text', 'updatedText', 'updated_text', 'modified', 'afterContent', 'after_content'];
+    const first = changes.find((change) => firstTextAt(change, beforeKeys) !== null);
+    const last = [...changes].reverse().find((change) => firstTextAt(change, afterKeys) !== null);
+    if (!first || !last)
+        return null;
+    const before = firstTextAt(first, beforeKeys);
+    const after = firstTextAt(last, afterKeys);
+    return before !== null && after !== null ? { before, after } : null;
+}
+function patchSnippetDiff(changes) {
+    const beforeParts = [];
+    const afterParts = [];
+    for (const change of changes) {
+        const patch = diffText(change);
+        if (!patch || !isPatch(patch))
+            continue;
+        const beforeLines = [];
+        const afterLines = [];
+        for (const line of patch.split('\n')) {
+            if (!line || line.startsWith('@@ ') || line === '\\ No newline at end of file')
+                continue;
+            const marker = line[0];
+            const text = line.slice(1);
+            if (marker === ' ' || marker === '-')
+                beforeLines.push(text);
+            if (marker === ' ' || marker === '+')
+                afterLines.push(text);
+        }
+        beforeParts.push(beforeLines.join('\n'));
+        afterParts.push(afterLines.join('\n'));
+    }
+    if (beforeParts.length === 0 && afterParts.length === 0)
+        return null;
+    return { before: beforeParts.join('\n~~~ ... ~~~\n'), after: afterParts.join('\n~~~ ... ~~~\n') };
+}
+function extractResolvedRequestId(message) {
+    if (!/request.*resolved|serverRequest.*resolved/i.test(message.method))
+        return null;
+    if (!isRecord(message.params))
+        return null;
+    const requestId = message.params.requestId ?? message.params.request_id ?? message.params.id;
+    return typeof requestId === 'string' || typeof requestId === 'number' ? requestId : null;
+}
+function shouldClearActiveTurnAfterInterruptFailure(error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return /not connected|closed|exited|not found|no active|unknown.*turn|turn.*unknown|thread.*unknown/i.test(message);
+}
+function patchApplyPayload(message) {
+    const payload = notificationPayload(message);
+    return isRecord(payload) && getStringPath(payload, ['type']) === 'patch_apply_end' ? payload : null;
+}
+export function attachBrowserSocket(server, deps) {
+    const wss = new WebSocketServer({ server, path: '/ws' });
+    let closed = false;
+    let queuedStartInFlight = null;
+    let queuedSteerInFlight = null;
+    let bangCommandInFlight = false;
+    const notificationStreamId = randomUUID();
+    const pendingTurnStartContexts = [];
+    const pendingServerRequests = new Map();
+    const resumedThreadIds = new Set();
+    const startedPendingRolloutThreadIds = new Set();
+    const resumeThreadPromises = new Map();
+    const knownThreadPaths = new Map();
+    let appServerGeneration = 0;
+    let restartInFlight = null;
+    const timedOutQueuedStarts = new Map();
+    const deferredQueuedMessagesByThread = new Map();
+    const recentNotifications = [];
+    let recentNotificationSeq = 0;
+    let recentNotificationBytes = 0;
+    const fileSnapshots = new Map();
+    const patchSnapshots = new Map();
+    const incompletePatchTurnKeys = new Set();
+    let patchCaptureChain = Promise.resolve();
+    let patchCaptureQueueDepth = 0;
+    const completingTurnKeys = new Set();
+    const terminalTurnKeys = new Set();
+    const completedTurnKeys = new Set();
+    const turnThreadPaths = new Map();
+    const turnCwds = new Map();
+    const livePatchTurnKeys = new Set();
+    const capturedPatchEventKeys = new Set();
+    const turnKey = (threadId, turnId) => `${threadId ?? ''}\0${turnId}`;
+    const openFileEditStore = (threadPath, options = {}) => {
+        if (!threadPath || !nodePath.isAbsolute(threadPath))
+            return null;
+        const dbPath = sessionFileEditDbPath(threadPath);
+        if (options.readonly && !fsSync.existsSync(dbPath))
+            return null;
+        try {
+            return new FileEditStore(dbPath, options);
+        }
+        catch (error) {
+            logWarn('Failed to open file edit store', error);
+            return null;
+        }
+    };
+    const rememberKnownThreadPath = (threadId, threadPath) => {
+        if (!threadId || !threadPath || !nodePath.isAbsolute(threadPath))
+            return;
+        knownThreadPaths.set(threadId, threadPath);
+        while (knownThreadPaths.size > 200) {
+            const oldest = knownThreadPaths.keys().next().value;
+            if (typeof oldest !== 'string')
+                break;
+            knownThreadPaths.delete(oldest);
+        }
+    };
+    const rememberKnownThreadPathsFromList = (result) => {
+        const threads = isRecord(result) && Array.isArray(result.data) ? result.data : Array.isArray(result) ? result : [];
+        for (const thread of threads)
+            rememberKnownThreadPath(extractThreadId(thread), extractThreadPath(thread));
+    };
+    const invalidateResumedThreads = () => {
+        appServerGeneration += 1;
+        resumedThreadIds.clear();
+        resumeThreadPromises.clear();
+    };
+    const validatedThreadPath = (state, threadId, turnId, threadPath) => {
+        if (!threadPath || !nodePath.isAbsolute(threadPath))
+            return null;
+        if (threadId && knownThreadPaths.get(threadId) === threadPath)
+            return threadPath;
+        if (turnId && turnThreadPaths.get(turnKey(threadId, turnId)) === threadPath)
+            return threadPath;
+        if ((!threadId || threadId === state.activeThreadId) && threadPath === state.activeThreadPath)
+            return threadPath;
+        return null;
+    };
+    const resumePathForThread = (threadId, requestedThreadPath) => {
+        const state = deps.stateStore.read();
+        const requested = requestedThreadPath && nodePath.isAbsolute(requestedThreadPath)
+            ? validatedThreadPath(state, threadId, null, requestedThreadPath)
+            : null;
+        if (requested)
+            return requested;
+        const known = knownThreadPaths.get(threadId);
+        if (known)
+            return known;
+        if (state.activeThreadId === threadId && state.activeThreadPath && nodePath.isAbsolute(state.activeThreadPath)) {
+            return state.activeThreadPath;
+        }
+        return null;
+    };
+    const trustedDiffRoot = (state, threadId, threadPath) => {
+        if (!state.activeCwd)
+            return null;
+        if (threadId && threadId !== state.activeThreadId)
+            return null;
+        if (threadPath && threadPath !== state.activeThreadPath)
+            return null;
+        return state.activeCwd;
+    };
+    const rememberTerminalTurnKey = (key) => {
+        terminalTurnKeys.add(key);
+        while (terminalTurnKeys.size > 200) {
+            const oldest = terminalTurnKeys.keys().next().value;
+            if (typeof oldest !== 'string')
+                break;
+            terminalTurnKeys.delete(oldest);
+        }
+    };
+    const rememberCompletedTurnKey = (key) => {
+        completedTurnKeys.add(key);
+        while (completedTurnKeys.size > 200) {
+            const oldest = completedTurnKeys.keys().next().value;
+            if (typeof oldest !== 'string')
+                break;
+            completedTurnKeys.delete(oldest);
+        }
+    };
+    const hasCompletedTurn = (threadId, turnId) => {
+        if (!turnId)
+            return false;
+        return (terminalTurnKeys.has(turnKey(threadId, turnId)) ||
+            terminalTurnKeys.has(turnKey(null, turnId)) ||
+            completedTurnKeys.has(turnKey(threadId, turnId)) ||
+            completedTurnKeys.has(turnKey(null, turnId)));
+    };
+    const isTerminalOrCompletingTurn = (threadId, turnId) => {
+        if (!turnId)
+            return false;
+        return hasCompletedTurn(threadId, turnId) || completingTurnKeys.has(turnKey(threadId, turnId)) || completingTurnKeys.has(turnKey(null, turnId));
+    };
+    const rememberTurnThreadPath = (threadId, turnId, threadPath) => {
+        if (!turnId || !threadPath)
+            return;
+        turnThreadPaths.set(turnKey(threadId, turnId), threadPath);
+        while (turnThreadPaths.size > 200) {
+            const oldest = turnThreadPaths.keys().next().value;
+            if (typeof oldest !== 'string')
+                break;
+            turnThreadPaths.delete(oldest);
+            turnCwds.delete(oldest);
+        }
+    };
+    const rememberTurnCwd = (threadId, turnId, cwd) => {
+        if (!turnId || !cwd)
+            return;
+        turnCwds.set(turnKey(threadId, turnId), cwd);
+        while (turnCwds.size > 200) {
+            const oldest = turnCwds.keys().next().value;
+            if (typeof oldest !== 'string')
+                break;
+            turnCwds.delete(oldest);
+            turnThreadPaths.delete(oldest);
+        }
+    };
+    const findTurnContext = (preferredThreadId, turnId, state) => {
+        const exactKey = turnKey(preferredThreadId, turnId);
+        let threadId = preferredThreadId;
+        let threadPath = turnThreadPaths.get(exactKey) ?? null;
+        let cwd = turnCwds.get(exactKey) ?? null;
+        if (!threadPath || !cwd) {
+            const suffix = `\0${turnId}`;
+            for (const key of new Set([...turnThreadPaths.keys(), ...turnCwds.keys()])) {
+                if (!key.endsWith(suffix))
+                    continue;
+                const matchedThreadId = key.slice(0, -suffix.length) || null;
+                threadId = threadId ?? matchedThreadId;
+                threadPath = threadPath ?? turnThreadPaths.get(key) ?? null;
+                cwd = cwd ?? turnCwds.get(key) ?? null;
+                if (threadPath && cwd)
+                    break;
+            }
+        }
+        const activeTurn = state.activeTurnId === turnId && (!threadId || threadId === state.activeThreadId);
+        if (activeTurn) {
+            threadId = threadId ?? state.activeThreadId;
+            threadPath = threadPath ?? state.activeThreadPath;
+            cwd = cwd ?? state.activeCwd;
+        }
+        return { threadId, threadPath, cwd };
+    };
+    const pruneFileSnapshots = () => {
+        const now = Date.now();
+        for (const [key, snapshot] of fileSnapshots) {
+            if (now - snapshot.createdAt > FILE_DIFF_SNAPSHOT_TTL_MS)
+                fileSnapshots.delete(key);
+        }
+        while (fileSnapshots.size > FILE_DIFF_SNAPSHOT_MAX_ENTRIES) {
+            const oldest = fileSnapshots.keys().next().value;
+            if (typeof oldest !== 'string')
+                break;
+            fileSnapshots.delete(oldest);
+        }
+    };
+    const prunePatchSnapshots = () => {
+        const now = Date.now();
+        const incompleteSnapshots = [];
+        for (const snapshot of patchSnapshots.values()) {
+            if (now - snapshot.updatedAt > FILE_DIFF_SNAPSHOT_TTL_MS) {
+                incompleteSnapshots.push(snapshot);
+            }
+        }
+        for (const snapshot of incompleteSnapshots)
+            markPatchTurnIncomplete(snapshot.threadId, snapshot.turnId);
+        while (patchSnapshots.size > FILE_DIFF_SNAPSHOT_MAX_ENTRIES) {
+            const oldest = patchSnapshots.values().next().value;
+            if (!oldest)
+                break;
+            markPatchTurnIncomplete(oldest.threadId, oldest.turnId);
+        }
+    };
+    function isPatchTurnIncomplete(threadId, turnId) {
+        return incompletePatchTurnKeys.has(turnKey(threadId, turnId)) || incompletePatchTurnKeys.has(turnKey(null, turnId));
+    }
+    function markPatchTurnIncomplete(threadId, turnId) {
+        const scoped = `${threadId ?? ''}\0${turnId}\0`;
+        const unscoped = `\0${turnId}\0`;
+        for (const key of patchSnapshots.keys()) {
+            if (key.startsWith(scoped) || key.startsWith(unscoped))
+                patchSnapshots.delete(key);
+        }
+        const key = turnKey(threadId, turnId);
+        incompletePatchTurnKeys.add(key);
+        livePatchTurnKeys.delete(key);
+        livePatchTurnKeys.delete(turnKey(null, turnId));
+        while (incompletePatchTurnKeys.size > FILE_DIFF_PATCH_MAX_INCOMPLETE_TURNS) {
+            const oldest = incompletePatchTurnKeys.keys().next().value;
+            if (typeof oldest !== 'string')
+                break;
+            incompletePatchTurnKeys.delete(oldest);
+            livePatchTurnKeys.delete(oldest);
+            const separator = oldest.indexOf('\0');
+            if (separator >= 0)
+                livePatchTurnKeys.delete(turnKey(null, oldest.slice(separator + 1)));
+        }
+    }
+    const appendTurnPatch = (threadId, turnId, key, patch, complete) => {
+        prunePatchSnapshots();
+        if (isPatchTurnIncomplete(threadId, turnId))
+            return null;
+        const patchBytes = Buffer.byteLength(patch, 'utf8');
+        if (patchBytes > FILE_DIFF_PATCH_MAX_BYTES_PER_FILE) {
+            markPatchTurnIncomplete(threadId, turnId);
+            return null;
+        }
+        const snapshot = patchSnapshots.get(key) ?? { threadId, turnId, patches: [], bytes: 0, updatedAt: Date.now(), complete };
+        if (snapshot.patches.length >= FILE_DIFF_PATCH_MAX_PATCHES_PER_FILE ||
+            snapshot.bytes + patchBytes > FILE_DIFF_PATCH_MAX_BYTES_PER_FILE) {
+            markPatchTurnIncomplete(threadId, turnId);
+            return null;
+        }
+        snapshot.patches.push(patch);
+        snapshot.bytes += patchBytes;
+        snapshot.updatedAt = Date.now();
+        snapshot.complete = snapshot.complete && complete;
+        patchSnapshots.set(key, snapshot);
+        return snapshot;
+    };
+    const beforeFromTurnPatches = (snapshot, after) => {
+        let before = after;
+        for (const candidate of [...snapshot.patches].reverse()) {
+            const previous = reverseUnifiedPatch(before, candidate);
+            if (previous === null)
+                return null;
+            before = previous;
+        }
+        return before;
+    };
+    const rememberLivePatchTurn = (threadId, turnId) => {
+        if (!turnId)
+            return;
+        livePatchTurnKeys.add(turnKey(threadId, turnId));
+        while (livePatchTurnKeys.size > 200) {
+            const oldest = livePatchTurnKeys.keys().next().value;
+            if (typeof oldest !== 'string')
+                break;
+            livePatchTurnKeys.delete(oldest);
+        }
+    };
+    const patchEventKey = (threadId, turnId, filePath, patch) => `${turnKey(threadId, turnId)}\0${filePath}\0${patchContentHash(patch)}`;
+    const rememberCapturedPatchEvent = (key) => {
+        capturedPatchEventKeys.add(key);
+        while (capturedPatchEventKeys.size > 1000) {
+            const oldest = capturedPatchEventKeys.keys().next().value;
+            if (typeof oldest !== 'string')
+                break;
+            capturedPatchEventKeys.delete(oldest);
+        }
+    };
+    const hasCapturedPatchEvent = (key) => capturedPatchEventKeys.has(key);
+    const startContextForThread = (threadId) => {
+        const state = deps.stateStore.read();
+        if (state.activeThreadId === threadId) {
+            return { threadId, threadPath: state.activeThreadPath, cwd: state.activeCwd };
+        }
+        return { threadId, threadPath: knownThreadPaths.get(threadId) ?? null, cwd: null };
+    };
+    const takePendingTurnStartContext = (threadId) => {
+        const index = threadId ? pendingTurnStartContexts.findIndex((context) => context.threadId === threadId) : 0;
+        if (index < 0)
+            return null;
+        const [context] = pendingTurnStartContexts.splice(index, 1);
+        return context ?? null;
+    };
+    const captureFileChangeSnapshots = (params, requestId) => {
+        const state = deps.stateStore.read();
+        if (!state.activeCwd)
+            return;
+        pruneFileSnapshots();
+        rememberKnownThreadPath(state.activeThreadId, state.activeThreadPath);
+        const store = state.activeTurnId ? openFileEditStore(state.activeThreadPath) : null;
+        let storedAny = false;
+        try {
+            for (const filePath of fileChangePaths(params)) {
+                let resolvedPath;
+                try {
+                    resolvedPath = resolveSnapshotPathInsideRoot(state.activeCwd, filePath);
+                }
+                catch {
+                    continue;
+                }
+                const key = snapshotKey(state.activeThreadId, state.activeTurnId, resolvedPath);
+                const before = readSnapshotFile(resolvedPath);
+                if (!fileSnapshots.has(key) && fileSnapshots.size < FILE_DIFF_SNAPSHOT_MAX_ENTRIES) {
+                    fileSnapshots.set(key, { before, createdAt: Date.now() });
+                }
+                if (store && state.activeTurnId) {
+                    rememberTurnThreadPath(state.activeThreadId, state.activeTurnId, state.activeThreadPath);
+                    rememberTurnCwd(state.activeThreadId, state.activeTurnId, state.activeCwd);
+                    store.recordSnapshot({
+                        turnId: state.activeTurnId,
+                        itemId: String(requestId),
+                        path: resolvedPath,
+                        before: before ?? '',
+                    });
+                    storedAny = true;
+                }
+            }
+        }
+        finally {
+            store?.close();
+        }
+        if (storedAny && state.activeThreadId && state.activeTurnId) {
+            broadcastFileChangeSummaryChanged(state.activeThreadId, state.activeTurnId);
+        }
+    };
+    const capturePatchChangeEntries = async (turnContext, turnId, itemId, entries) => {
+        const store = openFileEditStore(turnContext.threadPath);
+        if (!store)
+            return false;
+        let storedAny = false;
+        try {
+            for (const { filePath, rawChange } of entries) {
+                const patch = getStringPath(rawChange, ['unified_diff']) ?? diffText(rawChange);
+                if (!patch)
+                    continue;
+                let resolvedPath;
+                try {
+                    resolvedPath = turnContext.cwd ? resolveSnapshotPathInsideRoot(turnContext.cwd, filePath) : (normalizedAbsolutePath(filePath) ?? '');
+                    if (!resolvedPath)
+                        continue;
+                }
+                catch {
+                    continue;
+                }
+                const eventKey = patchEventKey(turnContext.threadId, turnId, resolvedPath, patch);
+                if (hasCapturedPatchEvent(eventKey))
+                    continue;
+                const key = snapshotKey(turnContext.threadId, turnId, resolvedPath);
+                const completePatchSequence = livePatchTurnKeys.has(turnKey(turnContext.threadId, turnId));
+                const patchSnapshot = isPatch(patch) ? appendTurnPatch(turnContext.threadId, turnId, key, patch, completePatchSequence) : null;
+                const after = await readCurrentFileForDiff(resolvedPath);
+                const changeType = changeKindType(rawChange);
+                const existingSnapshot = store.getSnapshot(turnId, resolvedPath);
+                const patchBefore = patchSnapshot ? beforeFromTurnPatches(patchSnapshot, after) : null;
+                if (patchSnapshot && patchBefore === null) {
+                    if (existingSnapshot?.source === 'patch')
+                        store.discardPatchDiff({ turnId, path: resolvedPath });
+                    continue;
+                }
+                const replacePatchBaseline = Boolean(patchSnapshot?.complete && (!existingSnapshot || existingSnapshot.source === 'patch'));
+                const before = replacePatchBaseline
+                    ? patchBefore
+                    : existingSnapshot
+                        ? existingSnapshot.before
+                        : changeType === 'add'
+                            ? ''
+                            : null;
+                if (before === null)
+                    continue;
+                store.recordPatchSnapshot({
+                    turnId,
+                    itemId,
+                    path: resolvedPath,
+                    before,
+                    replaceBefore: replacePatchBaseline,
+                });
+                store.finalizeFile({ turnId, path: resolvedPath, after });
+                rememberCapturedPatchEvent(eventKey);
+                rememberKnownThreadPath(turnContext.threadId, turnContext.threadPath);
+                rememberTurnThreadPath(turnContext.threadId, turnId, turnContext.threadPath);
+                rememberTurnCwd(turnContext.threadId, turnId, turnContext.cwd);
+                storedAny = true;
+            }
+        }
+        finally {
+            store.close();
+        }
+        return storedAny;
+    };
+    const capturePatchApplyPayload = async (payload) => {
+        if (!isRecord(payload.changes))
+            return;
+        const state = deps.stateStore.read();
+        const turnId = getStringPath(payload, ['turn_id']) ?? getStringPath(payload, ['turnId']);
+        if (!turnId)
+            return;
+        const activeThreadId = state.activeTurnId === turnId ? state.activeThreadId : null;
+        const turnContext = findTurnContext(activeThreadId, turnId, state);
+        const entries = Object.entries(payload.changes)
+            .filter((entry) => isRecord(entry[1]))
+            .map(([filePath, rawChange]) => ({ filePath, rawChange }));
+        const storedAny = await capturePatchChangeEntries(turnContext, turnId, getStringPath(payload, ['call_id']) ?? null, entries);
+        if (storedAny && turnContext.threadId)
+            broadcastFileChangeSummaryChanged(turnContext.threadId, turnId);
+    };
+    const captureStructuredFileChange = async (message) => {
+        if (!isRecord(message.params) || !isRecord(message.params.item))
+            return;
+        const item = message.params.item;
+        if (item.type !== 'fileChange' || !Array.isArray(item.changes))
+            return;
+        const turnId = notificationTurnId(message);
+        if (!turnId)
+            return;
+        const state = deps.stateStore.read();
+        const turnContext = findTurnContext(notificationThreadId(message), turnId, state);
+        const entries = item.changes
+            .filter(isRecord)
+            .map((rawChange) => {
+            const filePath = changePath(rawChange);
+            return filePath ? { filePath, rawChange } : null;
+        })
+            .filter((entry) => entry !== null);
+        const storedAny = await capturePatchChangeEntries(turnContext, turnId, stringValue(item, 'id'), entries);
+        if (storedAny && turnContext.threadId)
+            broadcastFileChangeSummaryChanged(turnContext.threadId, turnId);
+    };
+    const enqueuePatchApplyEnd = (message) => {
+        const payload = patchApplyPayload(message);
+        if (!payload)
+            return;
+        const turnId = getStringPath(payload, ['turn_id']) ?? getStringPath(payload, ['turnId']);
+        if (!turnId)
+            return;
+        if (patchCaptureQueueDepth >= FILE_DIFF_PATCH_MAX_PENDING_NOTIFICATIONS) {
+            const state = deps.stateStore.read();
+            const activeThreadId = state.activeTurnId === turnId ? state.activeThreadId : null;
+            const turnContext = findTurnContext(activeThreadId, turnId, state);
+            markPatchTurnIncomplete(turnContext.threadId, turnId);
+            return;
+        }
+        patchCaptureQueueDepth += 1;
+        patchCaptureChain = patchCaptureChain
+            .catch(() => undefined)
+            .then(() => capturePatchApplyPayload(payload))
+            .catch((error) => logWarn('Failed to capture patch apply notification', error))
+            .finally(() => {
+            patchCaptureQueueDepth -= 1;
+        });
+    };
+    const enqueueStructuredFileChange = (message) => {
+        if (!isRecord(message.params) || !isRecord(message.params.item))
+            return;
+        const item = message.params.item;
+        if (item.type !== 'fileChange' || !Array.isArray(item.changes))
+            return;
+        const turnId = notificationTurnId(message);
+        if (!turnId)
+            return;
+        if (patchCaptureQueueDepth >= FILE_DIFF_PATCH_MAX_PENDING_NOTIFICATIONS) {
+            const state = deps.stateStore.read();
+            markPatchTurnIncomplete(findTurnContext(notificationThreadId(message), turnId, state).threadId, turnId);
+            return;
+        }
+        patchCaptureQueueDepth += 1;
+        patchCaptureChain = patchCaptureChain
+            .catch(() => undefined)
+            .then(() => captureStructuredFileChange(message))
+            .catch((error) => logWarn('Failed to capture structured file change notification', error))
+            .finally(() => {
+            patchCaptureQueueDepth -= 1;
+        });
+    };
+    const findFileSnapshot = (threadId, turnId, filePath) => {
+        pruneFileSnapshots();
+        return (fileSnapshots.get(snapshotKey(threadId, turnId, filePath)) ??
+            fileSnapshots.get(snapshotKey(null, turnId, filePath)) ??
+            fileSnapshots.get(snapshotKey(threadId, null, filePath)) ??
+            fileSnapshots.get(snapshotKey(null, null, filePath)) ??
+            null);
+    };
+    const buildFileChangeDiff = async (params) => {
+        const state = deps.stateStore.read();
+        const root = trustedDiffRoot(state, params.threadId, params.threadPath);
+        const resolvedPath = root ? await resolveDiffPathInsideRoot(root, params.path) : normalizedAbsolutePath(params.path);
+        const validatedPath = validatedThreadPath(state, params.threadId, params.turnId, params.threadPath);
+        const store = params.turnId && resolvedPath ? openFileEditStore(validatedPath, { readonly: true }) : null;
+        try {
+            if (store && params.turnId && resolvedPath) {
+                const stored = store.getDiff(params.turnId, resolvedPath);
+                if (stored) {
+                    return {
+                        path: stored.path,
+                        before: stored.before,
+                        after: stored.after,
+                        source: 'stored',
+                    };
+                }
+                const storedSnapshot = store.getSnapshot(params.turnId, resolvedPath);
+                if (storedSnapshot && root) {
+                    const after = await readCurrentFileForDiff(storedSnapshot.path);
+                    return {
+                        path: storedSnapshot.path,
+                        before: storedSnapshot.before,
+                        after,
+                        source: 'snapshot',
+                    };
+                }
+            }
+        }
+        finally {
+            store?.close();
+        }
+        const snapshot = resolvedPath ? findFileSnapshot(params.threadId, params.turnId, resolvedPath) : null;
+        if (snapshot && root && resolvedPath) {
+            return {
+                path: resolvedPath,
+                before: snapshot.before ?? '',
+                after: await readCurrentFileForDiff(resolvedPath),
+                source: 'snapshot',
+            };
+        }
+        const reconstructed = explicitBeforeAfterDiff(params.changes) ?? reconstructAddedFileDiff(params.changes) ?? patchSnippetDiff(params.changes);
+        if (reconstructed) {
+            return { path: resolvedPath ?? params.path, ...reconstructed, source: 'reconstructed' };
+        }
+        if (!root || !resolvedPath) {
+            return {
+                path: resolvedPath ?? params.path,
+                before: '',
+                after: '',
+                source: 'current',
+            };
+        }
+        return {
+            path: resolvedPath,
+            before: '',
+            after: await readCurrentFileForDiff(resolvedPath),
+            source: 'current',
+        };
+    };
+    const listStoredTurnFiles = (turnId, threadId, threadPath) => {
+        const store = openFileEditStore(validatedThreadPath(deps.stateStore.read(), threadId, turnId, threadPath), { readonly: true });
+        if (!store)
+            return [];
+        try {
+            return store.listTurnFiles(turnId);
+        }
+        finally {
+            store.close();
+        }
+    };
+    const webuiFileChangeSummaryItem = (turnId, files) => ({
+        type: 'webuiFileChangeSummary',
+        id: `webui-file-summary:${turnId}`,
+        files: files.map((file) => ({ path: file.path, editCount: file.editCount, hasDiff: file.hasDiff, updatedAtMs: file.updatedAtMs })),
+    });
+    const augmentTurnWithStoredFileSummary = (turn, listFiles) => {
+        if (!isRecord(turn))
+            return turn;
+        const turnId = getStringPath(turn, ['id']);
+        const status = getStringPath(turn, ['status']);
+        if (!turnId || status === 'inProgress')
+            return turn;
+        const items = Array.isArray(turn.items) ? turn.items : [];
+        if (items.some((item) => isRecord(item) && item.type === 'webuiFileChangeSummary'))
+            return turn;
+        const files = listFiles(turnId);
+        if (files.length === 0)
+            return turn;
+        return { ...turn, items: [...items, webuiFileChangeSummaryItem(turnId, files)] };
+    };
+    const augmentTurnListWithStoredFileSummaries = (result, threadId) => {
+        const state = deps.stateStore.read();
+        const threadPath = knownThreadPaths.get(threadId) ?? (state.activeThreadId === threadId ? state.activeThreadPath : null);
+        const validatedPath = validatedThreadPath(state, threadId, null, threadPath);
+        const store = openFileEditStore(validatedPath, { readonly: true });
+        if (!store)
+            return result;
+        try {
+            const augmentTurns = (turns) => turns.map((turn) => augmentTurnWithStoredFileSummary(turn, (turnId) => store.listTurnFiles(turnId)));
+            if (Array.isArray(result))
+                return augmentTurns(result);
+            if (!isRecord(result))
+                return result;
+            let next = result;
+            if (Array.isArray(result.data))
+                next = { ...next, data: augmentTurns(result.data) };
+            if (Array.isArray(result.turns))
+                next = { ...next, turns: augmentTurns(result.turns) };
+            if (isRecord(result.thread) && Array.isArray(result.thread.turns)) {
+                next = { ...next, thread: { ...result.thread, turns: augmentTurns(result.thread.turns) } };
+            }
+            return next;
+        }
+        finally {
+            store.close();
+        }
+    };
+    const drainPatchCaptureQueue = () => {
+        if (patchCaptureQueueDepth === 0)
+            return null;
+        return patchCaptureChain.catch((error) => {
+            logWarn('Failed to drain file edit capture queue', error);
+        });
+    };
+    const finalizeTurnFileDiffs = (threadPath, turnId) => {
+        if (!threadPath || !nodePath.isAbsolute(threadPath) || !fsSync.existsSync(sessionFileEditDbPath(threadPath)))
+            return false;
+        const store = openFileEditStore(threadPath);
+        if (!store)
+            return false;
+        let files;
+        try {
+            files = store.listTurnFiles(turnId);
+            if (files.length === 0) {
+                store.close();
+                return false;
+            }
+        }
+        catch (error) {
+            store.close();
+            throw error;
+        }
+        const finalize = async () => {
+            try {
+                for (const file of files) {
+                    const after = await readCurrentFileForDiff(file.path);
+                    store.finalizeFile({ turnId, path: file.path, after });
+                }
+                return true;
+            }
+            finally {
+                store.close();
+            }
+        };
+        return finalize();
+    };
+    const finalizeTurnFileSummary = async (threadId, turnId, threadPath) => {
+        const drain = drainPatchCaptureQueue();
+        if (drain)
+            await drain;
+        const state = deps.stateStore.read();
+        const key = turnKey(threadId, turnId);
+        const finalizeThreadPath = threadPath ??
+            turnThreadPaths.get(key) ??
+            turnThreadPaths.get(turnKey(null, turnId)) ??
+            (!threadId || threadId === state.activeThreadId ? state.activeThreadPath : null);
+        const finalized = finalizeTurnFileDiffs(finalizeThreadPath, turnId);
+        const hasChanges = typeof finalized === 'boolean' ? finalized : await finalized;
+        const broadcastThreadId = threadId ?? (state.activeTurnId === turnId ? state.activeThreadId : null);
+        if (hasChanges && broadcastThreadId)
+            broadcastFileChangeSummaryChanged(broadcastThreadId, turnId);
+        return hasChanges;
+    };
+    const finalizeActiveTurnBeforeClear = async (threadId, turnId, threadPath) => {
+        try {
+            return await finalizeTurnFileSummary(threadId, turnId, threadPath);
+        }
+        catch (error) {
+            logWarn('Failed to finalize stopped file edit diffs', error);
+            return false;
+        }
+    };
+    const broadcastHello = (state = deps.stateStore.read()) => {
+        for (const client of wss.clients) {
+            sendHello(client, state);
+        }
+    };
+    const sendHello = (client, state = deps.stateStore.read()) => {
+        send(client, {
+            type: 'server/hello',
+            hostname: deps.config.hostname,
+            startCwd: deps.startCwd ?? null,
+            notificationStreamId,
+            state,
+            appServerHealth: deps.codex.health(),
+            requests: Array.from(pendingServerRequests.values()),
+        });
+    };
+    const notificationByteLength = (message) => {
+        try {
+            return Buffer.byteLength(JSON.stringify(message), 'utf8');
+        }
+        catch {
+            return RECENT_NOTIFICATION_SINGLE_MAX_BYTES + 1;
+        }
+    };
+    const rememberNotification = (message) => {
+        const seq = (recentNotificationSeq += 1);
+        const bytes = notificationByteLength(message);
+        if (bytes > RECENT_NOTIFICATION_SINGLE_MAX_BYTES)
+            return seq;
+        recentNotifications.push({ seq, message, bytes });
+        recentNotificationBytes += bytes;
+        while (recentNotifications.length > RECENT_NOTIFICATION_MAX_ENTRIES || recentNotificationBytes > RECENT_NOTIFICATION_MAX_BYTES) {
+            const removed = recentNotifications.shift();
+            if (!removed)
+                break;
+            recentNotificationBytes -= removed.bytes;
+        }
+        return seq;
+    };
+    const sendNotification = (client, seq, message) => {
+        send(client, { type: 'codex/notification', streamId: notificationStreamId, seq, message });
+    };
+    const broadcastNotification = (message) => {
+        const seq = rememberNotification(message);
+        for (const client of wss.clients)
+            sendNotification(client, seq, message);
+    };
+    const replayNotifications = (client, requestedStreamId, afterSeq) => {
+        if (requestedStreamId === null && afterSeq === null)
+            return;
+        const effectiveAfterSeq = requestedStreamId === notificationStreamId ? afterSeq : null;
+        for (const notification of recentNotifications) {
+            if (effectiveAfterSeq === null || notification.seq > effectiveAfterSeq)
+                sendNotification(client, notification.seq, notification.message);
+        }
+    };
+    const clearActiveTurn = (expected = {}, options = {}) => {
+        const current = deps.stateStore.read();
+        if (!current.activeTurnId)
+            return current;
+        if ('threadId' in expected && current.activeThreadId !== expected.threadId)
+            return current;
+        if ('turnId' in expected && current.activeTurnId !== expected.turnId)
+            return current;
+        const next = deps.stateStore.update((state) => {
+            if (!state.activeTurnId)
+                return state;
+            if ('threadId' in expected && state.activeThreadId !== expected.threadId)
+                return state;
+            if ('turnId' in expected && state.activeTurnId !== expected.turnId)
+                return state;
+            return { ...state, activeTurnId: null };
+        });
+        if (options.broadcast !== false)
+            broadcastHello(next);
+        return next;
+    };
+    const isMissingThreadError = (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        return /no rollout found for thread id|failed to resolve rollout path|thread .* is not materialized yet|thread not found|thread .* not found/i.test(message);
+    };
+    const noRolloutThreadIdFromError = (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        return /no rollout found for thread id\s+([^\s'",}]+)/i.exec(message)?.[1] ?? null;
+    };
+    const rolloutPathThreadIdFromError = (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        return /rollout-[^/\\`'"]*-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl/i.exec(message)?.[1] ?? null;
+    };
+    const unmaterializedThreadIdFromError = (error) => {
+        const message = error instanceof Error ? error.message : String(error);
+        return /thread\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\s+is not materialized yet/i.exec(message)?.[1] ?? null;
+    };
+    const missingRolloutThreadIdFromError = (error) => noRolloutThreadIdFromError(error) ?? rolloutPathThreadIdFromError(error) ?? unmaterializedThreadIdFromError(error);
+    const isNoRolloutFoundError = (error, threadId) => {
+        const noRolloutThreadId = missingRolloutThreadIdFromError(error);
+        if (!noRolloutThreadId)
+            return false;
+        return threadId === undefined || noRolloutThreadId === threadId;
+    };
+    const shouldReturnEmptyTurnsForPendingRolloutThread = (threadId) => {
+        const state = deps.stateStore.read();
+        return startedPendingRolloutThreadIds.has(threadId) && state.activeThreadId === threadId;
+    };
+    const markThreadRolloutObserved = (threadId) => {
+        if (threadId)
+            startedPendingRolloutThreadIds.delete(threadId);
+    };
+    const clearMissingActiveThread = (threadId, error) => {
+        resumedThreadIds.delete(threadId);
+        startedPendingRolloutThreadIds.delete(threadId);
+        resumeThreadPromises.delete(threadId);
+        knownThreadPaths.delete(threadId);
+        const current = deps.stateStore.read();
+        if (current.activeThreadId !== threadId)
+            return current;
+        const next = deps.stateStore.update((state) => {
+            if (state.activeThreadId !== threadId)
+                return state;
+            return {
+                ...state,
+                activeThreadId: null,
+                activeThreadPath: null,
+                activeTurnId: null,
+                model: null,
+                effort: null,
+                mode: null,
+                sandbox: null,
+            };
+        });
+        logWarn('Cleared missing active Codex thread', {
+            threadId,
+            error: error instanceof Error ? error.message : String(error),
+        });
+        broadcastHello(next);
+        return next;
+    };
+    clearActiveTurn({}, { broadcast: false });
+    const broadcastRequestResolved = (requestId) => {
+        for (const client of wss.clients) {
+            send(client, { type: 'codex/requestResolved', requestId });
+        }
+    };
+    const broadcastFileChangeSummaryChanged = (threadId, turnId) => {
+        broadcastNotification({
+            jsonrpc: '2.0',
+            method: 'webui/fileChange/summaryChanged',
+            params: { threadId, turnId },
+        });
+    };
+    const ensureCodexStarted = () => {
+        const health = deps.codex.health();
+        if (health.connected && !health.dead)
+            return null;
+        invalidateResumedThreads();
+        return deps.codex.start().then(() => {
+            const appServerUrl = deps.codex.getUrl();
+            const appServerPid = deps.codex.getPid();
+            const current = deps.stateStore.read();
+            if (current.appServerUrl === appServerUrl && current.appServerPid === appServerPid) {
+                broadcastHello(current);
+                return;
+            }
+            const next = deps.stateStore.update((state) => ({ ...state, appServerUrl, appServerPid }));
+            broadcastHello(next);
+        });
+    };
+    const requestCodex = (method, params, timeoutMs) => {
+        const call = () => (timeoutMs === undefined ? deps.codex.request(method, params) : deps.codex.request(method, params, timeoutMs));
+        const starting = ensureCodexStarted();
+        return starting ? starting.then(call) : call();
+    };
+    const ensureThreadResumed = (threadId, requestedThreadPath) => {
+        if (resumedThreadIds.has(threadId))
+            return Promise.resolve();
+        const existing = resumeThreadPromises.get(threadId);
+        if (existing)
+            return existing;
+        const resumePath = resumePathForThread(threadId, requestedThreadPath);
+        let generation = null;
+        let resumePromise;
+        resumePromise = (async () => {
+            const starting = ensureCodexStarted();
+            if (starting)
+                await starting;
+            generation = appServerGeneration;
+            const result = await deps.codex.request('thread/resume', {
+                threadId,
+                ...(resumePath ? { path: resumePath } : {}),
+                experimentalRawEvents: true,
+                persistExtendedHistory: true,
+                excludeTurns: true,
+            }, THREAD_TURNS_LIST_RPC_TIMEOUT_MS);
+            const activeCwd = extractThreadCwd(result);
+            const activeThreadPath = extractThreadPath(result) ?? resumePath;
+            const runtimeStatus = runtimeStatusFromThreadResult(result);
+            rememberKnownThreadPath(threadId, activeThreadPath);
+            let updatedActiveThread = false;
+            const nextState = deps.stateStore.update((state) => {
+                if (state.activeThreadId !== threadId)
+                    return state;
+                updatedActiveThread = true;
+                return {
+                    ...state,
+                    activeCwd: activeCwd ?? state.activeCwd,
+                    activeThreadPath: activeThreadPath ?? state.activeThreadPath,
+                    recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
+                    ...runtimeStatus,
+                };
+            });
+            if (updatedActiveThread)
+                broadcastHello(nextState);
+            const health = deps.codex.health();
+            if (generation === appServerGeneration && health.connected && !health.dead) {
+                resumedThreadIds.add(threadId);
+            }
+        })()
+            .catch((error) => {
+            if (isNoRolloutFoundError(error, threadId) && shouldReturnEmptyTurnsForPendingRolloutThread(threadId)) {
+                logWarn('Continuing newly started active Codex thread without rollout during resume', {
+                    threadId,
+                    error: error instanceof Error ? error.message : String(error),
+                });
+                return;
+            }
+            if (isMissingThreadError(error) && !(isNoRolloutFoundError(error, threadId) && shouldReturnEmptyTurnsForPendingRolloutThread(threadId))) {
+                clearMissingActiveThread(threadId, error);
+            }
+            throw error;
+        })
+            .finally(() => {
+            if ((generation === null || generation === appServerGeneration) && resumeThreadPromises.get(threadId) === resumePromise) {
+                resumeThreadPromises.delete(threadId);
+            }
+        });
+        resumeThreadPromises.set(threadId, resumePromise);
+        return resumePromise;
+    };
+    const startTurn = async ({ threadId, text, options }) => {
+        await ensureThreadResumed(threadId);
+        const context = startContextForThread(threadId);
+        pendingTurnStartContexts.push(context);
+        try {
+            const result = await requestCodex('turn/start', applyTurnRunOptions({
+                threadId,
+                input: [{ type: 'text', text, text_elements: [] }],
+            }, options, context.cwd), TURN_START_RPC_TIMEOUT_MS);
+            const health = deps.codex.health();
+            if (health.connected && !health.dead)
+                resumedThreadIds.add(threadId);
+            return result;
+        }
+        finally {
+            const index = pendingTurnStartContexts.indexOf(context);
+            if (index >= 0)
+                pendingTurnStartContexts.splice(index, 1);
+        }
+    };
+    const steerTurn = async ({ threadId, turnId, queuedMessage }) => {
+        await ensureThreadResumed(threadId);
+        const current = deps.stateStore.read();
+        if (current.activeThreadId !== threadId || current.activeTurnId !== turnId || isTerminalOrCompletingTurn(threadId, turnId)) {
+            throw new Error('active turn is no longer steerable');
+        }
+        return requestCodex('turn/steer', {
+            threadId,
+            expectedTurnId: turnId,
+            input: [{ type: 'text', text: queuedMessage.text, text_elements: [] }],
+        }, TURN_STEER_RPC_TIMEOUT_MS);
+    };
+    const deferQueuedMessageForThread = (threadId, queuedMessage) => {
+        const current = deferredQueuedMessagesByThread.get(threadId) ?? [];
+        if (!current.some((message) => message.id === queuedMessage.id))
+            current.push(queuedMessage);
+        deferredQueuedMessagesByThread.set(threadId, current.slice(-deps.config.queueLimit));
+    };
+    const restoreDeferredQueuedMessagesForThread = (threadId) => {
+        const deferred = deferredQueuedMessagesByThread.get(threadId);
+        if (!deferred || deferred.length === 0)
+            return null;
+        let restored = false;
+        const state = deps.stateStore.update((current) => {
+            if (current.activeThreadId !== threadId)
+                return current;
+            restored = true;
+            const existingIds = new Set(current.queue.map((message) => message.id));
+            const restoredMessages = deferred.filter((message) => !existingIds.has(message.id));
+            return restoredMessages.length > 0
+                ? { ...current, queue: [...restoredMessages, ...current.queue].slice(0, deps.config.queueLimit) }
+                : current;
+        });
+        if (restored)
+            deferredQueuedMessagesByThread.delete(threadId);
+        return restored ? state : null;
+    };
+    const restoreQueuedMessageToFront = (threadId, queuedMessage) => {
+        let restored = false;
+        const state = deps.stateStore.update((current) => {
+            if (current.activeThreadId !== threadId)
+                return current;
+            restored = true;
+            return {
+                ...current,
+                queue: current.queue.some((message) => message.id === queuedMessage.id)
+                    ? current.queue
+                    : [queuedMessage, ...current.queue].slice(0, deps.config.queueLimit),
+            };
+        });
+        if (!restored)
+            deferQueuedMessageForThread(threadId, queuedMessage);
+        return restored ? state : null;
+    };
+    const startQueuedTurnFromIdle = (threadId, queuedMessage) => {
+        if (queuedStartInFlight)
+            return;
+        queuedStartInFlight = { threadId, queuedMessage };
+        void (async () => {
+            let completedBeforeStartReturned = false;
+            try {
+                const result = await startTurn({ threadId, text: queuedMessage.text, options: queuedMessage.options });
+                const nextTurnId = extractTurnId(result);
+                timedOutQueuedStarts.delete(threadId);
+                const alreadyCompleted = hasCompletedTurn(threadId, nextTurnId);
+                completedBeforeStartReturned = alreadyCompleted;
+                const next = deps.stateStore.update((current) => {
+                    if (current.activeThreadId !== threadId)
+                        return current;
+                    if (alreadyCompleted && (current.activeTurnId === nextTurnId || isPendingTurnStartForThread(current.activeTurnId, threadId))) {
+                        return applyRunOptionsToRuntimeState({ ...current, activeTurnId: null }, queuedMessage.options);
+                    }
+                    if (current.activeTurnId === nextTurnId)
+                        return applyRunOptionsToRuntimeState(current, queuedMessage.options);
+                    if (isPendingTurnStartForThread(current.activeTurnId, threadId)) {
+                        return applyRunOptionsToRuntimeState({ ...current, activeTurnId: nextTurnId }, queuedMessage.options);
+                    }
+                    return current;
+                });
+                if (next.activeThreadId === threadId) {
+                    rememberTurnThreadPath(threadId, nextTurnId, next.activeThreadPath);
+                    rememberTurnCwd(threadId, nextTurnId, next.activeCwd);
+                    rememberLivePatchTurn(threadId, nextTurnId);
+                }
+                broadcastHello(next);
+            }
+            catch (error) {
+                logWarn('Failed to start queued turn', error);
+                if (isTurnStartTimeout(error)) {
+                    let restoredQueuedMessage = false;
+                    const next = deps.stateStore.update((current) => {
+                        if (current.activeThreadId !== threadId || !isPendingTurnStartForThread(current.activeTurnId, threadId))
+                            return current;
+                        restoredQueuedMessage = true;
+                        return {
+                            ...current,
+                            activeTurnId: null,
+                            queue: current.queue.some((message) => message.id === queuedMessage.id)
+                                ? current.queue
+                                : [queuedMessage, ...current.queue].slice(0, deps.config.queueLimit),
+                        };
+                    });
+                    if (restoredQueuedMessage)
+                        timedOutQueuedStarts.set(threadId, queuedMessage);
+                    broadcastHello(next);
+                    return;
+                }
+                const next = deps.stateStore.update((current) => {
+                    if (current.activeThreadId !== threadId || !isPendingTurnStartForThread(current.activeTurnId, threadId))
+                        return current;
+                    return {
+                        ...current,
+                        activeTurnId: null,
+                        queue: current.queue.some((message) => message.id === queuedMessage.id)
+                            ? current.queue
+                            : [queuedMessage, ...current.queue].slice(0, deps.config.queueLimit),
+                    };
+                });
+                broadcastHello(next);
+            }
+            finally {
+                queuedStartInFlight = null;
+                if (!completedBeforeStartReturned || !maybeStartQueuedTurnFromIdle(threadId))
+                    maybeSteerQueuedMessage();
+            }
+        })();
+    };
+    const maybeStartQueuedTurnFromIdle = (threadId) => {
+        if (queuedStartInFlight)
+            return false;
+        let claim = null;
+        const claimed = deps.stateStore.update((current) => {
+            if (current.activeThreadId !== threadId || current.activeTurnId || !current.activeThreadId)
+                return current;
+            const shifted = shiftQueuedMessage(current.queue);
+            if (!shifted.next)
+                return current;
+            claim = { threadId: current.activeThreadId, queuedMessage: shifted.next };
+            return applyRunOptionsToRuntimeState({ ...current, activeTurnId: pendingTurnStartTurnId(current.activeThreadId), queue: shifted.queue }, shifted.next.options);
+        });
+        const claimToStart = claim;
+        if (!claimToStart)
+            return false;
+        broadcastHello(claimed);
+        startQueuedTurnFromIdle(claimToStart.threadId, claimToStart.queuedMessage);
+        return true;
+    };
+    const maybeSteerQueuedMessage = () => {
+        if (queuedSteerInFlight || queuedStartInFlight)
+            return;
+        let claim = null;
+        const claimed = deps.stateStore.update((current) => {
+            if (!current.activeThreadId || !current.activeTurnId)
+                return current;
+            if (isPendingTurnForThread(current.activeTurnId, current.activeThreadId))
+                return current;
+            if (isTerminalOrCompletingTurn(current.activeThreadId, current.activeTurnId))
+                return current;
+            const nextQueuedMessage = current.queue[0];
+            if (!nextQueuedMessage || !queuedRunOptionsMatchActiveTurn(current, nextQueuedMessage))
+                return current;
+            const shifted = shiftQueuedMessage(current.queue);
+            if (!shifted.next)
+                return current;
+            claim = { threadId: current.activeThreadId, turnId: current.activeTurnId, queuedMessage: shifted.next };
+            return { ...current, queue: shifted.queue };
+        });
+        const claimToSteer = claim;
+        if (!claimToSteer)
+            return;
+        const inFlight = { ...claimToSteer, terminalDisposition: null, settled: false, timedOut: false };
+        queuedSteerInFlight = inFlight;
+        broadcastHello(claimed);
+        void (async () => {
+            let followUp = null;
+            try {
+                await steerTurn(claimToSteer);
+                inFlight.settled = true;
+                const terminalDisposition = inFlight.terminalDisposition;
+                if (terminalDisposition === 'barrier') {
+                    const restored = restoreQueuedMessageToFront(claimToSteer.threadId, claimToSteer.queuedMessage);
+                    if (restored)
+                        broadcastHello(restored);
+                }
+                else if (terminalDisposition === 'advance-queue') {
+                    const current = deps.stateStore.read();
+                    if (current.activeThreadId !== claimToSteer.threadId || current.activeTurnId !== claimToSteer.turnId) {
+                        followUp = 'start-next-turn';
+                    }
+                }
+                else {
+                    const current = deps.stateStore.read();
+                    if (current.activeThreadId === claimToSteer.threadId && current.activeTurnId === claimToSteer.turnId) {
+                        followUp = 'drain-active-turn';
+                    }
+                }
+            }
+            catch (error) {
+                logWarn('Failed to steer queued message into active turn', error);
+                inFlight.settled = true;
+                inFlight.timedOut = isTurnSteerTimeout(error);
+                const terminalDisposition = inFlight.terminalDisposition;
+                const restored = restoreQueuedMessageToFront(claimToSteer.threadId, claimToSteer.queuedMessage);
+                if (restored)
+                    broadcastHello(restored);
+                if (terminalDisposition === 'advance-queue' && !isTurnSteerTimeout(error)) {
+                    const current = deps.stateStore.read();
+                    if (current.activeThreadId !== claimToSteer.threadId || current.activeTurnId !== claimToSteer.turnId) {
+                        followUp = 'start-next-turn';
+                    }
+                }
+            }
+            finally {
+                if (queuedSteerInFlight === inFlight)
+                    queuedSteerInFlight = null;
+            }
+            if (followUp === 'start-next-turn') {
+                maybeStartQueuedTurnFromIdle(claimToSteer.threadId);
+            }
+            else if (followUp === 'drain-active-turn') {
+                maybeSteerQueuedMessage();
+            }
+        })();
+    };
+    const handleTurnCompleted = async (message, disposition) => {
+        const advanceQueue = disposition === 'advance-queue';
+        const allowMissingTurnId = advanceQueue;
+        const completedThreadId = notificationThreadId(message);
+        const completedTurnId = notificationTurnId(message);
+        const current = deps.stateStore.read();
+        const completingSteer = queuedSteerInFlight &&
+            (!completedThreadId || completedThreadId === queuedSteerInFlight.threadId) &&
+            completionMatchesActiveTurn(queuedSteerInFlight.turnId, queuedSteerInFlight.threadId, completedTurnId, { allowMissingTurnId })
+            ? queuedSteerInFlight
+            : null;
+        if (completingSteer)
+            completingSteer.terminalDisposition = disposition;
+        const missingTurnIdCanMatch = allowMissingTurnId && isPendingCompactionTurnForThread(current.activeTurnId, current.activeThreadId);
+        const turnIdToFinalize = completedTurnId ?? (missingTurnIdCanMatch ? current.activeTurnId : null);
+        const threadIdToFinalize = completedThreadId ?? (turnIdToFinalize === current.activeTurnId ? current.activeThreadId : null);
+        const completionKey = turnIdToFinalize ? turnKey(threadIdToFinalize, turnIdToFinalize) : null;
+        if (completionKey && (completingTurnKeys.has(completionKey) || completedTurnKeys.has(completionKey)))
+            return;
+        if (completionKey) {
+            completingTurnKeys.add(completionKey);
+            rememberTerminalTurnKey(completionKey);
+        }
+        let finalizedForCompletionKey = false;
+        if (turnIdToFinalize) {
+            try {
+                const finalizeThreadPath = (completionKey ? turnThreadPaths.get(completionKey) : null) ??
+                    (!threadIdToFinalize || threadIdToFinalize === current.activeThreadId ? current.activeThreadPath : null);
+                await finalizeTurnFileSummary(threadIdToFinalize, turnIdToFinalize, finalizeThreadPath);
+                finalizedForCompletionKey = true;
+            }
+            catch (error) {
+                logWarn('Failed to finalize file edit diffs', error);
+            }
+        }
+        else {
+            finalizedForCompletionKey = true;
+        }
+        const afterFinalize = deps.stateStore.read();
+        const activeCompletion = Boolean(afterFinalize.activeTurnId) &&
+            (!completedThreadId || completedThreadId === afterFinalize.activeThreadId) &&
+            completionMatchesActiveTurn(afterFinalize.activeTurnId, afterFinalize.activeThreadId, completedTurnId, { allowMissingTurnId });
+        if (!activeCompletion) {
+            if (advanceQueue && !afterFinalize.activeThreadId && afterFinalize.activeTurnId) {
+                const cleared = deps.stateStore.update((state) => ({ ...state, activeTurnId: null }));
+                broadcastHello(cleared);
+            }
+            if (completionKey) {
+                completingTurnKeys.delete(completionKey);
+                if (finalizedForCompletionKey) {
+                    rememberCompletedTurnKey(completionKey);
+                }
+            }
+            return;
+        }
+        if (queuedStartInFlight || queuedSteerInFlight || completingSteer || !advanceQueue) {
+            const cleared = deps.stateStore.update((current) => {
+                const stillActiveCompletion = Boolean(current.activeTurnId) &&
+                    (!completedThreadId || completedThreadId === current.activeThreadId) &&
+                    completionMatchesActiveTurn(current.activeTurnId, current.activeThreadId, completedTurnId, { allowMissingTurnId });
+                return stillActiveCompletion ? { ...current, activeTurnId: null } : current;
+            });
+            broadcastHello(cleared);
+            if (completionKey) {
+                completingTurnKeys.delete(completionKey);
+                if (finalizedForCompletionKey) {
+                    rememberCompletedTurnKey(completionKey);
+                }
+            }
+            if (completingSteer && advanceQueue && completingSteer.settled && !completingSteer.timedOut) {
+                maybeStartQueuedTurnFromIdle(completingSteer.threadId);
+            }
+            return;
+        }
+        let claim = null;
+        const claimed = deps.stateStore.update((current) => {
+            const stillActiveCompletion = Boolean(current.activeThreadId && current.activeTurnId) &&
+                (!completedThreadId || completedThreadId === current.activeThreadId) &&
+                completionMatchesActiveTurn(current.activeTurnId, current.activeThreadId, completedTurnId, { allowMissingTurnId });
+            if (!stillActiveCompletion)
+                return current;
+            if (!current.activeThreadId)
+                return { ...current, activeTurnId: null };
+            const shifted = shiftQueuedMessage(current.queue);
+            if (!shifted.next)
+                return { ...current, activeTurnId: null };
+            claim = { threadId: current.activeThreadId, queuedMessage: shifted.next };
+            return applyRunOptionsToRuntimeState({ ...current, activeTurnId: pendingTurnStartTurnId(current.activeThreadId), queue: shifted.queue }, shifted.next.options);
+        });
+        broadcastHello(claimed);
+        const claimToStart = claim;
+        if (!claimToStart) {
+            if (completionKey) {
+                completingTurnKeys.delete(completionKey);
+                if (finalizedForCompletionKey) {
+                    rememberCompletedTurnKey(completionKey);
+                }
+            }
+            return;
+        }
+        if (completionKey) {
+            completingTurnKeys.delete(completionKey);
+            if (finalizedForCompletionKey) {
+                rememberCompletedTurnKey(completionKey);
+            }
+        }
+        startQueuedTurnFromIdle(claimToStart.threadId, claimToStart.queuedMessage);
+    };
+    const handleTaskStarted = (message) => {
+        const turnId = notificationTurnId(message);
+        if (!turnId)
+            return;
+        const notifiedThreadId = notificationThreadId(message);
+        const pendingContext = takePendingTurnStartContext(notifiedThreadId);
+        const current = deps.stateStore.read();
+        const threadId = notifiedThreadId ?? pendingContext?.threadId ?? null;
+        if (!threadId)
+            return;
+        const threadPath = pendingContext?.threadPath ??
+            (threadId && threadId === current.activeThreadId ? current.activeThreadPath : threadId ? knownThreadPaths.get(threadId) ?? null : null);
+        const cwd = pendingContext?.cwd ?? (threadId && threadId === current.activeThreadId ? current.activeCwd : null);
+        rememberKnownThreadPath(threadId, threadPath);
+        rememberTurnThreadPath(threadId, turnId, threadPath);
+        rememberTurnCwd(threadId, turnId, cwd);
+        rememberLivePatchTurn(threadId, turnId);
+        const alreadyCompleted = hasCompletedTurn(threadId, turnId);
+        const timedOutQueuedStart = threadId ? timedOutQueuedStarts.get(threadId) : null;
+        if (threadId && timedOutQueuedStart) {
+            timedOutQueuedStarts.delete(threadId);
+            deps.stateStore.update((state) => state.activeThreadId === threadId
+                ? {
+                    ...state,
+                    queue: state.queue.filter((message) => message.id !== timedOutQueuedStart.id || message.text !== timedOutQueuedStart.text),
+                }
+                : state);
+        }
+        if (!threadId || current.activeThreadId !== threadId || current.activeTurnId === turnId)
+            return;
+        if (current.activeTurnId && current.activeTurnId !== turnId && !isPendingTurnForThread(current.activeTurnId, threadId))
+            return;
+        const next = deps.stateStore.update((state) => ({
+            ...state,
+            activeTurnId: state.activeThreadId === threadId ? (alreadyCompleted ? null : turnId) : state.activeTurnId,
+            activeThreadPath: state.activeThreadId === threadId ? (threadPath ?? state.activeThreadPath) : state.activeThreadPath,
+            activeCwd: state.activeThreadId === threadId ? (cwd ?? state.activeCwd) : state.activeCwd,
+        }));
+        broadcastHello(next);
+        maybeSteerQueuedMessage();
+    };
+    const unsubscribeNotification = deps.codex.onNotification((message) => {
+        const seq = rememberNotification(message);
+        const isTaskStart = message.method === 'turn/started' || (message.method === 'event_msg' && isTaskStartedEvent(message));
+        if (isTaskStart)
+            handleTaskStarted(message);
+        for (const client of wss.clients)
+            sendNotification(client, seq, message);
+        const resolvedRequestId = extractResolvedRequestId(message);
+        if (resolvedRequestId !== null && pendingServerRequests.delete(requestKey(resolvedRequestId))) {
+            broadcastRequestResolved(resolvedRequestId);
+        }
+        if (message.method === 'event_msg') {
+            enqueuePatchApplyEnd(message);
+        }
+        if (message.method === 'item/completed')
+            enqueueStructuredFileChange(message);
+        const terminalDisposition = notificationTerminalDisposition(message);
+        if (terminalDisposition)
+            void handleTurnCompleted(message, terminalDisposition);
+    });
+    const unsubscribeServerRequest = deps.codex.onServerRequest((message) => {
+        if (message.method === 'item/fileChange/requestApproval') {
+            captureFileChangeSnapshots(message.params, message.id);
+        }
+        pendingServerRequests.set(requestKey(message.id), message);
+        for (const client of wss.clients)
+            send(client, { type: 'codex/request', message });
+    });
+    const unsubscribeHealthChange = deps.codex.onHealthChange(() => {
+        const health = deps.codex.health();
+        if (!health.connected || health.dead) {
+            invalidateResumedThreads();
+            pendingServerRequests.clear();
+            const current = deps.stateStore.read();
+            if (current.activeTurnId) {
+                const { activeThreadId, activeThreadPath, activeTurnId } = current;
+                void finalizeActiveTurnBeforeClear(activeThreadId, activeTurnId, activeThreadPath).finally(() => {
+                    clearActiveTurn({ threadId: activeThreadId, turnId: activeTurnId }, { broadcast: true });
+                });
+                return;
+            }
+        }
+        broadcastHello();
+    });
+    const close = () => {
+        if (closed)
+            return;
+        closed = true;
+        unsubscribeNotification();
+        unsubscribeServerRequest();
+        unsubscribeHealthChange();
+        for (const client of wss.clients)
+            closeClient(client);
+        wss.close();
+    };
+    server.on('close', close);
+    wss.on('error', (err) => {
+        logWarn('Browser WebSocket server error', err);
+    });
+    wss.on('connection', (ws, req) => {
+        ws.on('error', (err) => {
+            logWarn('Browser WebSocket client error', err);
+        });
+        const url = new URL(req.url ?? '/ws', 'http://localhost');
+        if (!authorized(deps, url.searchParams.get('token'), req.headers.cookie, req.headers.host)) {
+            send(ws, { type: 'auth/error' });
+            ws.close(1008, 'unauthorized');
+            return;
+        }
+        sendHello(ws);
+        ws.on('message', async (raw) => {
+            const request = parseBrowserRequest(raw);
+            if (!request)
+                return;
+            if (request.type === 'client/hello') {
+                sendHello(ws);
+                replayNotifications(ws, lastNotificationStreamId(request.params), lastNotificationSeq(request.params));
+                return;
+            }
+            if (request.type !== 'rpc' ||
+                typeof request.method !== 'string' ||
+                typeof request.id !== 'number' ||
+                !Number.isFinite(request.id)) {
+                return;
+            }
+            try {
+                if (request.method === 'webui/codex/restart') {
+                    const current = deps.stateStore.read();
+                    if (current.activeTurnId) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'cannot restart Codex while a turn is active' });
+                        return;
+                    }
+                    if (restartInFlight) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'Codex restart is already in progress' });
+                        return;
+                    }
+                    const operation = (async () => {
+                        const activeThreadId = current.activeThreadId;
+                        const activeThreadPath = current.activeThreadPath;
+                        const options = runOptionsFromRuntimeState(current);
+                        const resumePath = activeThreadId ? resumePathForThread(activeThreadId, activeThreadPath) : null;
+                        pendingServerRequests.clear();
+                        invalidateResumedThreads();
+                        await deps.codex.restart();
+                        let state = deps.stateStore.update((state) => ({
+                            ...state,
+                            appServerUrl: deps.codex.getUrl(),
+                            appServerPid: deps.codex.getPid(),
+                        }));
+                        broadcastHello(state);
+                        let resumeResult = null;
+                        if (activeThreadId) {
+                            let skippedPendingRolloutResume = false;
+                            const params = applyThreadRunOptions({
+                                threadId: activeThreadId,
+                                ...(resumePath ? { path: resumePath } : {}),
+                                experimentalRawEvents: true,
+                                persistExtendedHistory: true,
+                                excludeTurns: true,
+                            }, options);
+                            const generation = appServerGeneration;
+                            resumeResult = await Promise.resolve(deps.codex.request('thread/resume', params, THREAD_TURNS_LIST_RPC_TIMEOUT_MS)).catch((error) => {
+                                if (isNoRolloutFoundError(error, activeThreadId) && shouldReturnEmptyTurnsForPendingRolloutThread(activeThreadId)) {
+                                    logWarn('Preserving newly started active Codex thread without rollout after app-server restart', {
+                                        threadId: activeThreadId,
+                                        error: error instanceof Error ? error.message : String(error),
+                                    });
+                                    skippedPendingRolloutResume = true;
+                                    return null;
+                                }
+                                if (isMissingThreadError(error))
+                                    clearMissingActiveThread(activeThreadId, error);
+                                throw error;
+                            });
+                            const health = deps.codex.health();
+                            if (!skippedPendingRolloutResume && generation === appServerGeneration && health.connected && !health.dead)
+                                resumedThreadIds.add(activeThreadId);
+                            const activeCwd = extractThreadCwd(resumeResult) ?? current.activeCwd;
+                            const resultThreadPath = extractThreadPath(resumeResult);
+                            const nextThreadPath = resultThreadPath ?? resumePath ?? activeThreadPath;
+                            const runtimeStatus = runtimeStatusFromThreadResult(resumeResult, options);
+                            rememberKnownThreadPath(activeThreadId, nextThreadPath);
+                            state = deps.stateStore.update((state) => state.activeThreadId === activeThreadId
+                                ? {
+                                    ...state,
+                                    activeThreadPath: nextThreadPath,
+                                    activeTurnId: null,
+                                    activeCwd,
+                                    ...runtimeStatus,
+                                    recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
+                                }
+                                : state);
+                            broadcastHello(state);
+                        }
+                        return {
+                            ok: true,
+                            resumedThreadId: activeThreadId,
+                            thread: sanitizeThreadHistory(resumeResult),
+                            appServerHealth: deps.codex.health(),
+                        };
+                    })();
+                    restartInFlight = operation;
+                    try {
+                        send(ws, { type: 'rpc/result', id: request.id, result: await operation });
+                    }
+                    finally {
+                        if (restartInFlight === operation)
+                            restartInFlight = null;
+                    }
+                    return;
+                }
+                if (restartInFlight) {
+                    send(ws, { type: 'rpc/error', id: request.id, error: 'Codex restart is in progress' });
+                    return;
+                }
+                if (request.method === 'webui/session/list') {
+                    const result = await requestCodex('thread/list', {
+                        limit: 50,
+                        cursor: null,
+                        sortDirection: 'desc',
+                        sortKey: 'updated_at',
+                    });
+                    rememberKnownThreadPathsFromList(result);
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/session/start') {
+                    const cwd = getRequiredString(request.params, 'cwd');
+                    if (!cwd) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'cwd is required' });
+                        return;
+                    }
+                    const options = runOptionsFromParams(request.params);
+                    const params = applyThreadRunOptions({
+                        cwd,
+                        experimentalRawEvents: true,
+                        persistExtendedHistory: true,
+                    }, options);
+                    const result = await requestCodex('thread/start', params);
+                    const activeCwd = extractThreadCwd(result) ?? cwd;
+                    const activeThreadId = extractThreadId(result);
+                    const activeThreadPath = extractThreadPath(result);
+                    const runtimeStatus = runtimeStatusFromThreadResult(result, options);
+                    rememberKnownThreadPath(activeThreadId, activeThreadPath);
+                    if (activeThreadId) {
+                        resumedThreadIds.add(activeThreadId);
+                        startedPendingRolloutThreadIds.add(activeThreadId);
+                    }
+                    const state = deps.stateStore.update((state) => ({
+                        ...state,
+                        activeThreadId,
+                        activeThreadPath,
+                        activeTurnId: null,
+                        activeCwd,
+                        ...runtimeStatus,
+                        recentCwds: rememberCwd(state.recentCwds, activeCwd),
+                    }));
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    broadcastHello(state);
+                    return;
+                }
+                if (request.method === 'webui/session/resume') {
+                    const threadId = getRequiredString(request.params, 'threadId');
+                    if (!threadId) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
+                        return;
+                    }
+                    const requestedThreadPath = getOptionalString(request.params, 'threadPath');
+                    const options = runOptionsFromParams(request.params);
+                    const resumePath = resumePathForThread(threadId, requestedThreadPath);
+                    const params = applyThreadRunOptions({
+                        threadId,
+                        ...(resumePath ? { path: resumePath } : {}),
+                        experimentalRawEvents: true,
+                        persistExtendedHistory: true,
+                        excludeTurns: true,
+                    }, options);
+                    const starting = ensureCodexStarted();
+                    if (starting)
+                        await starting;
+                    const generation = appServerGeneration;
+                    const result = await deps.codex.request('thread/resume', params).catch((error) => {
+                        if (isMissingThreadError(error))
+                            clearMissingActiveThread(threadId, error);
+                        throw error;
+                    });
+                    const health = deps.codex.health();
+                    if (generation === appServerGeneration && health.connected && !health.dead)
+                        resumedThreadIds.add(threadId);
+                    const activeCwd = extractThreadCwd(result) ?? deps.stateStore.read().activeCwd;
+                    const resultThreadPath = extractThreadPath(result);
+                    const activeThreadPath = resultThreadPath ?? resumePath ?? (requestedThreadPath && knownThreadPaths.get(threadId) === requestedThreadPath ? requestedThreadPath : null);
+                    const runtimeStatus = runtimeStatusFromThreadResult(result, options);
+                    rememberKnownThreadPath(threadId, activeThreadPath);
+                    let state = deps.stateStore.update((state) => ({
+                        ...state,
+                        activeThreadId: threadId,
+                        activeThreadPath,
+                        activeTurnId: null,
+                        activeCwd,
+                        ...runtimeStatus,
+                        recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
+                    }));
+                    state = restoreDeferredQueuedMessagesForThread(threadId) ?? state;
+                    send(ws, { type: 'rpc/result', id: request.id, result: sanitizeThreadHistory(result) });
+                    broadcastHello(state);
+                    return;
+                }
+                if (request.method === 'webui/queue/enqueue') {
+                    const text = getRequiredString(request.params, 'text');
+                    if (!text) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'text is required' });
+                        return;
+                    }
+                    const state = deps.stateStore.update((current) => ({
+                        ...current,
+                        queue: enqueueMessage(current.queue, text, deps.config.queueLimit, runOptionsFromParams(request.params)),
+                    }));
+                    send(ws, { type: 'rpc/result', id: request.id, result: state.queue });
+                    broadcastHello(state);
+                    maybeSteerQueuedMessage();
+                    return;
+                }
+                if (request.method === 'webui/bang/run') {
+                    const command = getRequiredString(request.params, 'command');
+                    if (!command) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'command is required' });
+                        return;
+                    }
+                    const state = deps.stateStore.read();
+                    if (state.activeTurnId) {
+                        throw new Error('! commands are disabled while Codex is working');
+                    }
+                    if (!state.activeCwd) {
+                        throw new Error('no active cwd');
+                    }
+                    if (isInteractiveCommandBlocked(command)) {
+                        throw new Error('interactive commands are not supported');
+                    }
+                    if (bangCommandInFlight) {
+                        throw new Error('A command is already running');
+                    }
+                    bangCommandInFlight = true;
+                    try {
+                        const result = await runBangCommand(command, state.activeCwd, deps.config.commandTimeoutMs, deps.config.commandOutputBytes);
+                        send(ws, { type: 'rpc/result', id: request.id, result });
+                    }
+                    finally {
+                        bangCommandInFlight = false;
+                    }
+                    return;
+                }
+                if (request.method === 'webui/thread/compact/start') {
+                    const state = deps.stateStore.read();
+                    const threadId = getRequiredString(request.params, 'threadId') ?? state.activeThreadId;
+                    if (!threadId) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
+                        return;
+                    }
+                    if (state.activeTurnId && state.activeThreadId === threadId) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'cannot compact while Codex is working' });
+                        return;
+                    }
+                    const pendingTurnId = pendingCompactionTurnId(threadId);
+                    const markedState = deps.stateStore.update((current) => current.activeThreadId === threadId && !current.activeTurnId ? { ...current, activeTurnId: pendingTurnId } : current);
+                    if (markedState.activeThreadId === threadId && markedState.activeTurnId === pendingTurnId)
+                        broadcastHello(markedState);
+                    try {
+                        await ensureThreadResumed(threadId);
+                        const result = await requestCodex('thread/compact/start', { threadId });
+                        send(ws, { type: 'rpc/result', id: request.id, result });
+                    }
+                    catch (error) {
+                        const cleared = clearActiveTurn({ threadId, turnId: pendingTurnId }, { broadcast: false });
+                        broadcastHello(cleared);
+                        throw error;
+                    }
+                    return;
+                }
+                if (request.method === 'webui/approval/respond') {
+                    const params = approvalRespondParams(request.params);
+                    if (typeof params === 'string') {
+                        send(ws, { type: 'rpc/error', id: request.id, error: params });
+                        return;
+                    }
+                    const pendingRequest = pendingServerRequests.get(requestKey(params.requestId));
+                    if (!pendingRequest) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'approval request is no longer pending' });
+                        return;
+                    }
+                    const response = approvalResponseForDecision(pendingRequest.method, params.decision, pendingRequest.params);
+                    deps.codex.respond(pendingRequest.id, response);
+                    pendingServerRequests.delete(requestKey(params.requestId));
+                    send(ws, { type: 'rpc/result', id: request.id, result: { ok: true } });
+                    broadcastRequestResolved(pendingRequest.id);
+                    return;
+                }
+                if (request.method === 'webui/fs/browseDirectory') {
+                    const filePath = getRequiredString(request.params, 'path') ?? browseBasePath(deps);
+                    const result = await browseDirectory(deps, filePath);
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/fs/browseWorkspaceDirectory') {
+                    let filePath = activeWorkspaceRoot(deps);
+                    if (isRecord(request.params) && hasOwn(request.params, 'path')) {
+                        const value = request.params.path;
+                        if (typeof value !== 'string' || value.trim().length === 0) {
+                            send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+                            return;
+                        }
+                        filePath = value;
+                    }
+                    const result = await browseWorkspaceDirectory(deps, filePath);
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/git/repos/list') {
+                    const result = await listGitRepos(deps.stateStore.read());
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/git/repos/add') {
+                    const repoPath = getRequiredString(request.params, 'path');
+                    if (!repoPath) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+                        return;
+                    }
+                    const result = await addGitRepo(deps.stateStore.read(), deps.stateStore, repoPath);
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/git/repos/remove') {
+                    const repoId = getRequiredString(request.params, 'repoId');
+                    if (!repoId) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'repoId is required' });
+                        return;
+                    }
+                    const result = removeGitRepo(deps.stateStore.read(), deps.stateStore, repoId);
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/git/status') {
+                    const repoId = getRequiredString(request.params, 'repoId');
+                    if (!repoId) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'repoId is required' });
+                        return;
+                    }
+                    const result = await gitStatusForRepo(deps.stateStore.read(), repoId);
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/git/diff') {
+                    const repoId = getRequiredString(request.params, 'repoId');
+                    const filePath = getRequiredRawString(request.params, 'path');
+                    const scope = getOptionalEnum(request.params, 'scope', GIT_DIFF_SCOPES);
+                    if (!repoId) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'repoId is required' });
+                        return;
+                    }
+                    if (!filePath) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+                        return;
+                    }
+                    if (!scope) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'scope is required' });
+                        return;
+                    }
+                    const originalPath = getOptionalRawString(request.params, 'originalPath');
+                    const result = await gitDiffForRepo(deps.stateStore.read(), { repoId, path: filePath, originalPath, scope });
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/git/stage') {
+                    assertNoActiveTurnForGitMutation(deps);
+                    const repoId = getRequiredString(request.params, 'repoId');
+                    const paths = getRequiredStringArray(request.params, 'paths');
+                    if (!repoId) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'repoId is required' });
+                        return;
+                    }
+                    if (!paths) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'paths are required' });
+                        return;
+                    }
+                    const result = await gitStagePaths(deps.stateStore.read(), { repoId, paths }, deps.stateStore.read.bind(deps.stateStore));
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/git/unstage') {
+                    assertNoActiveTurnForGitMutation(deps);
+                    const repoId = getRequiredString(request.params, 'repoId');
+                    const paths = getRequiredStringArray(request.params, 'paths');
+                    if (!repoId) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'repoId is required' });
+                        return;
+                    }
+                    if (!paths) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'paths are required' });
+                        return;
+                    }
+                    const result = await gitUnstagePaths(deps.stateStore.read(), { repoId, paths }, deps.stateStore.read.bind(deps.stateStore));
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/git/commit') {
+                    assertNoActiveTurnForGitMutation(deps);
+                    const repoId = getRequiredString(request.params, 'repoId');
+                    const message = getString(request.params, 'message');
+                    if (!repoId) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'repoId is required' });
+                        return;
+                    }
+                    if (message === null) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'message is required' });
+                        return;
+                    }
+                    const result = await gitCommit(deps.stateStore.read(), { repoId, message }, deps.stateStore.read.bind(deps.stateStore));
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/fs/readDirectory') {
+                    const filePath = getRequiredString(request.params, 'path');
+                    if (!filePath) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+                        return;
+                    }
+                    const result = await readDirectory(deps, filePath);
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/fs/readFile') {
+                    const filePath = getRequiredString(request.params, 'path');
+                    if (!filePath) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+                        return;
+                    }
+                    const result = await readFile(deps, filePath);
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/fs/writeFile') {
+                    const filePath = getRequiredString(request.params, 'path');
+                    const dataBase64 = getString(request.params, 'dataBase64');
+                    if (!filePath) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+                        return;
+                    }
+                    if (dataBase64 === null) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'dataBase64 is required' });
+                        return;
+                    }
+                    const result = await writeFile(deps, filePath, dataBase64);
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/fs/createDirectory') {
+                    const filePath = getRequiredString(request.params, 'path');
+                    if (!filePath) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+                        return;
+                    }
+                    const result = await createDirectory(deps, filePath);
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/fs/createBrowseDirectory') {
+                    const filePath = getRequiredString(request.params, 'path');
+                    if (!filePath) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+                        return;
+                    }
+                    const result = await createBrowseDirectory(deps, filePath);
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/fs/createFile') {
+                    const filePath = getRequiredString(request.params, 'path');
+                    if (!filePath) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+                        return;
+                    }
+                    const result = await writeFile(deps, filePath, '');
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/fs/getMetadata') {
+                    const filePath = getRequiredString(request.params, 'path');
+                    if (!filePath) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'path is required' });
+                        return;
+                    }
+                    const result = await getMetadata(deps, filePath);
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/fileChange/diff') {
+                    const params = fileDiffParams(request.params);
+                    if (typeof params === 'string') {
+                        send(ws, { type: 'rpc/error', id: request.id, error: params });
+                        return;
+                    }
+                    const result = await buildFileChangeDiff(params);
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/fileChange/summary') {
+                    const turnId = getRequiredString(request.params, 'turnId') ?? deps.stateStore.read().activeTurnId;
+                    if (!turnId) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'turnId is required' });
+                        return;
+                    }
+                    const threadId = getOptionalString(request.params, 'threadId');
+                    const threadPath = getOptionalString(request.params, 'threadPath');
+                    {
+                        const drain = drainPatchCaptureQueue();
+                        if (drain)
+                            await drain;
+                    }
+                    send(ws, { type: 'rpc/result', id: request.id, result: { turnId, files: listStoredTurnFiles(turnId, threadId, threadPath) } });
+                    return;
+                }
+                if (request.method === 'thread/turns/list') {
+                    const params = turnListParams(request.params);
+                    if (typeof params === 'string') {
+                        send(ws, { type: 'rpc/error', id: request.id, error: params });
+                        return;
+                    }
+                    let result;
+                    try {
+                        await ensureThreadResumed(params.threadId, params.threadPath);
+                        const codexParams = {
+                            threadId: params.threadId,
+                            cursor: params.cursor,
+                            limit: params.limit,
+                            sortDirection: params.sortDirection,
+                        };
+                        result = await requestCodex('thread/turns/list', codexParams, THREAD_TURNS_LIST_RPC_TIMEOUT_MS);
+                        markThreadRolloutObserved(params.threadId);
+                        const drain = drainPatchCaptureQueue();
+                        if (drain)
+                            await drain;
+                        result = augmentTurnListWithStoredFileSummaries(result, params.threadId);
+                    }
+                    catch (error) {
+                        if (isNoRolloutFoundError(error, params.threadId) &&
+                            shouldReturnEmptyTurnsForPendingRolloutThread(params.threadId)) {
+                            result = { data: [], nextCursor: null };
+                            logWarn('Treating missing rollout for newly started empty thread as empty history', {
+                                threadId: params.threadId,
+                                error: error instanceof Error ? error.message : String(error),
+                            });
+                            send(ws, { type: 'rpc/result', id: request.id, result });
+                            return;
+                        }
+                        resumedThreadIds.delete(params.threadId);
+                        resumeThreadPromises.delete(params.threadId);
+                        if (isMissingThreadError(error))
+                            clearMissingActiveThread(params.threadId, error);
+                        throw error;
+                    }
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    return;
+                }
+                if (request.method === 'webui/queue/remove') {
+                    const id = getRequiredString(request.params, 'id');
+                    if (!id) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'id is required' });
+                        return;
+                    }
+                    const includeStatus = isRecord(request.params) && request.params.includeStatus === true;
+                    let removed = false;
+                    const state = deps.stateStore.update((current) => {
+                        removed = current.queue.some((message) => message.id === id);
+                        return {
+                            ...current,
+                            queue: removed ? removeQueuedMessage(current.queue, id) : current.queue,
+                        };
+                    });
+                    send(ws, { type: 'rpc/result', id: request.id, result: includeStatus ? { queue: state.queue, removed } : state.queue });
+                    broadcastHello(state);
+                    maybeSteerQueuedMessage();
+                    return;
+                }
+                if (request.method === 'webui/queue/update') {
+                    const id = getRequiredString(request.params, 'id');
+                    const text = getRequiredString(request.params, 'text');
+                    if (!id) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'id is required' });
+                        return;
+                    }
+                    if (!text) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'text is required' });
+                        return;
+                    }
+                    const state = deps.stateStore.update((current) => ({
+                        ...current,
+                        queue: updateQueuedMessage(current.queue, id, text),
+                    }));
+                    send(ws, { type: 'rpc/result', id: request.id, result: state.queue });
+                    broadcastHello(state);
+                    return;
+                }
+                if (request.method === 'webui/turn/start') {
+                    const threadId = getRequiredString(request.params, 'threadId');
+                    const text = getRequiredString(request.params, 'text');
+                    if (!threadId) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
+                        return;
+                    }
+                    if (!text) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'text is required' });
+                        return;
+                    }
+                    const currentState = deps.stateStore.read();
+                    if (currentState.activeThreadId === threadId && currentState.activeTurnId) {
+                        send(ws, { type: 'rpc/error', id: request.id, error: 'Codex is already working; queue the message instead' });
+                        return;
+                    }
+                    const options = runOptionsFromParams(request.params);
+                    const pendingTurnId = pendingTurnStartTurnId(threadId);
+                    const pendingState = deps.stateStore.update((current) => current.activeThreadId === threadId && !current.activeTurnId
+                        ? applyRunOptionsToRuntimeState({ ...current, activeTurnId: pendingTurnId }, options)
+                        : current);
+                    if (pendingState.activeThreadId === threadId && pendingState.activeTurnId === pendingTurnId) {
+                        rememberTurnThreadPath(threadId, pendingTurnId, pendingState.activeThreadPath);
+                        rememberTurnCwd(threadId, pendingTurnId, pendingState.activeCwd);
+                        broadcastHello(pendingState);
+                    }
+                    let result;
+                    try {
+                        result = await startTurn({ threadId, text, options });
+                    }
+                    catch (error) {
+                        if (!isTurnStartTimeout(error)) {
+                            const cleared = clearActiveTurn({ threadId, turnId: pendingTurnId }, { broadcast: false });
+                            broadcastHello(cleared);
+                        }
+                        throw error;
+                    }
+                    const nextTurnId = extractTurnId(result);
+                    const alreadyCompleted = hasCompletedTurn(threadId, nextTurnId);
+                    const state = deps.stateStore.update((current) => {
+                        if (current.activeThreadId !== threadId)
+                            return current;
+                        if (alreadyCompleted && (current.activeTurnId === nextTurnId || current.activeTurnId === pendingTurnId)) {
+                            return applyRunOptionsToRuntimeState({ ...current, activeTurnId: null }, options);
+                        }
+                        if (current.activeTurnId === nextTurnId)
+                            return applyRunOptionsToRuntimeState(current, options);
+                        if (current.activeTurnId === pendingTurnId)
+                            return applyRunOptionsToRuntimeState({ ...current, activeTurnId: nextTurnId }, options);
+                        return current;
+                    });
+                    if (state.activeThreadId === threadId && state.activeTurnId === nextTurnId) {
+                        rememberTurnThreadPath(threadId, nextTurnId, state.activeThreadPath);
+                        rememberTurnCwd(threadId, nextTurnId, state.activeCwd);
+                        rememberLivePatchTurn(threadId, nextTurnId);
+                    }
+                    send(ws, { type: 'rpc/result', id: request.id, result });
+                    broadcastHello(state);
+                    if (!alreadyCompleted || !maybeStartQueuedTurnFromIdle(threadId))
+                        maybeSteerQueuedMessage();
+                    return;
+                }
+                if (request.method === 'webui/turn/interrupt') {
+                    const state = deps.stateStore.read();
+                    if (!state.activeTurnId) {
+                        throw new Error('no active turn to interrupt');
+                    }
+                    if (!state.activeThreadId) {
+                        await finalizeActiveTurnBeforeClear(null, state.activeTurnId, state.activeThreadPath);
+                        const next = clearActiveTurn({ turnId: state.activeTurnId }, { broadcast: false });
+                        send(ws, { type: 'rpc/result', id: request.id, result: { ok: false, cleared: true, error: 'active turn has no thread' } });
+                        broadcastHello(next);
+                        return;
+                    }
+                    const activeThreadId = state.activeThreadId;
+                    const activeTurnId = state.activeTurnId;
+                    const activeThreadPath = state.activeThreadPath;
+                    const health = deps.codex.health();
+                    if (!health.connected || health.dead) {
+                        await finalizeActiveTurnBeforeClear(activeThreadId, activeTurnId, activeThreadPath);
+                        const next = clearActiveTurn({ threadId: activeThreadId, turnId: activeTurnId }, { broadcast: false });
+                        send(ws, {
+                            type: 'rpc/result',
+                            id: request.id,
+                            result: { ok: false, cleared: true, error: health.error ?? 'Codex app-server is not connected' },
+                        });
+                        broadcastHello(next);
+                        return;
+                    }
+                    try {
+                        await ensureThreadResumed(activeThreadId);
+                        const result = await requestCodex('turn/interrupt', {
+                            threadId: activeThreadId,
+                            turnId: activeTurnId,
+                        });
+                        await finalizeActiveTurnBeforeClear(activeThreadId, activeTurnId, activeThreadPath);
+                        const next = clearActiveTurn({ threadId: activeThreadId, turnId: activeTurnId }, { broadcast: false });
+                        send(ws, { type: 'rpc/result', id: request.id, result });
+                        broadcastHello(next);
+                    }
+                    catch (error) {
+                        if (!shouldClearActiveTurnAfterInterruptFailure(error))
+                            throw error;
+                        await finalizeActiveTurnBeforeClear(activeThreadId, activeTurnId, activeThreadPath);
+                        const next = clearActiveTurn({ threadId: activeThreadId, turnId: activeTurnId }, { broadcast: false });
+                        send(ws, {
+                            type: 'rpc/result',
+                            id: request.id,
+                            result: { ok: false, cleared: true, error: error instanceof Error ? error.message : String(error) },
+                        });
+                        broadcastHello(next);
+                    }
+                    return;
+                }
+                send(ws, { type: 'rpc/error', id: request.id, error: `unsupported RPC method: ${request.method}` });
+            }
+            catch (err) {
+                send(ws, { type: 'rpc/error', id: request.id, error: err instanceof Error ? err.message : String(err) });
+            }
+        });
+    });
+    return { close };
+}

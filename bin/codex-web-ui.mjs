@@ -56,13 +56,11 @@ if (args.includes('--update')) {
   process.exit(code);
 }
 
-const tsxBin = path.join(packageRoot, 'node_modules', '.bin', process.platform === 'win32' ? 'tsx.cmd' : 'tsx');
-const scriptPath = path.join(packageRoot, 'scripts', 'start.ts');
-const tsconfigPath = path.join(packageRoot, 'tsconfig.server.json');
+const scriptPath = path.join(packageRoot, 'dist-server', 'scripts', 'start.js');
 const indexHtml = path.join(packageRoot, 'dist', 'index.html');
 
-if (!fs.existsSync(tsxBin)) {
-  process.stderr.write('Missing runtime dependency: tsx. Reinstall codex-web-ui before starting the server.\n');
+if (!fs.existsSync(scriptPath)) {
+  process.stderr.write('Server bundle is missing. Run `npm run build` in the codex-web-ui repo, then reinstall or relink the command.\n');
   process.exit(1);
 }
 
@@ -78,7 +76,7 @@ const env = {
   CODEX_WEB_UI_STATE_DIR: process.env.CODEX_WEB_UI_STATE_DIR || defaultStateDir(),
 };
 
-const child = spawn(tsxBin, ['--tsconfig', tsconfigPath, scriptPath, ...args], {
+const child = spawn(process.execPath, [scriptPath, ...args], {
   cwd: process.cwd(),
   env,
   stdio: 'inherit',

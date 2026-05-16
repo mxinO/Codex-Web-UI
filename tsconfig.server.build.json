@@ -1,0 +1,9 @@
+{
+  "extends": "./tsconfig.server.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist-server",
+    "rootDir": "."
+  },
+  "include": ["server/**/*.ts", "scripts/start.ts"]
+}

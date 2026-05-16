@@ -11,16 +11,27 @@ const packageJson = JSON.parse(fs.readFileSync(path.join(root, 'package.json'), 
 };
 const sourceIndexHtml = fs.readFileSync(path.join(root, 'index.html'), 'utf8');
 const readme = fs.readFileSync(path.join(root, 'README.md'), 'utf8');
+const cliLauncher = fs.readFileSync(path.join(root, 'bin', 'codex-web-ui.mjs'), 'utf8');
 
 describe('package metadata', () => {
   it('keeps browser bundle libraries out of runtime dependencies', () => {
-    expect(Object.keys(packageJson.dependencies ?? {}).sort()).toEqual(['better-sqlite3', 'cookie', 'express', 'tsx', 'ws']);
+    expect(Object.keys(packageJson.dependencies ?? {}).sort()).toEqual(['better-sqlite3', 'cookie', 'express', 'ws']);
+    expect(packageJson.dependencies?.tsx).toBeUndefined();
   });
 
-  it('ships the browser bundle without building during git install', () => {
+  it('ships prebuilt browser and server bundles without building during git install', () => {
     expect(packageJson.files).toContain('dist');
+    expect(packageJson.files).toContain('dist-server');
     expect(packageJson.scripts?.prepare).toBeUndefined();
     expect(fs.existsSync(path.join(root, 'dist', 'index.html'))).toBe(true);
+    expect(fs.existsSync(path.join(root, 'dist-server', 'scripts', 'start.js'))).toBe(true);
+  });
+
+  it('starts installed servers from precompiled JavaScript instead of tsx', () => {
+    expect(cliLauncher).toContain("dist-server', 'scripts', 'start.js");
+    expect(cliLauncher).toContain('process.execPath');
+    expect(cliLauncher).not.toContain("node_modules', '.bin'");
+    expect(cliLauncher).not.toContain('--tsconfig');
   });
 
   it('ships and references the project icon', () => {

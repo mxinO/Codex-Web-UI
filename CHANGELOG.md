@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 - 2026-05-16
+
+### Fixed
+
+- Fixed installed CLI startup on memory-limited hosts by running the prebuilt server bundle instead of loading `tsx` at runtime.
+
 ## 0.3.0 - 2026-05-13
 
 ### Added
