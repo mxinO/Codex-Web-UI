@@ -27,6 +27,10 @@ const packageRoot = resolvePackageRoot();
 const startCwd = resolveStartCwd();
 const safeHostname = config.hostname.replace(/[^A-Za-z0-9_.-]/g, '_');
 const logFilePath = path.join(config.stateDir, `${safeHostname}.log`);
+const nodeWebApiOptions = ['--no-experimental-fetch', '--no-experimental-websocket', '--no-experimental-eventsource'].filter((option) =>
+  process.allowedNodeEnvironmentFlags.has(option),
+);
+const nodeOptions = process.env.NODE_OPTIONS?.split(/\s+/).filter(Boolean) ?? [];
 configureLogger({ filePath: logFilePath });
 logInfo('Starting Codex Web UI server', {
   pid: process.pid,
@@ -36,7 +40,7 @@ logInfo('Starting Codex Web UI server', {
   stateDir: config.stateDir,
   startCwd,
   logFilePath,
-  nodeWebApis: typeof fetch === 'undefined' && typeof WebSocket === 'undefined' ? 'disabled' : 'default',
+  nodeWebApis: nodeWebApiOptions.length > 0 && nodeWebApiOptions.every((option) => nodeOptions.includes(option)) ? 'disabled' : 'default',
 });
 
 const app = express();

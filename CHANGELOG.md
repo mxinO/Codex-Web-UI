@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.6 - 2026-05-16
+
+### Fixed
+
+- Also disable Node's built-in EventSource API in low-memory startup mode and add opt-in Codex descendant process tracing for diagnosing remaining undici startup crashes.
+
 ## 0.3.5 - 2026-05-16
 
 ### Fixed

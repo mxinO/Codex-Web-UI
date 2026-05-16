@@ -17,7 +17,9 @@ const PLATFORM_PACKAGE_BY_TARGET = {
 };
 const NODE_FETCH_MEMORY_OPTION = '--no-experimental-fetch';
 const NODE_WEBSOCKET_MEMORY_OPTION = '--no-experimental-websocket';
-const NODE_WEB_API_MEMORY_OPTIONS = [NODE_FETCH_MEMORY_OPTION, NODE_WEBSOCKET_MEMORY_OPTION];
+const NODE_EVENTSOURCE_MEMORY_OPTION = '--no-experimental-eventsource';
+const NODE_WEB_API_MEMORY_OPTIONS = [NODE_FETCH_MEMORY_OPTION, NODE_WEBSOCKET_MEMORY_OPTION, NODE_EVENTSOURCE_MEMORY_OPTION];
+const ACTIVE_NODE_WEB_API_MEMORY_OPTIONS = NODE_WEB_API_MEMORY_OPTIONS.filter((option) => process.allowedNodeEnvironmentFlags.has(option));
 function truthyEnv(value) {
     return /^(1|true|yes)$/i.test(value ?? '');
 }
@@ -36,7 +38,7 @@ function appendNodeOptions(options, nextOptions) {
 function codexChildBaseEnv(env) {
     const childEnv = { ...env };
     if (!preserveNodeWebApis(childEnv)) {
-        childEnv.NODE_OPTIONS = appendNodeOptions(childEnv.NODE_OPTIONS, NODE_WEB_API_MEMORY_OPTIONS);
+        childEnv.NODE_OPTIONS = appendNodeOptions(childEnv.NODE_OPTIONS, ACTIVE_NODE_WEB_API_MEMORY_OPTIONS);
     }
     return childEnv;
 }
@@ -48,7 +50,8 @@ function createNodeWrapper(realNode, platform = process.platform) {
         return null;
     const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-webui-node-'));
     const wrapperPath = path.join(directory, platform === 'win32' ? 'node.cmd' : 'node');
-    const options = NODE_WEB_API_MEMORY_OPTIONS.join(' ');
+    const options = ACTIVE_NODE_WEB_API_MEMORY_OPTIONS.join(' ');
+    const posixAddOptions = ACTIVE_NODE_WEB_API_MEMORY_OPTIONS.map((option) => `add_node_option ${option}`).join('\n');
     const content = platform === 'win32'
         ? `@echo off\r\nset "NODE_OPTIONS=%NODE_OPTIONS% ${options}"\r\n"${realNode}" %*\r\n`
         : `#!/bin/sh
@@ -58,8 +61,7 @@ add_node_option() {
     *) NODE_OPTIONS="\${NODE_OPTIONS:+$NODE_OPTIONS }$1" ;;
   esac
 }
-add_node_option ${NODE_FETCH_MEMORY_OPTION}
-add_node_option ${NODE_WEBSOCKET_MEMORY_OPTION}
+${posixAddOptions}
 export NODE_OPTIONS
 exec ${shellQuote(realNode)} "$@"
 `;
@@ -88,6 +90,170 @@ export function prepareCodexChildRuntimeEnv(env, platform = process.platform, re
         nodeWrapperPath: wrapper.path,
         cleanup: wrapper.cleanup,
     };
+}
+function selectedTraceEnv(pid) {
+    const result = {};
+    let raw = '';
+    try {
+        raw = fs.readFileSync(`/proc/${pid}/environ`, 'utf8');
+    }
+    catch {
+        return result;
+    }
+    for (const entry of raw.split('\0')) {
+        const separator = entry.indexOf('=');
+        if (separator <= 0)
+            continue;
+        const key = entry.slice(0, separator);
+        const value = entry.slice(separator + 1);
+        if (key === 'NODE_OPTIONS')
+            result.NODE_OPTIONS = value;
+        if (key === 'PATH')
+            result.PATH_HEAD = value.split(path.delimiter).slice(0, 5);
+        if (key === 'npm_execpath')
+            result.npm_execpath = value;
+        if (key === 'npm_config_user_agent')
+            result.npm_config_user_agent = value;
+        if (key === 'CODEX_MANAGED_BY_NPM')
+            result.CODEX_MANAGED_BY_NPM = value;
+        if (key === 'CODEX_MANAGED_BY_BUN')
+            result.CODEX_MANAGED_BY_BUN = value;
+    }
+    return result;
+}
+const TRACE_SECRET_KEY_PATTERN = /(?:api[-_]?key|token|secret|password|passwd|credential|authorization|cookie)/i;
+function redactTraceArgValue(value) {
+    return value
+        .replace(/(authorization:\s*bearer\s+)[^\s"']+/gi, '$1<redacted>')
+        .replace(/(cookie:\s*)[^\s"']+/gi, '$1<redacted>')
+        .replace(/((?:api[-_]?key|token|secret|password|passwd|credential)\s*[:=]\s*)[^\s"']+/gi, '$1<redacted>')
+        .replace(/(?:sk|gh[pousr]|github_pat|xox[baprs]|nvapi)-[A-Za-z0-9_=-]{16,}/g, '<redacted>');
+}
+export function sanitizeProcessArgvForTrace(argv) {
+    const maxArgs = 64;
+    const sanitized = [];
+    let redactNext = false;
+    for (const arg of argv.slice(0, maxArgs)) {
+        if (redactNext) {
+            sanitized.push('<redacted>');
+            redactNext = false;
+            continue;
+        }
+        const separator = arg.indexOf('=');
+        if (separator > 0 && TRACE_SECRET_KEY_PATTERN.test(arg.slice(0, separator))) {
+            sanitized.push(`${arg.slice(0, separator)}=<redacted>`);
+            continue;
+        }
+        if (/^--?/.test(arg) && TRACE_SECRET_KEY_PATTERN.test(arg)) {
+            sanitized.push(arg);
+            redactNext = true;
+            continue;
+        }
+        sanitized.push(redactTraceArgValue(arg));
+    }
+    if (argv.length > maxArgs)
+        sanitized.push(`<truncated ${argv.length - maxArgs} args>`);
+    return sanitized;
+}
+function readProcSnapshot(pid) {
+    try {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+        const close = stat.lastIndexOf(')');
+        if (close < 0)
+            return null;
+        const comm = stat.slice(stat.indexOf('(') + 1, close);
+        const rest = stat.slice(close + 2).split(' ');
+        const ppid = Number(rest[1]);
+        if (!Number.isFinite(ppid))
+            return null;
+        const argv = sanitizeProcessArgvForTrace(fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean));
+        let exe = null;
+        try {
+            exe = fs.readlinkSync(`/proc/${pid}/exe`);
+        }
+        catch {
+            exe = null;
+        }
+        return { pid, ppid, comm, argv, exe };
+    }
+    catch {
+        return null;
+    }
+}
+function codexTraceDurationMs(env) {
+    const parsed = Number(env.CODEX_WEB_UI_TRACE_CODEX_PROCESSES_MS ?? 5000);
+    if (!Number.isFinite(parsed))
+        return 5000;
+    return Math.max(1000, Math.min(30000, parsed));
+}
+function startCodexProcessTrace(rootPid, env = process.env) {
+    if (!rootPid || process.platform !== 'linux' || !truthyEnv(env.CODEX_WEB_UI_TRACE_CODEX_PROCESSES))
+        return () => undefined;
+    const seen = new Set();
+    const durationMs = codexTraceDurationMs(env);
+    let stopped = false;
+    const sample = () => {
+        if (stopped)
+            return;
+        const snapshots = new Map();
+        let procEntries;
+        try {
+            procEntries = fs.readdirSync('/proc');
+        }
+        catch {
+            stop();
+            return;
+        }
+        for (const entry of procEntries) {
+            if (!/^\d+$/.test(entry))
+                continue;
+            const snapshot = readProcSnapshot(Number(entry));
+            if (snapshot)
+                snapshots.set(snapshot.pid, snapshot);
+        }
+        const descendants = new Set([rootPid]);
+        let changed = true;
+        while (changed) {
+            changed = false;
+            for (const snapshot of snapshots.values()) {
+                if (!descendants.has(snapshot.pid) && descendants.has(snapshot.ppid)) {
+                    descendants.add(snapshot.pid);
+                    changed = true;
+                }
+            }
+        }
+        for (const pid of descendants) {
+            if (seen.has(pid))
+                continue;
+            const snapshot = snapshots.get(pid);
+            if (!snapshot)
+                continue;
+            seen.add(pid);
+            logWarn('Codex process trace observed process', {
+                pid: snapshot.pid,
+                ppid: snapshot.ppid,
+                comm: snapshot.comm,
+                exe: snapshot.exe,
+                argv: snapshot.argv,
+                selectedEnv: selectedTraceEnv(snapshot.pid),
+            });
+        }
+    };
+    logWarn('Codex process tracing enabled', { rootPid, durationMs });
+    const interval = setInterval(sample, 50);
+    const timeout = setTimeout(stop, durationMs);
+    interval.unref();
+    timeout.unref();
+    sample();
+    function stop() {
+        if (stopped)
+            return;
+        stopped = true;
+        clearInterval(interval);
+        clearTimeout(timeout);
+        logWarn('Codex process tracing stopped', { rootPid, observedProcesses: seen.size });
+    }
+    return stop;
 }
 function targetTripleFor(platform = process.platform, arch = process.arch) {
     if (platform === 'linux' || platform === 'android') {
@@ -337,6 +503,7 @@ export class CodexAppServer {
             const lifecycleId = ++this.lifecycleId;
             const codexSpawn = resolveCodexSpawnConfig();
             const runtimeEnv = prepareCodexChildRuntimeEnv(codexSpawn.env);
+            const runtimeNodeOptions = runtimeEnv.env.NODE_OPTIONS?.split(/\s+/).filter(Boolean) ?? [];
             let runtimeCleaned = false;
             const cleanupRuntime = () => {
                 if (runtimeCleaned)
@@ -348,7 +515,7 @@ export class CodexAppServer {
                 cwd: this.options.cwd,
                 command: codexSpawn.command,
                 source: codexSpawn.source,
-                nodeWebApis: NODE_WEB_API_MEMORY_OPTIONS.every((option) => runtimeEnv.env.NODE_OPTIONS?.split(/\s+/).includes(option)) ? 'disabled' : 'default',
+                nodeWebApis: ACTIVE_NODE_WEB_API_MEMORY_OPTIONS.length > 0 && ACTIVE_NODE_WEB_API_MEMORY_OPTIONS.every((option) => runtimeNodeOptions.includes(option)) ? 'disabled' : 'default',
                 nodeWrapper: runtimeEnv.nodeWrapperPath ? 'enabled' : 'disabled',
             });
             let child;
@@ -366,6 +533,7 @@ export class CodexAppServer {
             }
             this.child = child;
             logInfo('Codex app-server child spawned', { pid: child.pid });
+            const cleanupProcessTrace = startCodexProcessTrace(child.pid);
             let settled = false;
             let connecting = false;
             const stdoutBuffer = new StartupOutputBuffer((line) => handleOutputLine('stdout', line));
@@ -383,6 +551,7 @@ export class CodexAppServer {
                 settled = true;
                 const current = this.isCurrentLifecycle(lifecycleId, child);
                 cleanupStartup();
+                cleanupProcessTrace();
                 logError('Codex app-server startup failed', { pid: child.pid, error });
                 if (current) {
                     this.closeSockets();
@@ -444,6 +613,7 @@ export class CodexAppServer {
             child.stderr.on('data', onStderrOutput);
             child.on('error', onError);
             child.once('exit', cleanupRuntime);
+            child.once('exit', cleanupProcessTrace);
             child.once('exit', onStartupExit);
             child.once('exit', (code, signal) => {
                 if (!this.isCurrentLifecycle(lifecycleId, child))

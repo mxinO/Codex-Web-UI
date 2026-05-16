@@ -8,7 +8,7 @@ import { runUpdate } from './update.mjs';
 
 const packageRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const args = process.argv.slice(2);
-const NODE_WEB_API_MEMORY_OPTIONS = ['--no-experimental-fetch', '--no-experimental-websocket'];
+const NODE_WEB_API_MEMORY_OPTIONS = ['--no-experimental-fetch', '--no-experimental-websocket', '--no-experimental-eventsource'];
 
 function truthyEnv(value) {
   return /^(1|true|yes)$/i.test(value ?? '');

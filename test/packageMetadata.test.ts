@@ -32,6 +32,7 @@ describe('package metadata', () => {
     expect(cliLauncher).toContain('process.execPath');
     expect(cliLauncher).toContain('--no-experimental-fetch');
     expect(cliLauncher).toContain('--no-experimental-websocket');
+    expect(cliLauncher).toContain('--no-experimental-eventsource');
     expect(cliLauncher).not.toContain("node_modules', '.bin'");
     expect(cliLauncher).not.toContain('--tsconfig');
   });
