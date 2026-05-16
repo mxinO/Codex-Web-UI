@@ -42,6 +42,26 @@ const PLATFORM_PACKAGE_BY_TARGET: Record<string, string> = {
   'x86_64-pc-windows-msvc': '@openai/codex-win32-x64',
   'aarch64-pc-windows-msvc': '@openai/codex-win32-arm64',
 };
+const NODE_FETCH_MEMORY_OPTION = '--no-experimental-fetch';
+
+function truthyEnv(value: string | undefined): boolean {
+  return /^(1|true|yes)$/i.test(value ?? '');
+}
+
+function appendNodeOption(options: string | undefined, option: string): string {
+  const trimmed = options?.trim();
+  if (!trimmed) return option;
+  const tokens = trimmed.split(/\s+/);
+  return tokens.includes(option) ? trimmed : `${trimmed} ${option}`;
+}
+
+function codexChildBaseEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const childEnv = { ...env };
+  if (!truthyEnv(childEnv.CODEX_WEB_UI_PRESERVE_NODE_FETCH)) {
+    childEnv.NODE_OPTIONS = appendNodeOption(childEnv.NODE_OPTIONS, NODE_FETCH_MEMORY_OPTION);
+  }
+  return childEnv;
+}
 
 function targetTripleFor(platform = process.platform, arch = process.arch): string | null {
   if (platform === 'linux' || platform === 'android') {
@@ -123,12 +143,13 @@ function nativeBinaryFromCodexLauncher(launcherPath: string, targetTriple: strin
 }
 
 export function resolveCodexSpawnConfig(env: NodeJS.ProcessEnv = process.env, platform = process.platform, arch = process.arch): CodexSpawnConfig {
+  const baseEnv = codexChildBaseEnv(env);
   const override = env.CODEX_WEB_UI_CODEX_BIN?.trim();
-  if (override) return { command: override, env: { ...env }, source: 'env' };
+  if (override) return { command: override, env: baseEnv, source: 'env' };
 
   const targetTriple = targetTripleFor(platform, arch);
   const platformPackage = targetTriple ? PLATFORM_PACKAGE_BY_TARGET[targetTriple] : null;
-  const launcherPath = findOnPath('codex', env, platform);
+  const launcherPath = findOnPath('codex', baseEnv, platform);
   const binaryName = platform === 'win32' ? 'codex.exe' : 'codex';
 
   if (targetTriple && platformPackage && launcherPath) {
@@ -136,21 +157,21 @@ export function resolveCodexSpawnConfig(env: NodeJS.ProcessEnv = process.env, pl
     if (binaryPath) {
       const archRoot = path.dirname(path.dirname(binaryPath));
       const pathDir = path.join(archRoot, 'path');
-      const nextPath = fs.existsSync(pathDir) ? [pathDir, ...pathEntries(env)].join(path.delimiter) : env.PATH;
-      const managerEnvVar = managedByEnvVar(launcherPath, env);
+      const nextPath = fs.existsSync(pathDir) ? [pathDir, ...pathEntries(baseEnv)].join(path.delimiter) : baseEnv.PATH;
+      const managerEnvVar = managedByEnvVar(launcherPath, baseEnv);
       return {
         command: binaryPath,
         env: {
-          ...env,
+          ...baseEnv,
           ...(nextPath ? { PATH: nextPath } : {}),
-          [managerEnvVar]: env[managerEnvVar] ?? '1',
+          [managerEnvVar]: baseEnv[managerEnvVar] ?? '1',
         },
         source: 'native-package',
       };
     }
   }
 
-  return { command: launcherPath ?? 'codex', env: { ...env }, source: 'path' };
+  return { command: launcherPath ?? 'codex', env: baseEnv, source: 'path' };
 }
 
 export class CodexAppServer {
@@ -302,7 +323,12 @@ export class CodexAppServer {
     return new Promise<CodexInitializeResponse>((resolve, reject) => {
       const lifecycleId = ++this.lifecycleId;
       const codexSpawn = resolveCodexSpawnConfig();
-      logInfo('Starting Codex app-server child', { cwd: this.options.cwd, command: codexSpawn.command, source: codexSpawn.source });
+      logInfo('Starting Codex app-server child', {
+        cwd: this.options.cwd,
+        command: codexSpawn.command,
+        source: codexSpawn.source,
+        nodeFetch: codexSpawn.env.NODE_OPTIONS?.split(/\s+/).includes(NODE_FETCH_MEMORY_OPTION) ? 'disabled' : 'default',
+      });
       const child = spawn(codexSpawn.command, ['app-server', '--listen', 'ws://127.0.0.1:0'], {
         cwd: this.options.cwd,
         env: codexSpawn.env,

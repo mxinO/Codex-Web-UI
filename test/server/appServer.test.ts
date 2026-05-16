@@ -13,6 +13,10 @@ function tempRoot(): string {
   return dir;
 }
 
+function nodeOptions(env: NodeJS.ProcessEnv): string[] {
+  return env.NODE_OPTIONS?.split(/\s+/).filter(Boolean) ?? [];
+}
+
 describe('CodexAppServer lifecycle', () => {
   afterEach(() => {
     for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
@@ -43,6 +47,7 @@ describe('CodexAppServer lifecycle', () => {
     expect(resolved.command).toBe(join(nativeDir, 'codex'));
     expect(resolved.env.PATH?.split(':')[0]).toBe(helperPathDir);
     expect(resolved.env.CODEX_MANAGED_BY_NPM).toBe('1');
+    expect(nodeOptions(resolved.env)).toContain('--no-experimental-fetch');
   });
 
   it('resolves native Codex binaries from the launcher local vendor layout', () => {
@@ -66,6 +71,7 @@ describe('CodexAppServer lifecycle', () => {
     expect(resolved.command).toBe(join(nativeDir, 'codex'));
     expect(resolved.env.CODEX_MANAGED_BY_BUN).toBe('1');
     expect(resolved.env.CODEX_MANAGED_BY_NPM).toBeUndefined();
+    expect(nodeOptions(resolved.env)).toContain('--no-experimental-fetch');
   });
 
   it('falls back to the codex launcher when a native package cannot be resolved', () => {
@@ -78,6 +84,7 @@ describe('CodexAppServer lifecycle', () => {
     const resolved = resolveCodexSpawnConfig({ PATH: binDir }, 'linux', 'x64');
 
     expect(resolved).toMatchObject({ command: join(binDir, 'codex'), source: 'path' });
+    expect(nodeOptions(resolved.env)).toContain('--no-experimental-fetch');
   });
 
   it('falls back to the codex launcher on unsupported native platforms', () => {
@@ -90,13 +97,45 @@ describe('CodexAppServer lifecycle', () => {
     const resolved = resolveCodexSpawnConfig({ PATH: binDir }, 'linux', 'ppc64');
 
     expect(resolved).toMatchObject({ command: join(binDir, 'codex'), source: 'path' });
+    expect(nodeOptions(resolved.env)).toContain('--no-experimental-fetch');
   });
 
   it('allows an explicit Codex binary override', () => {
-    expect(resolveCodexSpawnConfig({ CODEX_WEB_UI_CODEX_BIN: '/opt/codex-native', PATH: '' }, 'linux', 'x64')).toMatchObject({
+    const resolved = resolveCodexSpawnConfig({ CODEX_WEB_UI_CODEX_BIN: '/opt/codex-native', PATH: '' }, 'linux', 'x64');
+
+    expect(resolved).toMatchObject({
       command: '/opt/codex-native',
       source: 'env',
     });
+    expect(nodeOptions(resolved.env)).toContain('--no-experimental-fetch');
+  });
+
+  it('preserves existing child NODE_OPTIONS while disabling Node global fetch by default', () => {
+    const resolved = resolveCodexSpawnConfig({ CODEX_WEB_UI_CODEX_BIN: '/opt/codex-native', NODE_OPTIONS: '--max-old-space-size=256' }, 'linux', 'x64');
+
+    expect(nodeOptions(resolved.env)).toEqual(['--max-old-space-size=256', '--no-experimental-fetch']);
+  });
+
+  it('does not duplicate the child Node fetch option', () => {
+    const resolved = resolveCodexSpawnConfig({ CODEX_WEB_UI_CODEX_BIN: '/opt/codex-native', NODE_OPTIONS: '--no-experimental-fetch' }, 'linux', 'x64');
+
+    expect(nodeOptions(resolved.env)).toEqual(['--no-experimental-fetch']);
+  });
+
+  it('allows preserving Node global fetch for Codex child processes', () => {
+    const resolved = resolveCodexSpawnConfig({ CODEX_WEB_UI_CODEX_BIN: '/opt/codex-native', CODEX_WEB_UI_PRESERVE_NODE_FETCH: '1' }, 'linux', 'x64');
+
+    expect(resolved.env.NODE_OPTIONS).toBeUndefined();
+  });
+
+  it('does not mutate existing child NODE_OPTIONS when preserving Node global fetch', () => {
+    const resolved = resolveCodexSpawnConfig(
+      { CODEX_WEB_UI_CODEX_BIN: '/opt/codex-native', CODEX_WEB_UI_PRESERVE_NODE_FETCH: '1', NODE_OPTIONS: '--max-old-space-size=256' },
+      'linux',
+      'x64',
+    );
+
+    expect(nodeOptions(resolved.env)).toEqual(['--max-old-space-size=256']);
   });
 
   it('does not report connected until initialize has completed', () => {

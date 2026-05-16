@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.3 - 2026-05-16
+
+### Fixed
+
+- Reduced Codex child startup memory pressure on constrained hosts by disabling Node global fetch in the app-server child environment by default.
+
 ## 0.3.2 - 2026-05-16
 
 ### Fixed

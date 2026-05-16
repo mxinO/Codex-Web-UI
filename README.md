@@ -60,3 +60,4 @@ When changing frontend code, run `npm run build` before committing so the instal
 - Browser disconnects do not stop Codex work while the Node server remains running.
 - Runtime state is namespaced by hostname for shared filesystems.
 - `!` bash command output is browser-ephemeral and is not persisted by the server.
+- Codex child processes inherit `NODE_OPTIONS=--no-experimental-fetch` by default to avoid Node undici WebAssembly allocation failures on memory-limited login nodes. Set `CODEX_WEB_UI_PRESERVE_NODE_FETCH=1` before starting the server if your Codex-launched Node commands require global `fetch`.
