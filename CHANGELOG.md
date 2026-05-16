@@ -2,54 +2,6 @@
 
 ## 0.3.8 - 2026-05-16
 
-### Fixed
-
-- Fixed Web UI startup on memory-limited Node 22 hosts where Node's internal undici WebAssembly allocation can reject during Codex app-server startup before the browser server begins listening.
-
-## 0.3.7 - 2026-05-16
-
-### Fixed
-
-- Improved opt-in Codex startup tracing to catch short-lived or same-PID Node helper changes, trace node-wrapper invocations, and allow `CODEX_WEB_UI_CODEX_LAUNCH_MODE=path` for comparing the native package binary against the Codex launcher.
-
-## 0.3.6 - 2026-05-16
-
-### Fixed
-
-- Also disable Node's built-in EventSource API in low-memory startup mode and add opt-in Codex descendant process tracing for diagnosing remaining undici startup crashes.
-
-## 0.3.5 - 2026-05-16
-
-### Fixed
-
-- Disabled Node's built-in fetch and WebSocket APIs for the installed Web UI server process itself, not only for the Codex app-server child.
-
-## 0.3.4 - 2026-05-16
-
-### Fixed
-
-- Further reduced Node undici startup memory pressure under Codex by also disabling Node's global WebSocket and prepending a lightweight `node` wrapper for Codex-launched Node helpers.
-
-## 0.3.3 - 2026-05-16
-
-### Fixed
-
-- Reduced Codex child startup memory pressure on constrained hosts by disabling Node global fetch in the app-server child environment by default.
-
-## 0.3.2 - 2026-05-16
-
-### Fixed
-
-- Fixed another memory-limited startup path by resolving and spawning the native Codex binary directly instead of the Node-based `codex` launcher.
-
-## 0.3.1 - 2026-05-16
-
-### Fixed
-
-- Fixed installed CLI startup on memory-limited hosts by running the prebuilt server bundle instead of loading `tsx` at runtime.
-
-## 0.3.0 - 2026-05-13
-
 ### Added
 
 - Added streaming HTTP file reads for the file viewer to avoid loading full files through JSON-RPC/base64 payloads.
@@ -60,11 +12,15 @@
 
 - Bounded rendered chat history and restored old-message collapse when returning to the latest messages, reducing browser load on long sessions.
 - Improved file viewer and transfer path handling, including language detection and safer streamed downloads/previews.
+- Improved low-memory startup behavior by running the prebuilt server bundle, spawning the native Codex binary directly when available, and reducing Node web API memory pressure for Codex-launched helpers.
+- Improved opt-in Codex startup diagnostics with descendant process tracing, node-wrapper tracing, and `CODEX_WEB_UI_CODEX_LAUNCH_MODE=path` for launcher comparison.
 
 ### Fixed
 
+- Fixed installed CLI startup on memory-limited hosts.
 - Fixed duplicate or stale assistant streaming snapshots reappearing after turns finalize.
 - Fixed initial history loading, refresh, and reconnect behavior for restarted servers and newly created Codex sessions whose rollout file is not materialized yet.
 - Fixed auth token handling so reconnects do not spuriously expire the active token.
 - Fixed queue rendering so queued prompts do not disappear or get appended again when a turn finishes.
 - Fixed history scroll cycling after loading older messages and scrolling back to the bottom.
+- Fixed Web UI startup on memory-limited Node 22 hosts where Node's internal undici WebAssembly allocation can reject during Codex app-server startup before the browser server begins listening.
