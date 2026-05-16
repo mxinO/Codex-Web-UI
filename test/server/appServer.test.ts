@@ -1,8 +1,104 @@
 import { EventEmitter } from 'node:events';
-import { describe, expect, it, vi } from 'vitest';
-import { CodexAppServer } from '../../server/appServer.js';
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { CodexAppServer, resolveCodexSpawnConfig } from '../../server/appServer.js';
+
+const tempDirs: string[] = [];
+
+function tempRoot(): string {
+  const dir = mkdtempSync(join(tmpdir(), 'codex-webui-app-server-'));
+  tempDirs.push(dir);
+  return dir;
+}
 
 describe('CodexAppServer lifecycle', () => {
+  afterEach(() => {
+    for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('resolves the native Codex binary from the npm launcher to avoid the Node wrapper at runtime', () => {
+    const root = tempRoot();
+    const packageRoot = join(root, 'lib', 'node_modules', '@openai', 'codex');
+    const launcherDir = join(packageRoot, 'bin');
+    const binDir = join(root, 'bin');
+    const platformPackageRoot = join(packageRoot, 'node_modules', '@openai', 'codex-linux-x64');
+    const nativeDir = join(platformPackageRoot, 'vendor', 'x86_64-unknown-linux-musl', 'codex');
+    const helperPathDir = join(platformPackageRoot, 'vendor', 'x86_64-unknown-linux-musl', 'path');
+    mkdirSync(launcherDir, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(nativeDir, { recursive: true });
+    mkdirSync(helperPathDir, { recursive: true });
+    writeFileSync(join(launcherDir, 'codex.js'), '#!/usr/bin/env node\n');
+    chmodSync(join(launcherDir, 'codex.js'), 0o755);
+    writeFileSync(join(platformPackageRoot, 'package.json'), '{"name":"@openai/codex-linux-x64"}\n');
+    writeFileSync(join(nativeDir, 'codex'), '#!/bin/sh\n');
+    chmodSync(join(nativeDir, 'codex'), 0o755);
+    symlinkSync(join('..', 'lib', 'node_modules', '@openai', 'codex', 'bin', 'codex.js'), join(binDir, 'codex'));
+
+    const resolved = resolveCodexSpawnConfig({ PATH: binDir }, 'linux', 'x64');
+
+    expect(resolved.source).toBe('native-package');
+    expect(resolved.command).toBe(join(nativeDir, 'codex'));
+    expect(resolved.env.PATH?.split(':')[0]).toBe(helperPathDir);
+    expect(resolved.env.CODEX_MANAGED_BY_NPM).toBe('1');
+  });
+
+  it('resolves native Codex binaries from the launcher local vendor layout', () => {
+    const root = tempRoot();
+    const packageRoot = join(root, 'lib', 'node_modules', '@openai', 'codex');
+    const launcherDir = join(packageRoot, 'bin');
+    const binDir = join(root, 'bin');
+    const nativeDir = join(packageRoot, 'vendor', 'x86_64-unknown-linux-musl', 'codex');
+    mkdirSync(launcherDir, { recursive: true });
+    mkdirSync(binDir, { recursive: true });
+    mkdirSync(nativeDir, { recursive: true });
+    writeFileSync(join(launcherDir, 'codex.js'), '#!/usr/bin/env node\n');
+    chmodSync(join(launcherDir, 'codex.js'), 0o755);
+    writeFileSync(join(nativeDir, 'codex'), '#!/bin/sh\n');
+    chmodSync(join(nativeDir, 'codex'), 0o755);
+    symlinkSync(join('..', 'lib', 'node_modules', '@openai', 'codex', 'bin', 'codex.js'), join(binDir, 'codex'));
+
+    const resolved = resolveCodexSpawnConfig({ PATH: binDir, npm_config_user_agent: 'bun/1.2.0' }, 'linux', 'x64');
+
+    expect(resolved.source).toBe('native-package');
+    expect(resolved.command).toBe(join(nativeDir, 'codex'));
+    expect(resolved.env.CODEX_MANAGED_BY_BUN).toBe('1');
+    expect(resolved.env.CODEX_MANAGED_BY_NPM).toBeUndefined();
+  });
+
+  it('falls back to the codex launcher when a native package cannot be resolved', () => {
+    const root = tempRoot();
+    const binDir = join(root, 'bin');
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(join(binDir, 'codex'), '#!/usr/bin/env node\n');
+    chmodSync(join(binDir, 'codex'), 0o755);
+
+    const resolved = resolveCodexSpawnConfig({ PATH: binDir }, 'linux', 'x64');
+
+    expect(resolved).toMatchObject({ command: join(binDir, 'codex'), source: 'path' });
+  });
+
+  it('falls back to the codex launcher on unsupported native platforms', () => {
+    const root = tempRoot();
+    const binDir = join(root, 'bin');
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(join(binDir, 'codex'), '#!/usr/bin/env node\n');
+    chmodSync(join(binDir, 'codex'), 0o755);
+
+    const resolved = resolveCodexSpawnConfig({ PATH: binDir }, 'linux', 'ppc64');
+
+    expect(resolved).toMatchObject({ command: join(binDir, 'codex'), source: 'path' });
+  });
+
+  it('allows an explicit Codex binary override', () => {
+    expect(resolveCodexSpawnConfig({ CODEX_WEB_UI_CODEX_BIN: '/opt/codex-native', PATH: '' }, 'linux', 'x64')).toMatchObject({
+      command: '/opt/codex-native',
+      source: 'env',
+    });
+  });
+
   it('does not report connected until initialize has completed', () => {
     const server = new CodexAppServer({ cwd: process.cwd(), mock: false });
     const socket = { readyState: 1 };

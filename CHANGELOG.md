@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.2 - 2026-05-16
+
+### Fixed
+
+- Fixed another memory-limited startup path by resolving and spawning the native Codex binary directly instead of the Node-based `codex` launcher.
+
 ## 0.3.1 - 2026-05-16
 
 ### Fixed

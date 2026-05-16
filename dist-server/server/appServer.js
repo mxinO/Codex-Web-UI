@@ -1,7 +1,130 @@
 import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import { createRequire } from 'node:module';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import WebSocket from 'ws';
 import { JsonRpcPeer, } from './jsonRpc.js';
 import { logError, logInfo, logWarn } from './logger.js';
+const PLATFORM_PACKAGE_BY_TARGET = {
+    'x86_64-unknown-linux-musl': '@openai/codex-linux-x64',
+    'aarch64-unknown-linux-musl': '@openai/codex-linux-arm64',
+    'x86_64-apple-darwin': '@openai/codex-darwin-x64',
+    'aarch64-apple-darwin': '@openai/codex-darwin-arm64',
+    'x86_64-pc-windows-msvc': '@openai/codex-win32-x64',
+    'aarch64-pc-windows-msvc': '@openai/codex-win32-arm64',
+};
+function targetTripleFor(platform = process.platform, arch = process.arch) {
+    if (platform === 'linux' || platform === 'android') {
+        if (arch === 'x64')
+            return 'x86_64-unknown-linux-musl';
+        if (arch === 'arm64')
+            return 'aarch64-unknown-linux-musl';
+    }
+    if (platform === 'darwin') {
+        if (arch === 'x64')
+            return 'x86_64-apple-darwin';
+        if (arch === 'arm64')
+            return 'aarch64-apple-darwin';
+    }
+    if (platform === 'win32') {
+        if (arch === 'x64')
+            return 'x86_64-pc-windows-msvc';
+        if (arch === 'arm64')
+            return 'aarch64-pc-windows-msvc';
+    }
+    return null;
+}
+function pathEntries(env) {
+    return (env.PATH ?? '').split(path.delimiter).filter(Boolean);
+}
+function isExecutableFile(filePath) {
+    try {
+        fs.accessSync(filePath, fs.constants.X_OK);
+        return fs.statSync(filePath).isFile();
+    }
+    catch {
+        return false;
+    }
+}
+function findOnPath(command, env, platform = process.platform) {
+    if (path.isAbsolute(command) || command.includes(path.sep)) {
+        return isExecutableFile(command) ? command : null;
+    }
+    const extensions = platform === 'win32' ? ['', '.cmd', '.exe', '.bat'] : [''];
+    for (const dir of pathEntries(env)) {
+        for (const extension of extensions) {
+            const candidate = path.join(dir, `${command}${extension}`);
+            if (isExecutableFile(candidate))
+                return candidate;
+        }
+    }
+    return null;
+}
+function safeRealPath(filePath) {
+    try {
+        return fs.realpathSync.native(filePath);
+    }
+    catch {
+        return null;
+    }
+}
+function managedByEnvVar(launcherPath, env) {
+    if (/\bbun\//.test(env.npm_config_user_agent ?? ''))
+        return 'CODEX_MANAGED_BY_BUN';
+    if ((env.npm_execpath ?? '').includes('bun'))
+        return 'CODEX_MANAGED_BY_BUN';
+    if (launcherPath.includes('.bun/install/global') || launcherPath.includes('.bun\\install\\global'))
+        return 'CODEX_MANAGED_BY_BUN';
+    return 'CODEX_MANAGED_BY_NPM';
+}
+function nativeBinaryFromCodexLauncher(launcherPath, targetTriple, platformPackage, binaryName) {
+    const candidates = Array.from(new Set([launcherPath, safeRealPath(launcherPath)].filter((candidate) => Boolean(candidate))));
+    for (const candidate of candidates) {
+        try {
+            const requireFromLauncher = createRequire(pathToFileURL(candidate));
+            const packageJsonPath = requireFromLauncher.resolve(`${platformPackage}/package.json`);
+            const binaryPath = path.join(path.dirname(packageJsonPath), 'vendor', targetTriple, 'codex', binaryName);
+            if (isExecutableFile(binaryPath))
+                return binaryPath;
+        }
+        catch {
+            // Fall through to local vendor layout below.
+        }
+        const localBinaryPath = path.join(path.dirname(candidate), '..', 'vendor', targetTriple, 'codex', binaryName);
+        if (isExecutableFile(localBinaryPath))
+            return localBinaryPath;
+    }
+    return null;
+}
+export function resolveCodexSpawnConfig(env = process.env, platform = process.platform, arch = process.arch) {
+    const override = env.CODEX_WEB_UI_CODEX_BIN?.trim();
+    if (override)
+        return { command: override, env: { ...env }, source: 'env' };
+    const targetTriple = targetTripleFor(platform, arch);
+    const platformPackage = targetTriple ? PLATFORM_PACKAGE_BY_TARGET[targetTriple] : null;
+    const launcherPath = findOnPath('codex', env, platform);
+    const binaryName = platform === 'win32' ? 'codex.exe' : 'codex';
+    if (targetTriple && platformPackage && launcherPath) {
+        const binaryPath = nativeBinaryFromCodexLauncher(launcherPath, targetTriple, platformPackage, binaryName);
+        if (binaryPath) {
+            const archRoot = path.dirname(path.dirname(binaryPath));
+            const pathDir = path.join(archRoot, 'path');
+            const nextPath = fs.existsSync(pathDir) ? [pathDir, ...pathEntries(env)].join(path.delimiter) : env.PATH;
+            const managerEnvVar = managedByEnvVar(launcherPath, env);
+            return {
+                command: binaryPath,
+                env: {
+                    ...env,
+                    ...(nextPath ? { PATH: nextPath } : {}),
+                    [managerEnvVar]: env[managerEnvVar] ?? '1',
+                },
+                source: 'native-package',
+            };
+        }
+    }
+    return { command: launcherPath ?? 'codex', env: { ...env }, source: 'path' };
+}
 export class CodexAppServer {
     options;
     child = null;
@@ -136,9 +259,11 @@ export class CodexAppServer {
     startReal() {
         return new Promise((resolve, reject) => {
             const lifecycleId = ++this.lifecycleId;
-            logInfo('Starting Codex app-server child', { cwd: this.options.cwd });
-            const child = spawn('codex', ['app-server', '--listen', 'ws://127.0.0.1:0'], {
+            const codexSpawn = resolveCodexSpawnConfig();
+            logInfo('Starting Codex app-server child', { cwd: this.options.cwd, command: codexSpawn.command, source: codexSpawn.source });
+            const child = spawn(codexSpawn.command, ['app-server', '--listen', 'ws://127.0.0.1:0'], {
                 cwd: this.options.cwd,
+                env: codexSpawn.env,
                 stdio: ['ignore', 'pipe', 'pipe'],
             });
             this.child = child;
