@@ -4,7 +4,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { useThreadTimeline } from '../../src/hooks/useThreadTimeline';
-import type { CodexTurn } from '../../src/types/codex';
+import type { CodexItem, CodexTurn } from '../../src/types/codex';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -45,6 +45,18 @@ function makeTurn(id: string, text = id): CodexTurn {
 
 function makeTurns(prefix: string, count: number): CodexTurn[] {
   return Array.from({ length: count }, (_, index) => makeTurn(`${prefix}-${index}`, `${prefix}-${index}`));
+}
+
+function makeIdlessCommand(command: string, options: { status?: string; output?: string } = {}): CodexItem {
+  return {
+    type: 'commandExecution',
+    command,
+    cwd: '/repo',
+    status: options.status ?? 'completed',
+    aggregatedOutput: options.output ?? `${command}\n`,
+    exitCode: 0,
+    durationMs: 1,
+  } as CodexItem;
 }
 
 function asRpc(mock: unknown): TimelineRpc {
@@ -486,6 +498,484 @@ describe('useThreadTimeline', () => {
     });
 
     expect(currentTimeline?.items.map(itemText)).toEqual(['Done with tests.']);
+  });
+
+  it('reload lets finalized history reorder a stale same-turn assistant around later activity', async () => {
+    const partial = deferred<RpcResult>();
+    const completed = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(partial.promise).mockReturnValueOnce(completed.promise);
+    const partialTurn: CodexTurn = {
+      id: 'turn-1',
+      status: 'inProgress',
+      startedAt: 1,
+      completedAt: null,
+      items: [
+        { type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'question' }] },
+        { type: 'agentMessage', id: 'a1', text: 'final answer', phase: 'final_answer' },
+      ],
+    };
+    const completedTurn: CodexTurn = {
+      id: 'turn-1',
+      status: 'completed',
+      startedAt: 1,
+      completedAt: 2,
+      items: [
+        { type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'question' }] },
+        { type: 'commandExecution', id: 'cmd-1', command: 'pwd', cwd: '/repo', status: 'completed', aggregatedOutput: '/repo\n', exitCode: 0, durationMs: 1 },
+        { type: 'agentMessage', id: 'a1', text: 'final answer', phase: 'final_answer' },
+      ],
+    };
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      partial.resolve({ data: [partialTurn], nextCursor: null });
+      await partial.promise;
+    });
+    expect(currentTimeline?.items.map((item) => (item.kind === 'command' ? item.command : itemText(item)))).toEqual(['question', 'final answer']);
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      completed.resolve({ data: [completedTurn], nextCursor: null });
+      await completed.promise;
+    });
+
+    expect(currentTimeline?.items.map((item) => (item.kind === 'command' ? item.command : itemText(item)))).toEqual([
+      'question',
+      'pwd',
+      'final answer',
+    ]);
+  });
+
+  it('reload preserves current-only activity positions when a terminal page is sparse', async () => {
+    const complete = deferred<RpcResult>();
+    const sparse = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(complete.promise).mockReturnValueOnce(sparse.promise);
+    const completeTurn: CodexTurn = {
+      id: 'turn-1',
+      status: 'completed',
+      startedAt: 1,
+      completedAt: 2,
+      items: [
+        { type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'question' }] },
+        { type: 'commandExecution', id: 'cmd-1', command: 'pwd', cwd: '/repo', status: 'completed', aggregatedOutput: '/repo\n', exitCode: 0, durationMs: 1 },
+        { type: 'agentMessage', id: 'a1', text: 'final answer', phase: 'final_answer' },
+      ],
+    };
+    const sparseTurn: CodexTurn = {
+      ...completeTurn,
+      items: [
+        { type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'question' }] },
+        { type: 'agentMessage', id: 'a1', text: 'final answer', phase: 'final_answer' },
+      ],
+    };
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      complete.resolve({ data: [completeTurn], nextCursor: null });
+      await complete.promise;
+    });
+    expect(currentTimeline?.items.map((item) => (item.kind === 'command' ? item.command : itemText(item)))).toEqual([
+      'question',
+      'pwd',
+      'final answer',
+    ]);
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      sparse.resolve({ data: [sparseTurn], nextCursor: null });
+      await sparse.promise;
+    });
+
+    expect(currentTimeline?.items.map((item) => (item.kind === 'command' ? item.command : itemText(item)))).toEqual([
+      'question',
+      'pwd',
+      'final answer',
+    ]);
+  });
+
+  it('reload preserves activity before a sparse terminal page expands the following assistant', async () => {
+    const partial = deferred<RpcResult>();
+    const completed = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(partial.promise).mockReturnValueOnce(completed.promise);
+    const partialTurn: CodexTurn = {
+      id: 'turn-1',
+      status: 'inProgress',
+      startedAt: 1,
+      completedAt: null,
+      items: [
+        { type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'question' }] },
+        { type: 'commandExecution', id: 'cmd-1', command: 'pwd', cwd: '/repo', status: 'completed', aggregatedOutput: '/repo\n', exitCode: 0, durationMs: 1 },
+        { type: 'agentMessage', id: 'transport-partial', text: 'Done', phase: 'final_answer' },
+      ],
+    };
+    const completedTurn: CodexTurn = {
+      ...partialTurn,
+      status: 'completed',
+      completedAt: 2,
+      items: [
+        { type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'question' }] },
+        { type: 'agentMessage', id: 'persisted-final', text: 'Done with tests.', phase: 'final_answer' },
+      ],
+    };
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      partial.resolve({ data: [partialTurn], nextCursor: null });
+      await partial.promise;
+    });
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      completed.resolve({ data: [completedTurn], nextCursor: null });
+      await completed.promise;
+    });
+
+    expect(currentTimeline?.items.map((item) => (item.kind === 'command' ? item.command : itemText(item)))).toEqual([
+      'question',
+      'pwd',
+      'Done with tests.',
+    ]);
+  });
+
+  it('reload preserves duplicate-id current-only items when a terminal page is sparse', async () => {
+    const complete = deferred<RpcResult>();
+    const sparse = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(complete.promise).mockReturnValueOnce(sparse.promise);
+    const completeTurn: CodexTurn = {
+      id: 'turn-1',
+      status: 'completed',
+      startedAt: 1,
+      completedAt: 2,
+      items: [
+        { type: 'agentMessage', id: 'a1', text: 'first copy', phase: 'final_answer' },
+        { type: 'agentMessage', id: 'a1', text: 'second copy', phase: 'final_answer' },
+        { type: 'commandExecution', id: 'cmd-1', command: 'pwd', cwd: '/repo', status: 'completed', aggregatedOutput: '/repo\n', exitCode: 0, durationMs: 1 },
+      ],
+    };
+    const sparseTurn: CodexTurn = {
+      ...completeTurn,
+      items: [
+        { type: 'agentMessage', id: 'a1', text: 'second copy', phase: 'final_answer' },
+        { type: 'commandExecution', id: 'cmd-1', command: 'pwd', cwd: '/repo', status: 'completed', aggregatedOutput: '/repo\n', exitCode: 0, durationMs: 1 },
+      ],
+    };
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      complete.resolve({ data: [completeTurn], nextCursor: null });
+      await complete.promise;
+    });
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      sparse.resolve({ data: [sparseTurn], nextCursor: null });
+      await sparse.promise;
+    });
+
+    expect(currentTimeline?.items.map((item) => (item.kind === 'command' ? item.command : itemText(item)))).toEqual([
+      'first copy',
+      'second copy',
+      'pwd',
+    ]);
+  });
+
+  it('reload matches duplicate-id final assistants across equivalent final phases', async () => {
+    const complete = deferred<RpcResult>();
+    const refreshed = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(complete.promise).mockReturnValueOnce(refreshed.promise);
+    const completeTurn: CodexTurn = {
+      id: 'turn-1',
+      status: 'completed',
+      startedAt: 1,
+      completedAt: 2,
+      items: [
+        { type: 'agentMessage', id: 'a1', text: 'same final', phase: null },
+        { type: 'agentMessage', id: 'a1', text: 'other final', phase: 'final_answer' },
+      ],
+    };
+    const refreshedTurn: CodexTurn = {
+      ...completeTurn,
+      items: [
+        { type: 'agentMessage', id: 'a1', text: 'same final', phase: 'final_answer' },
+        { type: 'agentMessage', id: 'a1', text: 'other final', phase: null },
+      ],
+    };
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      complete.resolve({ data: [completeTurn], nextCursor: null });
+      await complete.promise;
+    });
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      refreshed.resolve({ data: [refreshedTurn], nextCursor: null });
+      await refreshed.promise;
+    });
+
+    expect(currentTimeline?.items.map(itemText)).toEqual(['same final', 'other final']);
+  });
+
+  it('reload removes duplicate-id stale assistant prefixes when terminal history expands them', async () => {
+    const partial = deferred<RpcResult>();
+    const completed = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(partial.promise).mockReturnValueOnce(completed.promise);
+    const partialTurn: CodexTurn = {
+      id: 'turn-1',
+      status: 'inProgress',
+      startedAt: 1,
+      completedAt: null,
+      items: [
+        { type: 'agentMessage', id: 'a1', text: 'Done', phase: 'final_answer' },
+        { type: 'agentMessage', id: 'a1', text: 'Other final', phase: 'final_answer' },
+      ],
+    };
+    const completedTurn: CodexTurn = {
+      ...partialTurn,
+      status: 'completed',
+      completedAt: 2,
+      items: [
+        { type: 'agentMessage', id: 'a1', text: 'Done with tests.', phase: 'final_answer' },
+        { type: 'agentMessage', id: 'a1', text: 'Other final', phase: 'final_answer' },
+      ],
+    };
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      partial.resolve({ data: [partialTurn], nextCursor: null });
+      await partial.promise;
+    });
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      completed.resolve({ data: [completedTurn], nextCursor: null });
+      await completed.promise;
+    });
+
+    expect(currentTimeline?.items.map(itemText)).toEqual(['Done with tests.', 'Other final']);
+  });
+
+  it('reload replaces a stale idless command when terminal history finalizes its output', async () => {
+    const partial = deferred<RpcResult>();
+    const completed = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(partial.promise).mockReturnValueOnce(completed.promise);
+    const partialTurn: CodexTurn = {
+      id: 'turn-1',
+      status: 'inProgress',
+      startedAt: 1,
+      completedAt: null,
+      items: [makeIdlessCommand('pwd', { status: 'inProgress', output: '/r' })],
+    };
+    const completedTurn: CodexTurn = {
+      ...partialTurn,
+      status: 'completed',
+      completedAt: 2,
+      items: [makeIdlessCommand('pwd', { status: 'completed', output: '/repo\n' })],
+    };
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      partial.resolve({ data: [partialTurn], nextCursor: null });
+      await partial.promise;
+    });
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      completed.resolve({ data: [completedTurn], nextCursor: null });
+      await completed.promise;
+    });
+
+    const commands = currentTimeline?.items.filter((item) => item.kind === 'command') ?? [];
+    expect(commands.map((item) => item.output)).toEqual(['/repo\n']);
+  });
+
+  it('reload matches the later repeated idless command when a sparse terminal page keeps it', async () => {
+    const complete = deferred<RpcResult>();
+    const sparse = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(complete.promise).mockReturnValueOnce(sparse.promise);
+    const completeTurn: CodexTurn = {
+      id: 'turn-1',
+      status: 'completed',
+      startedAt: 1,
+      completedAt: 2,
+      items: [
+        makeIdlessCommand('pwd', { output: 'first\n' }),
+        { type: 'agentMessage', id: 'a1', text: 'middle', phase: 'commentary' },
+        makeIdlessCommand('pwd', { status: 'inProgress', output: 'sec' }),
+      ],
+    };
+    const sparseTurn: CodexTurn = {
+      ...completeTurn,
+      items: [
+        { type: 'agentMessage', id: 'a1', text: 'middle', phase: 'commentary' },
+        makeIdlessCommand('pwd', { output: 'second\n' }),
+      ],
+    };
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      complete.resolve({ data: [completeTurn], nextCursor: null });
+      await complete.promise;
+    });
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      sparse.resolve({ data: [sparseTurn], nextCursor: null });
+      await sparse.promise;
+    });
+
+    const commands = currentTimeline?.items.filter((item) => item.kind === 'command') ?? [];
+    expect(commands.map((item) => item.output)).toEqual(['first\n', 'second\n']);
+    expect(currentTimeline?.items.map((item) => (item.kind === 'command' ? item.output : itemText(item)))).toEqual([
+      'first\n',
+      'middle',
+      'second\n',
+    ]);
+  });
+
+  it('reload anchors idless current-only items by content when a terminal page is sparse', async () => {
+    const complete = deferred<RpcResult>();
+    const sparse = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(complete.promise).mockReturnValueOnce(sparse.promise);
+    const completeTurn: CodexTurn = {
+      id: 'turn-1',
+      status: 'completed',
+      startedAt: 1,
+      completedAt: 2,
+      items: [makeIdlessCommand('pwd'), makeIdlessCommand('git status'), makeIdlessCommand('npm test')],
+    };
+    const sparseTurn: CodexTurn = {
+      ...completeTurn,
+      items: [makeIdlessCommand('pwd'), makeIdlessCommand('git diff'), makeIdlessCommand('git status')],
+    };
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      complete.resolve({ data: [completeTurn], nextCursor: null });
+      await complete.promise;
+    });
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      sparse.resolve({ data: [sparseTurn], nextCursor: null });
+      await sparse.promise;
+    });
+
+    expect(currentTimeline?.items.map((item) => (item.kind === 'command' ? item.command : itemText(item)))).toEqual([
+      'pwd',
+      'git diff',
+      'git status',
+      'npm test',
+    ]);
+  });
+
+  it('reload keeps current-only activity after the previous exact match when covered assistants reorder before it', async () => {
+    const partial = deferred<RpcResult>();
+    const completed = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(partial.promise).mockReturnValueOnce(completed.promise);
+    const partialTurn: CodexTurn = {
+      id: 'turn-1',
+      status: 'inProgress',
+      startedAt: 1,
+      completedAt: null,
+      items: [
+        { type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'question' }] },
+        { type: 'commandExecution', id: 'cmd-1', command: 'npm test', cwd: '/repo', status: 'completed', aggregatedOutput: 'ok\n', exitCode: 0, durationMs: 1 },
+        makeIdlessCommand('git status'),
+        { type: 'agentMessage', id: 'transport-partial', text: 'Done', phase: 'final_answer' },
+      ],
+    };
+    const completedTurn: CodexTurn = {
+      ...partialTurn,
+      status: 'completed',
+      completedAt: 2,
+      items: [
+        { type: 'userMessage', id: 'u1', content: [{ type: 'text', text: 'question' }] },
+        { type: 'agentMessage', id: 'persisted-final', text: 'Done with tests.', phase: 'final_answer' },
+        { type: 'commandExecution', id: 'cmd-1', command: 'npm test', cwd: '/repo', status: 'completed', aggregatedOutput: 'ok\n', exitCode: 0, durationMs: 1 },
+      ],
+    };
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      partial.resolve({ data: [partialTurn], nextCursor: null });
+      await partial.promise;
+    });
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      completed.resolve({ data: [completedTurn], nextCursor: null });
+      await completed.promise;
+    });
+
+    expect(currentTimeline?.items.map((item) => (item.kind === 'command' ? item.command : itemText(item)))).toEqual([
+      'question',
+      'npm test',
+      'git status',
+      'Done with tests.',
+    ]);
+  });
+
+  it('reload does not duplicate exact commands when a sparse terminal page reorders them', async () => {
+    const complete = deferred<RpcResult>();
+    const sparse = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(complete.promise).mockReturnValueOnce(sparse.promise);
+    const completeTurn: CodexTurn = {
+      id: 'turn-1',
+      status: 'completed',
+      startedAt: 1,
+      completedAt: 2,
+      items: [
+        { type: 'commandExecution', id: 'cmd-a', command: 'cmd-a', cwd: '/repo', status: 'completed', aggregatedOutput: 'a\n', exitCode: 0, durationMs: 1 },
+        { type: 'commandExecution', id: 'cmd-b', command: 'cmd-b', cwd: '/repo', status: 'completed', aggregatedOutput: 'b\n', exitCode: 0, durationMs: 1 },
+        { type: 'agentMessage', id: 'a1', text: 'current only', phase: 'commentary' },
+      ],
+    };
+    const sparseTurn: CodexTurn = {
+      ...completeTurn,
+      items: [
+        { type: 'commandExecution', id: 'cmd-b', command: 'cmd-b', cwd: '/repo', status: 'completed', aggregatedOutput: 'b\n', exitCode: 0, durationMs: 1 },
+        { type: 'commandExecution', id: 'cmd-a', command: 'cmd-a', cwd: '/repo', status: 'completed', aggregatedOutput: 'a refreshed\n', exitCode: 0, durationMs: 1 },
+      ],
+    };
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      complete.resolve({ data: [completeTurn], nextCursor: null });
+      await complete.promise;
+    });
+
+    await act(async () => {
+      currentTimeline?.reload();
+    });
+    await act(async () => {
+      sparse.resolve({ data: [sparseTurn], nextCursor: null });
+      await sparse.promise;
+    });
+
+    const commands = currentTimeline?.items.filter((item) => item.kind === 'command') ?? [];
+    expect(commands.map((item) => item.command)).toEqual(['cmd-a', 'cmd-b']);
+    expect(commands.map((item) => item.output)).toEqual(['a refreshed\n', 'b\n']);
   });
 
   it('reload ignores a stale in-progress partial assistant after terminal history with a different item id', async () => {

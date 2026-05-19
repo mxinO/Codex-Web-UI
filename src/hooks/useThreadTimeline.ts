@@ -35,6 +35,147 @@ function itemMergeKey(item: CodexItem, index: number): string {
   return typeof item.id === 'string' && item.id.trim() ? `id:${item.id}` : `index:${index}`;
 }
 
+function stableJson(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(stableJson);
+  if (value && typeof value === 'object') {
+    return Object.keys(value)
+      .sort()
+      .reduce<Record<string, unknown>>((result, key) => {
+        result[key] = stableJson((value as Record<string, unknown>)[key]);
+        return result;
+      }, {});
+  }
+  return value;
+}
+
+function itemId(item: CodexItem): string | null {
+  return typeof item.id === 'string' && item.id.trim() ? item.id : null;
+}
+
+function stringFieldFromItem(item: CodexItem, key: string): string {
+  const value = (item as Record<string, unknown>)[key];
+  return typeof value === 'string' ? value : '';
+}
+
+function assistantMergePhase(item: CodexItem): string {
+  const phase = (item as Record<string, unknown>).phase;
+  if (phase === null || phase === 'final_answer' || phase === 'final') return 'final';
+  return typeof phase === 'string' ? phase : '';
+}
+
+function semanticItemIdentity(item: CodexItem): string {
+  if (item.type === 'agentMessage') {
+    return `agent:${assistantMergePhase(item)}\0${normalizedMessageText(stringFieldFromItem(item, 'text'))}`;
+  }
+  if (item.type === 'commandExecution') {
+    return `command:${stringFieldFromItem(item, 'cwd')}\0${stringFieldFromItem(item, 'command')}`;
+  }
+  if (item.type === 'mcpToolCall') {
+    return `mcp:${stringFieldFromItem(item, 'server')}\0${stringFieldFromItem(item, 'tool')}\0${JSON.stringify(stableJson((item as Record<string, unknown>).arguments))}`;
+  }
+  if (item.type === 'fileChange') {
+    return `fileChange:${JSON.stringify(stableJson((item as Record<string, unknown>).changes))}`;
+  }
+  return `${item.type}:${JSON.stringify(stableJson(item))}`;
+}
+
+interface TerminalMergeEntry {
+  item: CodexItem;
+  identity: string;
+}
+
+function terminalMergeEntries(items: CodexItem[], duplicateIds: ReadonlySet<string>): TerminalMergeEntry[] {
+  return items.map((item) => {
+    const id = itemId(item);
+    return {
+      item,
+      identity: id && !duplicateIds.has(id) ? `id:${id}` : id ? `id:${id}\0${semanticItemIdentity(item)}` : `semantic:${semanticItemIdentity(item)}`,
+    };
+  });
+}
+
+function duplicatedItemIds(...groups: CodexItem[][]): Set<string> {
+  const duplicates = new Set<string>();
+  for (const items of groups) {
+    const counts = new Map<string, number>();
+    for (const item of items) {
+      const id = itemId(item);
+      if (!id) continue;
+      counts.set(id, (counts.get(id) ?? 0) + 1);
+    }
+    for (const [id, count] of counts) {
+      if (count > 1) duplicates.add(id);
+    }
+  }
+  return duplicates;
+}
+
+function identityCounts(entries: TerminalMergeEntry[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const entry of entries) counts.set(entry.identity, (counts.get(entry.identity) ?? 0) + 1);
+  return counts;
+}
+
+function entriesCoverIdentities(currentEntries: TerminalMergeEntry[], latestEntries: TerminalMergeEntry[]): boolean {
+  const currentCounts = identityCounts(currentEntries);
+  const latestCounts = identityCounts(latestEntries);
+  for (const [identity, currentCount] of currentCounts) {
+    if ((latestCounts.get(identity) ?? 0) < currentCount) return false;
+  }
+  return true;
+}
+
+function exactTerminalEntryMatches(currentEntries: TerminalMergeEntry[], latestEntries: TerminalMergeEntry[]): Map<number, number> {
+  const currentCount = currentEntries.length;
+  const latestCount = latestEntries.length;
+  const lengths = Array.from({ length: currentCount + 1 }, () => new Array<number>(latestCount + 1).fill(0));
+
+  for (let currentIndex = currentCount - 1; currentIndex >= 0; currentIndex -= 1) {
+    for (let latestIndex = latestCount - 1; latestIndex >= 0; latestIndex -= 1) {
+      if (currentEntries[currentIndex].identity === latestEntries[latestIndex].identity) {
+        lengths[currentIndex][latestIndex] = lengths[currentIndex + 1][latestIndex + 1] + 1;
+      } else {
+        lengths[currentIndex][latestIndex] = Math.max(lengths[currentIndex + 1][latestIndex], lengths[currentIndex][latestIndex + 1]);
+      }
+    }
+  }
+
+  const matches = new Map<number, number>();
+  let currentIndex = 0;
+  let latestIndex = 0;
+  while (currentIndex < currentCount && latestIndex < latestCount) {
+    if (lengths[currentIndex + 1][latestIndex] === lengths[currentIndex][latestIndex]) {
+      currentIndex += 1;
+    } else if (
+      currentEntries[currentIndex].identity === latestEntries[latestIndex].identity &&
+      lengths[currentIndex + 1][latestIndex + 1] + 1 === lengths[currentIndex][latestIndex]
+    ) {
+      matches.set(currentIndex, latestIndex);
+      currentIndex += 1;
+      latestIndex += 1;
+    } else {
+      latestIndex += 1;
+    }
+  }
+
+  return matches;
+}
+
+function addRemainingExactTerminalMatches(
+  currentEntries: TerminalMergeEntry[],
+  latestEntries: TerminalMergeEntry[],
+  currentToLatest: Map<number, number>,
+): void {
+  const usedLatestIndexes = new Set(currentToLatest.values());
+  for (const [currentIndex, currentEntry] of currentEntries.entries()) {
+    if (currentToLatest.has(currentIndex)) continue;
+    const latestIndex = latestEntries.findIndex((entry, index) => !usedLatestIndexes.has(index) && entry.identity === currentEntry.identity);
+    if (latestIndex < 0) continue;
+    currentToLatest.set(currentIndex, latestIndex);
+    usedLatestIndexes.add(latestIndex);
+  }
+}
+
 function isTerminalTurnStatus(status: CodexTurn['status']): boolean {
   return status === 'completed' || status === 'failed' || status === 'interrupted';
 }
@@ -66,6 +207,35 @@ function finalAgentMessageCovers(candidate: CodexItem, covering: CodexItem): boo
   return messageCovers(candidate.text, covering.text);
 }
 
+function finalAgentMessagesEqual(a: CodexItem, b: CodexItem): boolean {
+  if (!isAgentMessageItem(a) || !isFinalAgentMessageItem(a)) return false;
+  if (!isAgentMessageItem(b) || !isFinalAgentMessageItem(b)) return false;
+  return normalizedMessageText(a.text) === normalizedMessageText(b.text);
+}
+
+function coveredAssistantMatches(
+  currentEntries: TerminalMergeEntry[],
+  latestEntries: TerminalMergeEntry[],
+  currentToLatest: Map<number, number>,
+): Map<number, number> {
+  const latestUsed = new Set(currentToLatest.values());
+  const matches = new Map<number, number>();
+
+  for (const [currentIndex, currentEntry] of currentEntries.entries()) {
+    if (currentToLatest.has(currentIndex)) continue;
+    const candidates = latestEntries
+      .map((entry, latestIndex) => ({ entry, latestIndex }))
+      .filter(({ entry, latestIndex }) => !latestUsed.has(latestIndex) && finalAgentMessageCovers(currentEntry.item, entry.item));
+    const exactCandidate = candidates.find(({ entry }) => finalAgentMessagesEqual(currentEntry.item, entry.item));
+    const candidate = exactCandidate ?? candidates[0];
+    if (!candidate) continue;
+    latestUsed.add(candidate.latestIndex);
+    matches.set(currentIndex, candidate.latestIndex);
+  }
+
+  return matches;
+}
+
 function latestItemCoveredByCurrent(item: CodexItem, current: CodexItem[]): boolean {
   return current.some((candidate) => finalAgentMessageCovers(item, candidate));
 }
@@ -94,6 +264,54 @@ function mergeTurnItems(
   if (latest.length === 0) return current;
 
   const indexes = new Map<string, number>();
+
+  if (options.replaceExisting && options.removeCurrentCoveredByLatest) {
+    const duplicateIds = duplicatedItemIds(current, latest);
+    const latestEntries = terminalMergeEntries(latest, duplicateIds);
+    const currentEntries = terminalMergeEntries(current, duplicateIds);
+    if (entriesCoverIdentities(currentEntries, latestEntries)) return latest;
+
+    const currentToLatest = exactTerminalEntryMatches(currentEntries, latestEntries);
+    addRemainingExactTerminalMatches(currentEntries, latestEntries, currentToLatest);
+    for (const [currentIndex, latestIndex] of coveredAssistantMatches(currentEntries, latestEntries, currentToLatest)) {
+      currentToLatest.set(currentIndex, latestIndex);
+    }
+
+    const matchedLatestIndexes = new Set(currentToLatest.values());
+    const emittedLatestIndexes = new Set<number>();
+    const merged: CodexItem[] = [];
+
+    const emitLatest = (latestIndex: number) => {
+      if (emittedLatestIndexes.has(latestIndex)) return;
+      emittedLatestIndexes.add(latestIndex);
+      const item = latestEntries[latestIndex]?.item;
+      if (!item) return;
+      if (options.skipLatestCoveredByCurrent && latestItemCoveredByCurrent(item, current)) return;
+      merged.push(item);
+    };
+
+    const emitUnmatchedLatestBefore = (limitIndex: number) => {
+      for (let latestIndex = 0; latestIndex < limitIndex; latestIndex += 1) {
+        if (matchedLatestIndexes.has(latestIndex)) continue;
+        emitLatest(latestIndex);
+      }
+    };
+
+    currentEntries.forEach((entry, currentIndex) => {
+      const latestIndex = currentToLatest.get(currentIndex);
+      if (latestIndex === undefined) {
+        merged.push(entry.item);
+        return;
+      }
+      emitUnmatchedLatestBefore(latestIndex);
+      emitLatest(latestIndex);
+    });
+
+    latestEntries.forEach((_, latestIndex) => emitLatest(latestIndex));
+
+    return merged;
+  }
+
   const baseCurrent = options.removeCurrentCoveredByLatest ? removeCurrentItemsCoveredByLatest(current, latest) : current;
   const merged = [...baseCurrent];
   merged.forEach((item, index) => indexes.set(itemMergeKey(item, index), index));
