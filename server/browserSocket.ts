@@ -171,6 +171,7 @@ function getRequiredStringArray(params: unknown, key: string): string[] | null {
 const REASONING_EFFORTS = new Set<CodexReasoningEffort>(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
 const SANDBOX_MODES = new Set<CodexSandboxMode>(['read-only', 'workspace-write', 'danger-full-access']);
 const COLLABORATION_MODES = new Set<CodexCollaborationMode>(['default', 'plan']);
+const TURN_ITEMS_VIEWS = new Set(['notLoaded', 'summary', 'full'] as const);
 const GIT_DIFF_SCOPES = new Set<GitDiffResult['scope']>(['staged', 'unstaged', 'untracked']);
 const BROWSE_DIRECTORY_LIMIT = 500;
 export const LEGACY_READ_FILE_MAX_BYTES = 5 * 1024 * 1024;
@@ -744,7 +745,16 @@ async function isBrowsableWorkspaceDirectoryEntry(realRoot: string, entry: fsSyn
   }
 }
 
-function turnListParams(params: unknown): { threadId: string; threadPath: string | null; cursor: unknown; limit: number; sortDirection: string } | string {
+type TurnItemsView = 'notLoaded' | 'summary' | 'full';
+
+function turnListParams(params: unknown): {
+  threadId: string;
+  threadPath: string | null;
+  cursor: unknown;
+  limit: number;
+  sortDirection: string;
+  itemsView: TurnItemsView;
+} | string {
   if (!isRecord(params)) return 'thread list params are required';
   const threadId = getRequiredString(params, 'threadId');
   if (!threadId) return 'threadId is required';
@@ -752,12 +762,14 @@ function turnListParams(params: unknown): { threadId: string; threadPath: string
 
   const limit = typeof params.limit === 'number' && Number.isFinite(params.limit) ? Math.max(1, Math.min(100, Math.floor(params.limit))) : 50;
   const sortDirection = params.sortDirection === 'asc' ? 'asc' : 'desc';
+  const itemsView = enumValue(params.itemsView, TURN_ITEMS_VIEWS) ?? 'full';
   return {
     threadId,
     threadPath,
     cursor: typeof params.cursor === 'string' ? params.cursor : null,
     limit,
     sortDirection,
+    itemsView,
   };
 }
 
@@ -3123,6 +3135,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
               cursor: params.cursor,
               limit: params.limit,
               sortDirection: params.sortDirection,
+              itemsView: params.itemsView,
             };
             result = await requestCodex('thread/turns/list', codexParams, THREAD_TURNS_LIST_RPC_TIMEOUT_MS);
             markThreadRolloutObserved(params.threadId);

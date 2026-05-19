@@ -3480,6 +3480,7 @@ describe('attachBrowserSocket app-server lifecycle', () => {
       cursor: null,
       limit: 50,
       sortDirection: 'desc',
+      itemsView: 'full',
     }, 120000);
   });
 
@@ -3553,6 +3554,7 @@ describe('attachBrowserSocket app-server lifecycle', () => {
       cursor: null,
       limit: 50,
       sortDirection: 'desc',
+      itemsView: 'full',
     }, 120000);
     expect(start.mock.invocationCallOrder[0]).toBeLessThan(request.mock.invocationCallOrder[0]);
   });

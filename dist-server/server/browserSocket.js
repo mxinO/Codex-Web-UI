@@ -93,6 +93,7 @@ function getRequiredStringArray(params, key) {
 const REASONING_EFFORTS = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
 const SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-access']);
 const COLLABORATION_MODES = new Set(['default', 'plan']);
+const TURN_ITEMS_VIEWS = new Set(['notLoaded', 'summary', 'full']);
 const GIT_DIFF_SCOPES = new Set(['staged', 'unstaged', 'untracked']);
 const BROWSE_DIRECTORY_LIMIT = 500;
 export const LEGACY_READ_FILE_MAX_BYTES = 5 * 1024 * 1024;
@@ -655,12 +656,14 @@ function turnListParams(params) {
     const threadPath = getOptionalString(params, 'threadPath');
     const limit = typeof params.limit === 'number' && Number.isFinite(params.limit) ? Math.max(1, Math.min(100, Math.floor(params.limit))) : 50;
     const sortDirection = params.sortDirection === 'asc' ? 'asc' : 'desc';
+    const itemsView = enumValue(params.itemsView, TURN_ITEMS_VIEWS) ?? 'full';
     return {
         threadId,
         threadPath,
         cursor: typeof params.cursor === 'string' ? params.cursor : null,
         limit,
         sortDirection,
+        itemsView,
     };
 }
 function stringValue(value, key) {
@@ -2908,6 +2911,7 @@ export function attachBrowserSocket(server, deps) {
                             cursor: params.cursor,
                             limit: params.limit,
                             sortDirection: params.sortDirection,
+                            itemsView: params.itemsView,
                         };
                         result = await requestCodex('thread/turns/list', codexParams, THREAD_TURNS_LIST_RPC_TIMEOUT_MS);
                         markThreadRolloutObserved(params.threadId);
