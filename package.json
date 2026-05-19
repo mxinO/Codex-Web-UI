@@ -21,6 +21,8 @@
     "install:global": "npm link --ignore-scripts",
     "prepublishOnly": "npm run build && npm test",
     "build": "vite build && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.server.json --noEmit && node -e \"require('node:fs').rmSync('dist-server',{recursive:true,force:true})\" && tsc -p tsconfig.server.build.json",
+    "check:package": "node scripts/check-package-build.mjs",
+    "hooks:install": "git config core.hooksPath .githooks",
     "test": "vitest run",
     "test:watch": "vitest",
     "probe:continuity": "tsx scripts/probe-continuity.ts"
