@@ -643,7 +643,7 @@ describe('useThreadTimeline', () => {
     ]);
   });
 
-  it('reload preserves duplicate-id current-only items when a terminal page is sparse', async () => {
+  it('reload preserves duplicate-id current-only final items while keeping later activity before them', async () => {
     const complete = deferred<RpcResult>();
     const sparse = deferred<RpcResult>();
     const rpc = vi.fn().mockReturnValueOnce(complete.promise).mockReturnValueOnce(sparse.promise);
@@ -681,9 +681,9 @@ describe('useThreadTimeline', () => {
     });
 
     expect(currentTimeline?.items.map((item) => (item.kind === 'command' ? item.command : itemText(item)))).toEqual([
+      'pwd',
       'first copy',
       'second copy',
-      'pwd',
     ]);
   });
 

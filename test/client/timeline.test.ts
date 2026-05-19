@@ -20,6 +20,8 @@ import {
   pendingUserItemsWithoutHistory,
   shouldShowLiveStreamingItem,
   timelineItemsWithLiveTurnOverlay,
+  timelineItemsWithRetainedLiveTurnOverlay,
+  timelineItemsWithRetainedTurnTimestamps,
   withTimelineNotificationMeta,
   turnToTimelineItems,
   trimTimelineWindow,
@@ -30,7 +32,7 @@ import type { TimelineItem } from '../../src/lib/timeline';
 import type { CodexTurn } from '../../src/types/codex';
 
 describe('timeline', () => {
-  it('converts user, assistant, and command items', () => {
+  it('moves a terminal final assistant after later same-turn activity', () => {
     const turn: CodexTurn = {
       id: 'turn-1',
       status: 'completed',
@@ -43,7 +45,7 @@ describe('timeline', () => {
       ],
     };
 
-    expect(turnToTimelineItems(turn).map((item) => item.kind)).toEqual(['user', 'assistant', 'command']);
+    expect(turnToTimelineItems(turn).map((item) => item.kind)).toEqual(['user', 'command', 'assistant']);
   });
 
   it('keeps chronological file edit cards and appends a per-turn file summary', () => {
@@ -82,6 +84,36 @@ describe('timeline', () => {
         ],
       },
     ]);
+  });
+
+  it('places the per-turn file summary before the terminal final assistant', () => {
+    const turn: CodexTurn = {
+      id: 'turn-file',
+      status: 'completed',
+      startedAt: 10,
+      completedAt: 11,
+      items: [
+        { type: 'fileChange', id: 'f1', status: 'completed', changes: [{ path: '/repo/a.txt', diff: 'created\n' }] },
+        { type: 'agentMessage', id: 'a1', text: 'Done.', phase: 'final_answer' },
+      ],
+    };
+
+    expect(turnToTimelineItems(turn).map((item) => item.kind)).toEqual(['fileChange', 'fileChangeSummary', 'assistant']);
+  });
+
+  it('places later notice activity before the terminal final assistant', () => {
+    const turn: CodexTurn = {
+      id: 'turn-notice',
+      status: 'completed',
+      startedAt: 10,
+      completedAt: 11,
+      items: [
+        { type: 'agentMessage', id: 'a1', text: 'Done.', phase: 'final_answer' },
+        { type: 'plan', id: 'p1', text: 'Plan updated' },
+      ],
+    };
+
+    expect(turnToTimelineItems(turn).map((item) => item.kind)).toEqual(['notice', 'assistant']);
   });
 
   it('splits multiple raw changes from one Codex fileChange item into per-edit history cards', () => {
@@ -241,8 +273,8 @@ describe('timeline', () => {
     };
 
     expect(turnToTimelineItems(turn)).toEqual([
-      { id: 'turn-warning:w1', kind: 'warning', timestamp: 1000, text: 'low disk' },
-      { id: 'turn-warning:e1', kind: 'error', timestamp: 1000, text: 'failed turn' },
+      { id: 'turn-warning:w1', kind: 'warning', timestamp: 1000, text: 'low disk', turnId: 'turn-warning' },
+      { id: 'turn-warning:e1', kind: 'error', timestamp: 1000, text: 'failed turn', turnId: 'turn-warning' },
     ]);
   });
 
@@ -289,6 +321,23 @@ describe('timeline', () => {
     expect(mergeTimelineItemsByTimestamp([queued, bang, live]).map((item) => item.id)).toEqual(['live-1', 'bang-1', 'queued-1']);
   });
 
+  it('does not apply same-turn final/activity ordering to unscoped items', () => {
+    const final: TimelineItem = { id: 'unscoped-final', kind: 'assistant', timestamp: 1000, sortOrder: 1, text: 'Done.', phase: 'final_answer' };
+    const command: TimelineItem = {
+      id: 'unscoped-command',
+      kind: 'command',
+      timestamp: 1000,
+      sortOrder: 2,
+      command: 'pwd',
+      cwd: '/repo',
+      output: '/repo\n',
+      status: 'completed',
+      exitCode: 0,
+    };
+
+    expect(mergeTimelineItemsByTimestamp([command, final]).map((item) => item.id)).toEqual(['unscoped-final', 'unscoped-command']);
+  });
+
   it('normalizes malformed arrays and missing item ids defensively', () => {
     const turn: CodexTurn = {
       id: 'turn-2',
@@ -304,7 +353,7 @@ describe('timeline', () => {
     expect(() => turnToTimelineItems(turn)).not.toThrow();
     expect(turnToTimelineItems(turn)).toEqual([
       { id: 'turn-2:0', kind: 'user', timestamp: 0, text: '', turnId: 'turn-2' },
-      { id: 'turn-2:r1', kind: 'notice', timestamp: 0, text: '' },
+      { id: 'turn-2:r1', kind: 'notice', timestamp: 0, text: '', turnId: 'turn-2' },
     ]);
   });
 
@@ -1448,6 +1497,200 @@ describe('timeline', () => {
       { id: 'turn-1:a1', kind: 'assistant', timestamp: 1000, text: 'Previous answer.', phase: 'final_answer', turnId: 'turn-1' },
     ];
     expect(mergeRetainedLiveTurnItems(caughtUpHistory, retained, [])).toEqual([]);
+  });
+
+  it('keeps retained completed-turn activities between their live assistant anchors after history catches up', () => {
+    const completedLiveItems = liveTurnItemsFromNotifications(
+      [
+        withTimelineNotificationMeta(
+          { method: 'event_msg', params: { type: 'agent_message', message: 'I will inspect the file.', phase: 'commentary', turn_id: 'turn-1' } },
+          { order: 1, receivedAt: 2000, streamId: 'stream-1', seq: 1 },
+        ),
+        withTimelineNotificationMeta(
+          {
+            method: 'item/completed',
+            params: {
+              threadId: 'thread-1',
+              turnId: 'turn-1',
+              item: {
+                type: 'commandExecution',
+                id: 'cmd-1',
+                command: 'pwd',
+                cwd: '/repo',
+                status: 'completed',
+                aggregatedOutput: '/repo\n',
+                exitCode: 0,
+              },
+            },
+          },
+          { order: 2, receivedAt: 3000, streamId: 'stream-1', seq: 2 },
+        ),
+        withTimelineNotificationMeta(
+          { method: 'event_msg', params: { type: 'agent_message', message: 'Done.', phase: 'final_answer', turn_id: 'turn-1' } },
+          { order: 3, receivedAt: 4000, streamId: 'stream-1', seq: 3 },
+        ),
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      false,
+      1000,
+    );
+    const caughtUpHistory: TimelineItem[] = [
+      { id: 'turn-1:u1', kind: 'user', timestamp: 1000, text: 'question', turnId: 'turn-1' },
+      {
+        id: 'turn-1:persisted-commentary',
+        kind: 'assistant',
+        timestamp: 1000,
+        text: 'I will inspect the file.',
+        phase: 'commentary',
+        turnId: 'turn-1',
+        sourceId: 'persisted-commentary',
+      },
+      {
+        id: 'turn-1:persisted-final',
+        kind: 'assistant',
+        timestamp: 1000,
+        text: 'Done.',
+        phase: 'final_answer',
+        turnId: 'turn-1',
+        sourceId: 'persisted-final',
+      },
+    ];
+
+    const retained = mergeRetainedLiveTurnItems(caughtUpHistory, [], completedLiveItems);
+    const overlaidHistory = timelineItemsWithRetainedLiveTurnOverlay(caughtUpHistory, retained);
+    const visibleRetained = visibleRetainedLiveTurnItemsForTimeline(overlaidHistory, [], retained);
+    const merged = mergeTimelineItemsByTimestamp([...overlaidHistory, ...visibleRetained]);
+
+    expect(merged.map((item) => (item.kind === 'assistant' || item.kind === 'user' ? item.text : item.id))).toEqual([
+      'question',
+      'I will inspect the file.',
+      'turn-1:cmd-1',
+      'Done.',
+    ]);
+  });
+
+  it('keeps retained completed-turn activity before the next persisted user prompt', () => {
+    const caughtUpHistory: TimelineItem[] = [
+      { id: 'turn-1:u1', kind: 'user', timestamp: 1000, text: 'first question', turnId: 'turn-1' },
+      {
+        id: 'turn-1:persisted-final',
+        kind: 'assistant',
+        timestamp: 1000,
+        text: 'Done.',
+        phase: 'final_answer',
+        turnId: 'turn-1',
+        sourceId: 'persisted-final',
+      },
+      { id: 'turn-2:u1', kind: 'user', timestamp: 2500, text: 'next question', turnId: 'turn-2' },
+    ];
+    const retained: TimelineItem[] = [
+      {
+        id: 'turn-1:cmd-1',
+        kind: 'command',
+        timestamp: 3000,
+        sortOrder: 2,
+        command: 'pwd',
+        cwd: '/repo',
+        output: '/repo\n',
+        status: 'completed',
+        exitCode: 0,
+      },
+      {
+        id: 'turn-1:live-final',
+        kind: 'assistant',
+        timestamp: 4000,
+        sortOrder: 3,
+        text: 'Done.',
+        phase: 'final_answer',
+        turnId: 'turn-1',
+      },
+    ];
+
+    const normalizedRetained = timelineItemsWithRetainedTurnTimestamps(caughtUpHistory, retained);
+    const overlaidHistory = timelineItemsWithRetainedLiveTurnOverlay(caughtUpHistory, normalizedRetained);
+    const visibleRetained = visibleRetainedLiveTurnItemsForTimeline(overlaidHistory, [], normalizedRetained);
+    const merged = mergeTimelineItemsByTimestamp([...overlaidHistory, ...visibleRetained]);
+
+    expect(merged.map((item) => (item.kind === 'assistant' || item.kind === 'user' ? item.text : item.id))).toEqual([
+      'first question',
+      'turn-1:cmd-1',
+      'Done.',
+      'next question',
+    ]);
+  });
+
+  it('keeps retained activity ordered for turn ids that contain colons', () => {
+    const turnId = 'turn:1';
+    const history: TimelineItem[] = [
+      { id: `${turnId}:u1`, kind: 'user', timestamp: 1000, text: 'first question', turnId },
+      { id: `${turnId}:final`, kind: 'assistant', timestamp: 1000, text: 'Done.', phase: 'final_answer', turnId },
+      { id: 'turn-2:u1', kind: 'user', timestamp: 2500, text: 'next question', turnId: 'turn-2' },
+    ];
+    const retained = liveTurnItemsFromNotifications(
+      [
+        withTimelineNotificationMeta(
+          {
+            method: 'item/completed',
+            params: {
+              threadId: 'thread-1',
+              turnId,
+              item: {
+                type: 'commandExecution',
+                id: 'cmd-1',
+                command: 'pwd',
+                cwd: '/repo',
+                status: 'completed',
+                aggregatedOutput: '/repo\n',
+                exitCode: 0,
+              },
+            },
+          },
+          { order: 1, receivedAt: 3000, streamId: 'stream-1', seq: 1 },
+        ),
+        withTimelineNotificationMeta(
+          { method: 'event_msg', params: { type: 'agent_message', message: 'Done.', phase: 'final_answer', turn_id: turnId } },
+          { order: 2, receivedAt: 4000, streamId: 'stream-1', seq: 2 },
+        ),
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: turnId },
+      false,
+      1000,
+    );
+
+    const normalizedRetained = timelineItemsWithRetainedTurnTimestamps(history, retained);
+    const overlaidHistory = timelineItemsWithRetainedLiveTurnOverlay(history, normalizedRetained);
+    const visibleRetained = visibleRetainedLiveTurnItemsForTimeline(overlaidHistory, [], normalizedRetained);
+    const merged = mergeTimelineItemsByTimestamp([...overlaidHistory, ...visibleRetained]);
+
+    expect(merged.map((item) => (item.kind === 'assistant' || item.kind === 'user' ? item.text : item.id))).toEqual([
+      'first question',
+      `${turnId}:cmd-1`,
+      'Done.',
+      'next question',
+    ]);
+  });
+
+  it('keeps a retained file summary before the matching persisted final assistant', () => {
+    const history: TimelineItem[] = [
+      { id: 'turn-1:u1', kind: 'user', timestamp: 1000, text: 'question', turnId: 'turn-1' },
+      { id: 'turn-1:final', kind: 'assistant', timestamp: 1000, text: 'Done.', phase: 'final_answer', turnId: 'turn-1' },
+    ];
+    const retainedSummary: Extract<TimelineItem, { kind: 'fileChangeSummary' }> = {
+      id: 'turn-1:file-summary',
+      kind: 'fileChangeSummary',
+      timestamp: 4000,
+      turnId: 'turn-1',
+      files: [{ path: '/repo/a.txt', changeCount: 1 }],
+    };
+
+    const normalizedSummary = timelineItemsWithRetainedTurnTimestamps(history, [retainedSummary]);
+    const merged = mergeTimelineItemsByTimestamp([...history, ...normalizedSummary]);
+
+    expect(merged.map((item) => (item.kind === 'assistant' || item.kind === 'user' ? item.text : item.id))).toEqual([
+      'question',
+      'turn-1:file-summary',
+      'Done.',
+    ]);
   });
 
   it('removes retained partial streaming once final history catches up with a different source id', () => {

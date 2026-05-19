@@ -50,6 +50,8 @@ import {
   requestKey,
   retargetSyntheticUserItemsToTurn,
   timelineItemsWithLiveTurnOverlay,
+  timelineItemsWithRetainedLiveTurnOverlay,
+  timelineItemsWithRetainedTurnTimestamps,
   visibleRetainedLiveTurnItemsForTimeline,
   visibleLiveTurnItemsForTimeline,
   type TimelineItem,
@@ -303,6 +305,18 @@ export default function App() {
     () => timelineItemsWithLiveTurnOverlay(timeline.items, liveTurnItems, state?.activeTurnId ? liveNotificationActiveTurnId : null),
     [liveNotificationActiveTurnId, liveTurnItems, state?.activeTurnId, timeline.items],
   );
+  const retainedOverlayItems = useMemo(
+    () => [...retainedLiveTurnItems, ...retainedFileSummaryItems],
+    [retainedFileSummaryItems, retainedLiveTurnItems],
+  );
+  const timelineItemsForChatWithRetainedOverlay = useMemo(
+    () => timelineItemsWithRetainedLiveTurnOverlay(timelineItemsForChat, retainedOverlayItems),
+    [retainedOverlayItems, timelineItemsForChat],
+  );
+  const retainedLiveTurnItemsForChat = useMemo(
+    () => timelineItemsWithRetainedTurnTimestamps(timelineItemsForChat, retainedLiveTurnItems),
+    [retainedLiveTurnItems, timelineItemsForChat],
+  );
   const latestCompletionCount = useMemo(
     () =>
       latestCompletionNotificationCount(liveNotifications, socket.notificationCount, {
@@ -312,12 +326,12 @@ export default function App() {
     [activeThreadId, liveNotificationActiveTurnId, liveNotifications, socket.notificationCount],
   );
   const visibleLiveTurnItems = useMemo(
-    () => visibleLiveTurnItemsForTimeline(timelineItemsForChat, liveTurnItems, { allowAssistantTextMatchAcrossSources: !state?.activeTurnId }),
-    [liveTurnItems, state?.activeTurnId, timelineItemsForChat],
+    () => visibleLiveTurnItemsForTimeline(timelineItemsForChatWithRetainedOverlay, liveTurnItems, { allowAssistantTextMatchAcrossSources: !state?.activeTurnId }),
+    [liveTurnItems, state?.activeTurnId, timelineItemsForChatWithRetainedOverlay],
   );
   const visibleRetainedLiveTurnItems = useMemo(
-    () => visibleRetainedLiveTurnItemsForTimeline(timelineItemsForChat, visibleLiveTurnItems, retainedLiveTurnItems),
-    [retainedLiveTurnItems, timelineItemsForChat, visibleLiveTurnItems],
+    () => visibleRetainedLiveTurnItemsForTimeline(timelineItemsForChatWithRetainedOverlay, visibleLiveTurnItems, retainedLiveTurnItemsForChat),
+    [retainedLiveTurnItemsForChat, timelineItemsForChatWithRetainedOverlay, visibleLiveTurnItems],
   );
   const historyFileSummaryTurnIds = useMemo(
     () =>
@@ -332,6 +346,10 @@ export default function App() {
     () => retainedFileSummaryItems.filter((item) => !historyFileSummaryTurnIds.has(item.turnId)),
     [historyFileSummaryTurnIds, retainedFileSummaryItems],
   );
+  const visibleRetainedFileSummaryItemsForChat = useMemo(
+    () => timelineItemsWithRetainedTurnTimestamps(timelineItemsForChat, visibleRetainedFileSummaryItems),
+    [timelineItemsForChat, visibleRetainedFileSummaryItems],
+  );
   const approvalItems = useMemo(
     () =>
       approvalItemsFromRequests(socket.requests, answeredApprovals).map((item) => ({
@@ -343,16 +361,16 @@ export default function App() {
   const chatItems = useMemo<TimelineItem[]>(() => {
     if (!timeline.isViewingLatest) return timeline.items;
     return mergeTimelineItemsByTimestamp([
-      ...timelineItemsForChat,
+      ...timelineItemsForChatWithRetainedOverlay,
       ...visibleRetainedLiveTurnItems,
-      ...visibleRetainedFileSummaryItems,
+      ...visibleRetainedFileSummaryItemsForChat,
       ...pendingUserItems,
       ...claimedQueuedUserItems,
       ...ephemeralItems,
       ...visibleLiveTurnItems,
       ...approvalItems,
     ]);
-  }, [approvalItems, claimedQueuedUserItems, ephemeralItems, pendingUserItems, timeline.isViewingLatest, timeline.items, timelineItemsForChat, visibleLiveTurnItems, visibleRetainedFileSummaryItems, visibleRetainedLiveTurnItems]);
+  }, [approvalItems, claimedQueuedUserItems, ephemeralItems, pendingUserItems, timeline.isViewingLatest, timeline.items, timelineItemsForChatWithRetainedOverlay, visibleLiveTurnItems, visibleRetainedFileSummaryItemsForChat, visibleRetainedLiveTurnItems]);
   const runOptions = useMemo<CodexRunOptions>(() => ({ model, mode: effectiveMode(mode, model), effort, sandbox }), [effort, mode, model, sandbox]);
   const serverModel = sanitizeStoredModel(state?.model ?? null);
   const serverEffort = sanitizeStoredEffort(state?.effort ?? null);

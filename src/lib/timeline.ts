@@ -15,7 +15,7 @@ export type TimelineItem = TimelineItemOrder & (
       sourceId?: string | null;
       liveSource?: 'event_msg' | 'item_completed';
     }
-  | { id: string; kind: 'command'; timestamp: number; command: string; cwd: string; output: string; status: string; exitCode: number | null }
+  | { id: string; kind: 'command'; timestamp: number; command: string; cwd: string; output: string; status: string; exitCode: number | null; turnId?: string | null }
   | { id: string; kind: 'bangCommand'; timestamp: number; command: string; cwd: string; output: string; status: string; exitCode: number | null }
   | {
       id: string;
@@ -36,10 +36,10 @@ export type TimelineItem = TimelineItemOrder & (
       turnId: string;
       files: Array<{ path: string; changeCount: number }>;
     }
-  | { id: string; kind: 'tool'; timestamp: number; item: CodexItem }
-  | { id: string; kind: 'notice'; timestamp: number; text: string }
-  | { id: string; kind: 'warning'; timestamp: number; text: string }
-  | { id: string; kind: 'error'; timestamp: number; text: string }
+  | { id: string; kind: 'tool'; timestamp: number; item: CodexItem; turnId?: string | null }
+  | { id: string; kind: 'notice'; timestamp: number; text: string; turnId?: string | null }
+  | { id: string; kind: 'warning'; timestamp: number; text: string; turnId?: string | null }
+  | { id: string; kind: 'error'; timestamp: number; text: string; turnId?: string | null }
   | { id: string; kind: 'queued'; timestamp: number; message: { id: string; text: string; createdAt: number; options?: Partial<CodexRunOptions> } }
   | { id: string; kind: 'streaming'; timestamp: number; text: string; active: boolean; turnId?: string | null; sourceId?: string | null }
   | { id: string; kind: 'approval'; timestamp: number; requestId: number | string; method: string; params: unknown }
@@ -348,6 +348,36 @@ function syntheticFileChangeSummaryItem(turn: CodexTurn, items: CodexItem[], tim
   };
 }
 
+function isTurnActivityItem(item: TimelineItem): boolean {
+  return (
+    item.kind === 'command' ||
+    item.kind === 'fileChange' ||
+    item.kind === 'fileChangeSummary' ||
+    item.kind === 'tool' ||
+    item.kind === 'notice' ||
+    item.kind === 'warning' ||
+    item.kind === 'error'
+  );
+}
+
+function isFinalAssistantTimelineItem(item: TimelineItem): item is Extract<TimelineItem, { kind: 'assistant' }> {
+  return item.kind === 'assistant' && (item.phase === null || item.phase === 'final_answer' || item.phase === 'final');
+}
+
+function finalAssistantAfterLaterActivity(items: TimelineItem[]): TimelineItem[] {
+  const firstFinalIndex = items.findIndex(isFinalAssistantTimelineItem);
+  if (firstFinalIndex < 0) return items;
+  if (!items.slice(firstFinalIndex + 1).some(isTurnActivityItem)) return items;
+
+  const finals: TimelineItem[] = [];
+  const others: TimelineItem[] = [];
+  for (const item of items) {
+    if (isFinalAssistantTimelineItem(item)) finals.push(item);
+    else others.push(item);
+  }
+  return [...others, ...finals];
+}
+
 export function turnToTimelineItems(turn: CodexTurn): TimelineItem[] {
   const timestamp = (turn.startedAt ?? 0) * 1000;
   const items = Array.isArray(turn.items) ? turn.items : [];
@@ -377,20 +407,25 @@ export function turnToTimelineItems(turn: CodexTurn): TimelineItem[] {
         output: stringField(item, 'aggregatedOutput'),
         status: stringField(item, 'status', 'unknown'),
         exitCode: numberOrNullField(item, 'exitCode'),
+        turnId: turn.id,
       }];
     }
     if (item.type === 'reasoning') {
       const summary = Array.isArray(item.summary) ? item.summary.filter((entry): entry is string => typeof entry === 'string') : [];
       const content = Array.isArray(item.content) ? item.content.filter((entry): entry is string => typeof entry === 'string') : [];
-      return [{ id, kind: 'notice', timestamp, text: [...summary, ...content].join('\n') }];
+      return [{ id, kind: 'notice', timestamp, text: [...summary, ...content].join('\n'), turnId: turn.id }];
     }
-    if (item.type === 'plan') return [{ id, kind: 'notice', timestamp, text: stringField(item, 'text') }];
-    if (item.type === 'warning') return [{ id, kind: 'warning', timestamp, text: stringField(item, 'message') || stringField(item, 'text') || item.type }];
-    if (item.type === 'error') return [{ id, kind: 'error', timestamp, text: stringField(item, 'message') || stringField(item, 'text') || item.type }];
-    return [{ id, kind: 'tool', timestamp, item }];
+    if (item.type === 'plan') return [{ id, kind: 'notice', timestamp, text: stringField(item, 'text'), turnId: turn.id }];
+    if (item.type === 'warning') {
+      return [{ id, kind: 'warning', timestamp, text: stringField(item, 'message') || stringField(item, 'text') || item.type, turnId: turn.id }];
+    }
+    if (item.type === 'error') {
+      return [{ id, kind: 'error', timestamp, text: stringField(item, 'message') || stringField(item, 'text') || item.type, turnId: turn.id }];
+    }
+    return [{ id, kind: 'tool', timestamp, item, turnId: turn.id }];
   });
   const summary = syntheticFileChangeSummaryItem(turn, items, timestamp) ?? fileChangeSummaryItem({ ...turn, items }, timestamp);
-  return summary ? [...timelineItems, summary] : timelineItems;
+  return finalAssistantAfterLaterActivity(summary ? [...timelineItems, summary] : timelineItems);
 }
 
 export function trimTimelineWindow<T>(items: T[], limit: number): T[] {
@@ -405,7 +440,13 @@ export function mergeTimelineItemsByTimestamp(items: TimelineItem[]): TimelineIt
       const bTime = Number.isFinite(b.item.timestamp) ? b.item.timestamp : 0;
       const aOrder = typeof a.item.sortOrder === 'number' && Number.isFinite(a.item.sortOrder) ? a.item.sortOrder : null;
       const bOrder = typeof b.item.sortOrder === 'number' && Number.isFinite(b.item.sortOrder) ? b.item.sortOrder : null;
-      return aTime - bTime || (aOrder ?? a.index) - (bOrder ?? b.index) || a.index - b.index;
+      const aTurnId = timelineItemTurnId(a.item);
+      const bTurnId = timelineItemTurnId(b.item);
+      const sameTurn = aTurnId !== null && aTurnId === bTurnId;
+      let activityBeforeFinal = 0;
+      if (sameTurn && isFinalAssistantTimelineItem(a.item) && isTurnActivityItem(b.item)) activityBeforeFinal = 1;
+      else if (sameTurn && isTurnActivityItem(a.item) && isFinalAssistantTimelineItem(b.item)) activityBeforeFinal = -1;
+      return aTime - bTime || activityBeforeFinal || (aOrder ?? a.index) - (bOrder ?? b.index) || a.index - b.index;
     })
     .map(({ item }) => item);
 }
@@ -1050,6 +1091,88 @@ export function visibleLiveTurnItemsForTimeline(
   });
 }
 
+function isRetainedActivityOrderAnchor(item: TimelineItem): boolean {
+  return isTurnActivityItem(item);
+}
+
+function retainedActivityTurnIdsMissingFromHistory(historyItems: TimelineItem[], retainedItems: TimelineItem[]): Set<string> {
+  const historyIds = new Set(historyItems.map((item) => item.id));
+  const turnIds = new Set<string>();
+  for (const item of retainedItems) {
+    if (!isRetainedActivityOrderAnchor(item)) continue;
+    if (historyIds.has(item.id)) continue;
+    const turnId = timelineItemTurnId(item);
+    if (turnId) turnIds.add(turnId);
+  }
+  return turnIds;
+}
+
+function retainedAssistantOverlayCounts(historyItems: TimelineItem[], retainedItems: TimelineItem[]): Map<string, number> {
+  const orderSensitiveTurnIds = retainedActivityTurnIdsMissingFromHistory(historyItems, retainedItems);
+  const counts = new Map<string, number>();
+  if (orderSensitiveTurnIds.size === 0) return counts;
+
+  for (const item of retainedItems) {
+    if (item.kind !== 'assistant') continue;
+    const turnId = timelineItemTurnId(item);
+    if (!turnId || !orderSensitiveTurnIds.has(turnId)) continue;
+    const text = normalizedMessageBlock(item.text);
+    if (!text) continue;
+    const key = assistantTextKey(turnId, item.phase, text);
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+
+  return counts;
+}
+
+export function timelineItemsWithRetainedLiveTurnOverlay(historyItems: TimelineItem[], retainedItems: TimelineItem[]): TimelineItem[] {
+  const counts = retainedAssistantOverlayCounts(historyItems, retainedItems);
+  if (counts.size === 0) return historyItems;
+
+  let changed = false;
+  const filtered = historyItems.filter((item) => {
+    if (item.kind !== 'assistant') return true;
+    const turnId = timelineItemTurnId(item);
+    if (!turnId) return true;
+    const text = normalizedMessageBlock(item.text);
+    if (!text) return true;
+    const key = assistantTextKey(turnId, item.phase, text);
+    const count = counts.get(key) ?? 0;
+    if (count <= 0) return true;
+    if (count === 1) counts.delete(key);
+    else counts.set(key, count - 1);
+    changed = true;
+    return false;
+  });
+
+  return changed ? filtered : historyItems;
+}
+
+export function timelineItemsWithRetainedTurnTimestamps<T extends TimelineItem>(historyItems: TimelineItem[], retainedItems: T[]): T[] {
+  const orderSensitiveTurnIds = retainedActivityTurnIdsMissingFromHistory(historyItems, retainedItems);
+  if (orderSensitiveTurnIds.size === 0) return retainedItems;
+
+  const historyTimestampsByTurn = new Map<string, number>();
+  for (const item of historyItems) {
+    const turnId = timelineItemTurnId(item);
+    if (!turnId || !orderSensitiveTurnIds.has(turnId)) continue;
+    const timestamp = Number.isFinite(item.timestamp) ? item.timestamp : 0;
+    const current = historyTimestampsByTurn.get(turnId);
+    if (current === undefined || timestamp < current) historyTimestampsByTurn.set(turnId, timestamp);
+  }
+
+  let changed = false;
+  const normalized = retainedItems.map((item) => {
+    const turnId = timelineItemTurnId(item);
+    const timestamp = turnId ? historyTimestampsByTurn.get(turnId) : undefined;
+    if (timestamp === undefined || item.timestamp === timestamp) return item;
+    changed = true;
+    return { ...item, timestamp };
+  });
+
+  return changed ? normalized : retainedItems;
+}
+
 export function visibleRetainedLiveTurnItemsForTimeline(
   historyItems: TimelineItem[],
   currentLiveItems: TimelineItem[],
@@ -1057,7 +1180,8 @@ export function visibleRetainedLiveTurnItemsForTimeline(
 ): TimelineItem[] {
   const currentLiveKeys = new Set(currentLiveItems.map(liveCurrentDuplicateKey));
   const currentAssistantItems = currentLiveItems.filter((item): item is Extract<TimelineItem, { kind: 'assistant' }> => item.kind === 'assistant');
-  return visibleLiveTurnItemsForTimeline([...historyItems, ...currentAssistantItems], retainedItems, {
+  const historyWithRetainedOverlay = timelineItemsWithRetainedLiveTurnOverlay([...historyItems, ...currentAssistantItems], retainedItems);
+  return visibleLiveTurnItemsForTimeline(historyWithRetainedOverlay, retainedItems, {
     allowAssistantTextMatchAcrossSources: true,
   }).filter((item) => !currentLiveKeys.has(liveCurrentDuplicateKey(item)));
 }
@@ -1173,8 +1297,10 @@ export function mergeRetainedLiveTurnItems(
   additions: TimelineItem[],
   limit = 200,
 ): TimelineItem[] {
-  const retained = visibleLiveTurnItemsForTimeline(historyItems, retainedItems, { allowAssistantTextMatchAcrossSources: true });
-  const visibleAdditions = visibleLiveTurnItemsForTimeline(historyItems, additions, { allowAssistantTextMatchAcrossSources: true }).filter(
+  const overlayItems = [...retainedItems, ...additions];
+  const historyWithRetainedOverlay = timelineItemsWithRetainedLiveTurnOverlay(historyItems, overlayItems);
+  const retained = visibleLiveTurnItemsForTimeline(historyWithRetainedOverlay, retainedItems, { allowAssistantTextMatchAcrossSources: true });
+  const visibleAdditions = visibleLiveTurnItemsForTimeline(historyWithRetainedOverlay, additions, { allowAssistantTextMatchAcrossSources: true }).filter(
     (item) => !(item.kind === 'streaming' && item.active),
   );
   if (retained.length === 0 && visibleAdditions.length === 0) return [];
@@ -1188,7 +1314,8 @@ export function mergeRetainedLiveTurnItems(
     merged.push(item);
   }
 
-  return trimTimelineWindow(visibleLiveTurnItemsForTimeline(historyItems, merged, { allowAssistantTextMatchAcrossSources: true }), limit);
+  const finalHistoryWithRetainedOverlay = timelineItemsWithRetainedLiveTurnOverlay(historyItems, merged);
+  return trimTimelineWindow(visibleLiveTurnItemsForTimeline(finalHistoryWithRetainedOverlay, merged, { allowAssistantTextMatchAcrossSources: true }), limit);
 }
 
 export function timelineItemsWithLiveTurnOverlay(items: TimelineItem[], liveItems: TimelineItem[], activeTurnId: string | null | undefined): TimelineItem[] {
