@@ -1,5 +1,6 @@
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, ChevronRight, Clipboard, Download, Eye, File, FilePlus, Folder, FolderOpen, FolderPlus, Pencil, RefreshCw, Upload } from 'lucide-react';
+import { ChevronDown, ChevronRight, Clipboard, Download, ExternalLink, Eye, File, FilePlus, Folder, FolderOpen, FolderPlus, Pencil, RefreshCw, Upload } from 'lucide-react';
+import { fileRawUrl, isRawBrowserOpenablePath } from '../lib/filePreview';
 
 type Rpc = <T>(method: string, params?: unknown, timeoutMs?: number) => Promise<T>;
 
@@ -282,6 +283,11 @@ export default function FileExplorerPanel({ root, rpc, onOpenFile }: FileExplore
                 <button className="file-compact" type="button" onClick={() => onOpenFile(entry.path, true)} title="View file" aria-label={`View ${entry.name}`}>
                   <Eye size={13} aria-hidden="true" />
                 </button>
+                {isRawBrowserOpenablePath(entry.path) && (
+                  <a className="file-compact" href={fileRawUrl(entry.path)} target="_blank" rel="noreferrer" title="Open raw file in browser" aria-label={`Open ${entry.name} in browser`}>
+                    <ExternalLink size={13} aria-hidden="true" />
+                  </a>
+                )}
                 <a className="file-compact" href={`/api/download?path=${encodeURIComponent(entry.path)}`} title="Download file" aria-label={`Download ${entry.name}`}>
                   <Download size={13} aria-hidden="true" />
                 </a>

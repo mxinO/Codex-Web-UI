@@ -177,4 +177,17 @@ describe('FileEditorModal', () => {
     expect(Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Preview')).toBe(false);
     expect(document.body.textContent).toContain('Preview disabled for large Markdown files.');
   });
+
+  it('shows a raw browser link for read-only browser-openable files', async () => {
+    render(<FileEditorModal path="/repo/report.html" initialContent="<h1>Report</h1>" sizeBytes={15} readOnly onClose={vi.fn()} onSave={vi.fn()} />);
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const link = document.querySelector<HTMLAnchorElement>('a[aria-label="Open /repo/report.html in browser"]');
+    expect(link?.getAttribute('href')).toBe('/api/file/raw?path=%2Frepo%2Freport.html');
+    expect(link?.getAttribute('target')).toBe('_blank');
+    expect(link?.getAttribute('rel')).toBe('noreferrer');
+  });
 });

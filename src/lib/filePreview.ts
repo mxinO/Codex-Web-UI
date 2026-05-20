@@ -1,4 +1,5 @@
 const IMAGE_EXTENSIONS = new Set(['.avif', '.bmp', '.gif', '.ico', '.jpeg', '.jpg', '.png', '.svg', '.webp']);
+const RAW_BROWSER_EXTENSIONS = new Set(['.htm', '.html', '.pdf']);
 
 export function normalizeMentionedFilePath(path: string): string {
   return path.trim().replace(/:\d+(?::\d+)?$/, '');
@@ -11,8 +12,19 @@ export function isImagePath(path: string): boolean {
   return IMAGE_EXTENSIONS.has(normalized.slice(dotIndex));
 }
 
+export function isRawBrowserOpenablePath(path: string): boolean {
+  const normalized = path.toLowerCase();
+  const dotIndex = normalized.lastIndexOf('.');
+  if (dotIndex < 0) return false;
+  return RAW_BROWSER_EXTENSIONS.has(normalized.slice(dotIndex));
+}
+
 export function filePreviewUrl(path: string): string {
   return `/api/file?path=${encodeURIComponent(path)}`;
+}
+
+export function fileRawUrl(path: string): string {
+  return `/api/file/raw?path=${encodeURIComponent(path)}`;
 }
 
 export function fileDownloadUrl(path: string): string {

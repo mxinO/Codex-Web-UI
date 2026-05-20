@@ -9,6 +9,7 @@ import { readConfig } from './config.js';
 import { createFileContentHandler } from './fileContent.js';
 import { createFileDownloadHandler } from './fileDownload.js';
 import { createFilePreviewHandler } from './filePreview.js';
+import { createFileRawHandler } from './fileRaw.js';
 import { writeFileInsideRoot } from './fileTransfer.js';
 import { HostStateStore } from './hostState.js';
 import { configureLogger, logError, logInfo, logWarn } from './logger.js';
@@ -77,6 +78,9 @@ const fileContentHandler = createFileContentHandler({ authorized, getActiveCwd }
 app.head('/api/file/content', fileContentHandler);
 app.get('/api/file/content', fileContentHandler);
 app.get('/api/file', createFilePreviewHandler({ authorized, getActiveCwd }));
+const fileRawHandler = createFileRawHandler({ authorized, getActiveCwd });
+app.head('/api/file/raw', fileRawHandler);
+app.get('/api/file/raw', fileRawHandler);
 const fileDownloadHandler = createFileDownloadHandler({ authorized, getActiveCwd });
 app.head('/api/download', fileDownloadHandler);
 app.get('/api/download', fileDownloadHandler);

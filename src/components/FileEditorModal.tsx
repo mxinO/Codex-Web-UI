@@ -1,4 +1,6 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
+import { ExternalLink } from 'lucide-react';
+import { fileRawUrl, isRawBrowserOpenablePath } from '../lib/filePreview';
 
 const MonacoEditor = lazy(() => import('@monaco-editor/react'));
 const MarkdownView = lazy(() => import('./MarkdownView'));
@@ -141,6 +143,7 @@ export default function FileEditorModal({ path, initialContent, sizeBytes, readO
   const theme = document.documentElement.dataset.theme === 'light' ? 'light' : 'vs-dark';
   const language = useMemo(() => languageForPath(path), [path]);
   const isMarkdown = language === 'markdown';
+  const rawOpenable = readOnly && isRawBrowserOpenablePath(path);
   const markdownPreviewAllowed = !isMarkdown || sizeBytes === null || sizeBytes === undefined || sizeBytes <= MARKDOWN_PREVIEW_MAX_BYTES;
 
   useEffect(() => {
@@ -188,6 +191,11 @@ export default function FileEditorModal({ path, initialContent, sizeBytes, readO
               </div>
             )}
             {readOnly && isMarkdown && !markdownPreviewAllowed && <span className="file-editor-note">Preview disabled for large Markdown files.</span>}
+            {rawOpenable && (
+              <a className="text-button file-editor-raw-link" href={fileRawUrl(path)} target="_blank" rel="noreferrer" title="Open raw file in browser" aria-label={`Open ${path} in browser`}>
+                <ExternalLink size={14} aria-hidden="true" />
+              </a>
+            )}
             {!readOnly && (
               <button className="text-button primary" type="button" onClick={() => void save()} disabled={!dirty || saving}>
                 {saving ? 'Saving...' : 'Save'}

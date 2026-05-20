@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { fileDownloadUrl, filePreviewUrl, isImagePath, normalizeMentionedFilePath } from '../../src/lib/filePreview';
+import { fileDownloadUrl, filePreviewUrl, fileRawUrl, isImagePath, isRawBrowserOpenablePath, normalizeMentionedFilePath } from '../../src/lib/filePreview';
 import { markdownFileHrefPath, splitFileMentions } from '../../src/lib/fileMentions';
 
 describe('file preview helpers', () => {
@@ -19,6 +19,14 @@ describe('file preview helpers', () => {
     expect(filePreviewUrl('/repo/plots/output image.png')).toBe('/api/file?path=%2Frepo%2Fplots%2Foutput%20image.png');
     expect(filePreviewUrl('/repo/plots/output.png:12')).toBe('/api/file?path=%2Frepo%2Fplots%2Foutput.png%3A12');
     expect(fileDownloadUrl('/repo/data/report.txt:12')).toBe('/api/download?path=%2Frepo%2Fdata%2Freport.txt%3A12');
+  });
+
+  it('detects browser-openable raw files and builds raw URLs', () => {
+    expect(isRawBrowserOpenablePath('/repo/report.HTML')).toBe(true);
+    expect(isRawBrowserOpenablePath('/repo/paper.pdf')).toBe(true);
+    expect(isRawBrowserOpenablePath('/repo/src/App.tsx')).toBe(false);
+    expect(isRawBrowserOpenablePath('/repo/paper.pdf:12')).toBe(false);
+    expect(fileRawUrl('/repo/reports/a b.html')).toBe('/api/file/raw?path=%2Frepo%2Freports%2Fa%20b.html');
   });
 });
 
