@@ -183,6 +183,47 @@ describe('ChatItem details', () => {
     expect(onOpenMentionedFile).toHaveBeenNthCalledWith(2, 'docs/guide.md');
   });
 
+  it('opens browser-native message file links in a new raw tab', async () => {
+    const onOpenMentionedFile = vi.fn();
+    const item: TimelineItem = {
+      id: 'a1',
+      kind: 'assistant',
+      timestamp: 1,
+      text: 'Open reports/summary.pdf, [report](reports/index.html), and src/App.tsx.',
+      phase: null,
+    };
+
+    render(
+      <ChatItem
+        item={item}
+        onOpenDetail={vi.fn()}
+        onApprovalDecision={onApprovalDecision}
+        onOpenMentionedFile={onOpenMentionedFile}
+      />,
+    );
+
+    await act(async () => {
+      await import('../../src/components/MarkdownView');
+    });
+    await flushLazy();
+
+    const rawLinks = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href^="/api/file/raw"]'));
+    expect(rawLinks.map((link) => [link.textContent, link.getAttribute('href'), link.getAttribute('target'), link.getAttribute('rel')])).toEqual([
+      ['reports/summary.pdf', '/api/file/raw?path=reports%2Fsummary.pdf', '_blank', 'noreferrer'],
+      ['report', '/api/file/raw?path=reports%2Findex.html', '_blank', 'noreferrer'],
+    ]);
+
+    const viewerLinks = Array.from(document.querySelectorAll<HTMLButtonElement>('.markdown-file-link'));
+    expect(viewerLinks.map((link) => link.textContent)).toEqual(['src/App.tsx']);
+
+    act(() => {
+      viewerLinks[0].click();
+    });
+
+    expect(onOpenMentionedFile).toHaveBeenCalledTimes(1);
+    expect(onOpenMentionedFile).toHaveBeenCalledWith('src/App.tsx');
+  });
+
   it('opens streaming file mentions through the same viewer callback', async () => {
     const onOpenMentionedFile = vi.fn();
     const item: TimelineItem = { id: 's1', kind: 'streaming', timestamp: 1, text: 'Review plots/output.png before replying.', active: true };

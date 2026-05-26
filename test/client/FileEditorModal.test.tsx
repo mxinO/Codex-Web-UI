@@ -158,6 +158,42 @@ describe('FileEditorModal', () => {
     expect(onOpenFile).toHaveBeenNthCalledWith(2, '/repo/src/App.tsx');
   });
 
+  it('resolves raw markdown preview links before opening them in the browser', async () => {
+    const onOpenFile = vi.fn();
+    render(
+      <FileEditorModal
+        path="/repo/docs/README.md"
+        initialContent="[Spec](./spec.pdf) and [Page](../site/index.html)"
+        sizeBytes={42}
+        readOnly
+        onClose={vi.fn()}
+        onSave={vi.fn()}
+        onOpenFile={onOpenFile}
+      />,
+    );
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const previewButton = Array.from(document.querySelectorAll('button')).find((button) => button.textContent === 'Preview');
+    act(() => {
+      previewButton?.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    });
+    await act(async () => {
+      await import('../../src/components/MarkdownView');
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    const rawLinks = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href^="/api/file/raw"]'));
+    expect(rawLinks.map((link) => [link.textContent, link.getAttribute('href'), link.getAttribute('target')])).toEqual([
+      ['Spec', '/api/file/raw?path=%2Frepo%2Fdocs%2Fspec.pdf', '_blank'],
+      ['Page', '/api/file/raw?path=%2Frepo%2Fsite%2Findex.html', '_blank'],
+    ]);
+    expect(onOpenFile).not.toHaveBeenCalled();
+  });
+
   it('disables markdown preview for large markdown files', async () => {
     render(
       <FileEditorModal

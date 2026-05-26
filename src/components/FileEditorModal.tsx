@@ -170,7 +170,7 @@ export default function FileEditorModal({ path, initialContent, sizeBytes, readO
       setSaving(false);
     }
   };
-  const openMarkdownLink = onOpenFile ? (linkedPath: string) => onOpenFile(resolveMarkdownLinkPath(path, linkedPath)) : undefined;
+  const resolveOpenFilePath = (linkedPath: string) => resolveMarkdownLinkPath(path, linkedPath);
 
   return (
     <div className="modal-overlay" role="presentation">
@@ -211,7 +211,7 @@ export default function FileEditorModal({ path, initialContent, sizeBytes, readO
           {readOnly && isMarkdown && markdownPreviewAllowed && viewMode === 'preview' ? (
             <Suspense fallback={<div className="detail-loading">Loading preview...</div>}>
               <div className="file-markdown-preview">
-                <MarkdownView content={content} onOpenFile={openMarkdownLink} />
+                <MarkdownView content={content} onOpenFile={onOpenFile} resolveFilePath={resolveOpenFilePath} />
               </div>
             </Suspense>
           ) : (

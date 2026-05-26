@@ -6,10 +6,12 @@ import rehypeKatex from 'rehype-katex';
 import rehypeHighlight from 'rehype-highlight';
 import 'katex/dist/katex.min.css';
 import { decodeFileMentionHref, FILE_MENTION_HREF_PREFIX, markdownFileHrefPath, remarkFileMentions } from '../lib/fileMentions';
+import { fileRawUrl, isRawBrowserOpenablePath } from '../lib/filePreview';
 
 interface MarkdownViewProps {
   content: string;
   onOpenFile?: (path: string) => void;
+  resolveFilePath?: (path: string) => string;
 }
 
 const REHYPE_PLUGINS = [rehypeKatex, rehypeHighlight];
@@ -218,7 +220,7 @@ export function normalizeLatexDelimiters(content: string): string {
   return result;
 }
 
-function MarkdownView({ content, onOpenFile }: MarkdownViewProps) {
+function MarkdownView({ content, onOpenFile, resolveFilePath }: MarkdownViewProps) {
   const remarkPlugins = useMemo(() => (onOpenFile ? [remarkGfm, remarkMath, remarkFileMentions] : [remarkGfm, remarkMath]), [Boolean(onOpenFile)]);
   const normalizedContent = useMemo(() => normalizeLatexDelimiters(content), [content]);
   const components = useMemo(
@@ -226,8 +228,16 @@ function MarkdownView({ content, onOpenFile }: MarkdownViewProps) {
       a: ({ href, children }: { href?: string; children?: ReactNode }) => {
         const mentionedPath = href ? decodeFileMentionHref(href) ?? markdownFileHrefPath(href) : null;
         if (mentionedPath && onOpenFile) {
+          const resolvedPath = resolveFilePath ? resolveFilePath(mentionedPath) : mentionedPath;
+          if (isRawBrowserOpenablePath(resolvedPath)) {
+            return (
+              <a href={fileRawUrl(resolvedPath)} target="_blank" rel="noreferrer" title={`Open ${resolvedPath} in browser`}>
+                {children}
+              </a>
+            );
+          }
           return (
-            <button className="markdown-file-link" type="button" title={`Open ${mentionedPath}`} onClick={() => onOpenFile(mentionedPath)}>
+            <button className="markdown-file-link" type="button" title={`Open ${resolvedPath}`} onClick={() => onOpenFile(resolvedPath)}>
               {children}
             </button>
           );
@@ -239,7 +249,7 @@ function MarkdownView({ content, onOpenFile }: MarkdownViewProps) {
         );
       },
     }),
-    [onOpenFile],
+    [onOpenFile, resolveFilePath],
   );
 
   return (
