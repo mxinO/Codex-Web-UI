@@ -446,7 +446,12 @@ export function mergeTimelineItemsByTimestamp(items: TimelineItem[]): TimelineIt
       let activityBeforeFinal = 0;
       if (sameTurn && isFinalAssistantTimelineItem(a.item) && isTurnActivityItem(b.item)) activityBeforeFinal = 1;
       else if (sameTurn && isTurnActivityItem(a.item) && isFinalAssistantTimelineItem(b.item)) activityBeforeFinal = -1;
-      return aTime - bTime || activityBeforeFinal || (aOrder ?? a.index) - (bOrder ?? b.index) || a.index - b.index;
+      const orderCompare = aOrder !== null && bOrder !== null ? aOrder - bOrder : 0;
+      const fallbackOrderCompare = (aOrder ?? a.index) - (bOrder ?? b.index);
+      if (sameTurn) {
+        return orderCompare || activityBeforeFinal || aTime - bTime || fallbackOrderCompare || a.index - b.index;
+      }
+      return aTime - bTime || fallbackOrderCompare || a.index - b.index;
     })
     .map(({ item }) => item);
 }
@@ -754,15 +759,21 @@ export function liveTurnItemsFromNotifications(
     timestamp = now,
     sortOrder: number | null = null,
   ) => {
+    const clearCompletedStreaming = () => {
+      streamingIndexes.delete(liveStreamingMessageKey(turnId, null));
+      if (sourceId) streamingIndexes.delete(liveStreamingMessageKey(turnId, sourceId));
+      deltaIndex = null;
+    };
     const previous = items.at(-1);
     if (previous?.kind === 'assistant' && shouldReplaceLiveAssistantSnapshot(previous, text, phase, turnId, sourceId)) {
       items[items.length - 1] = { ...previous, text, phase, turnId, sourceId, liveSource };
+      clearCompletedStreaming();
       return;
     }
 
     sequence += 1;
     const id = liveAssistantItemId(turnId, sourceId, sequence);
-    const index = rememberItem({
+    rememberItem({
       id,
       kind: 'assistant',
       timestamp,
@@ -773,8 +784,7 @@ export function liveTurnItemsFromNotifications(
       sourceId,
       liveSource,
     });
-    if (sourceId) streamingIndexes.delete(liveStreamingMessageKey(turnId, sourceId));
-    if (deltaIndex === index) deltaIndex = null;
+    clearCompletedStreaming();
   };
 
   const appendDelta = (delta: string, turnId: string | null, sourceId: string | null, timestamp: number, sortOrder: number | null) => {
@@ -887,7 +897,7 @@ export function liveTurnItemsFromNotifications(
   }
   if (lastStreamingIndex >= 0) {
     const item = items[lastStreamingIndex];
-    if (item.kind === 'streaming') items[lastStreamingIndex] = { ...item, active };
+    if (item.kind === 'streaming') items[lastStreamingIndex] = { ...item, active: active && deltaIndex === lastStreamingIndex };
   }
 
   return items;
@@ -1379,13 +1389,17 @@ export function liveStreamingItemFromNotifications(
 ): Extract<TimelineItem, { kind: 'streaming' }> | null {
   let text = '';
   let turnId: string | null = null;
+  let streamOpen = false;
   const acceptUnscoped = options.acceptUnscoped ?? active;
 
   for (const notification of notifications) {
     if (!isRecord(notification) || typeof notification.method !== 'string') continue;
 
     if (TERMINAL_NOTIFICATION_METHODS.has(notification.method)) {
-      if (notificationMatchesActiveTurn(notification, scope)) turnId = notificationTurnId(notification) ?? turnId;
+      if (notificationMatchesActiveTurn(notification, scope)) {
+        turnId = notificationTurnId(notification) ?? turnId;
+        streamOpen = false;
+      }
       continue;
     }
 
@@ -1394,6 +1408,7 @@ export function liveStreamingItemFromNotifications(
       const delta = notification.params.delta;
       if (typeof delta === 'string') text += delta;
       turnId = notificationTurnId(notification) ?? turnId;
+      streamOpen = true;
       continue;
     }
 
@@ -1401,7 +1416,10 @@ export function liveStreamingItemFromNotifications(
     const payload = notificationPayload(notification);
     if (!isRecord(payload)) continue;
     if (typeof payload.type === 'string' && TERMINAL_EVENT_TYPES.has(payload.type)) {
-      if (notificationIsTurnComplete(notification, scope)) turnId = notificationTurnId(notification) ?? turnId;
+      if (notificationIsTurnComplete(notification, scope)) {
+        turnId = notificationTurnId(notification) ?? turnId;
+        streamOpen = false;
+      }
       continue;
     }
     if (payload.type !== 'agent_message') continue;
@@ -1411,6 +1429,7 @@ export function liveStreamingItemFromNotifications(
     const message = payload.message;
     if (typeof message === 'string' && message.trim()) text = text ? `${text}\n\n${message}` : message;
     turnId = notificationTurnId(notification) ?? turnId;
+    streamOpen = true;
   }
 
   if (!text && !active) return null;
@@ -1420,7 +1439,7 @@ export function liveStreamingItemFromNotifications(
     kind: 'streaming',
     timestamp: now,
     text,
-    active,
+    active: active && streamOpen,
     turnId,
   };
 }

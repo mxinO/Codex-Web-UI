@@ -14,7 +14,23 @@ export const FILE_RAW_CSP = [
     "script-src 'none'",
     "style-src 'self' 'unsafe-inline'",
 ].join('; ');
+export const FILE_RAW_TRUSTED_HTML_CSP = [
+    "default-src 'none'",
+    "base-uri 'none'",
+    "connect-src 'none'",
+    "font-src 'self' data:",
+    "form-action 'none'",
+    "frame-ancestors 'none'",
+    "img-src 'self' data: blob:",
+    "media-src 'self' data: blob:",
+    "object-src 'none'",
+    "script-src 'unsafe-inline'",
+    "style-src 'self' 'unsafe-inline'",
+    "worker-src 'none'",
+    "sandbox allow-scripts allow-downloads",
+].join('; ');
 const RAW_BROWSER_EXTENSIONS = new Set(['.htm', '.html', '.pdf']);
+const RAW_TRUSTED_HTML_EXTENSIONS = new Set(['.htm', '.html']);
 function getQueryPath(req) {
     return typeof req.query.path === 'string' && req.query.path.trim() ? req.query.path : null;
 }
@@ -37,6 +53,13 @@ function contentDispositionHeader(filePath) {
 }
 function isRawBrowserOpenablePath(filePath) {
     return RAW_BROWSER_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
+function isTrustedHtmlPath(filePath) {
+    return RAW_TRUSTED_HTML_EXTENSIONS.has(path.extname(filePath).toLowerCase());
+}
+function wantsTrustedHtml(req) {
+    const value = req.query.trusted;
+    return value === '1' || value === 'true';
 }
 function parseRangeHeader(rawRange, size) {
     if (!rawRange)
@@ -90,6 +113,7 @@ export function createFileRawHandler(options) {
             const start = range?.start ?? 0;
             const end = range?.end ?? Math.max(0, opened.stats.size - 1);
             const contentLength = opened.stats.size === 0 ? 0 : end - start + 1;
+            const trustedHtml = wantsTrustedHtml(req) && isTrustedHtmlPath(opened.realPath);
             if (range) {
                 res.status(206);
                 res.setHeader('Content-Range', `bytes ${start}-${end}/${opened.stats.size}`);
@@ -97,7 +121,7 @@ export function createFileRawHandler(options) {
             res.setHeader('Accept-Ranges', 'bytes');
             res.setHeader('Content-Disposition', contentDispositionHeader(opened.realPath));
             res.setHeader('Content-Length', String(contentLength));
-            res.setHeader('Content-Security-Policy', FILE_RAW_CSP);
+            res.setHeader('Content-Security-Policy', trustedHtml ? FILE_RAW_TRUSTED_HTML_CSP : FILE_RAW_CSP);
             res.setHeader('Last-Modified', opened.stats.mtime.toUTCString());
             res.setHeader('Cache-Control', 'no-store');
             res.setHeader('X-Content-Type-Options', 'nosniff');

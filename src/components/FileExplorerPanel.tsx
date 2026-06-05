@@ -1,6 +1,6 @@
 import { ChangeEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronDown, ChevronRight, Clipboard, Download, ExternalLink, Eye, File, FilePlus, Folder, FolderOpen, FolderPlus, Pencil, RefreshCw, Upload } from 'lucide-react';
-import { fileRawUrl, isRawBrowserOpenablePath } from '../lib/filePreview';
+import { ChevronDown, ChevronRight, Clipboard, Download, ExternalLink, Eye, File, FileCode, FilePlus, Folder, FolderOpen, FolderPlus, Pencil, RefreshCw, Upload } from 'lucide-react';
+import { fileRawUrl, fileTrustedHtmlUrl, isRawBrowserOpenablePath, isTrustedHtmlPath } from '../lib/filePreview';
 
 type Rpc = <T>(method: string, params?: unknown, timeoutMs?: number) => Promise<T>;
 
@@ -286,6 +286,11 @@ export default function FileExplorerPanel({ root, rpc, onOpenFile }: FileExplore
                 {isRawBrowserOpenablePath(entry.path) && (
                   <a className="file-compact" href={fileRawUrl(entry.path)} target="_blank" rel="noreferrer" title="Open raw file in browser" aria-label={`Open ${entry.name} in browser`}>
                     <ExternalLink size={13} aria-hidden="true" />
+                  </a>
+                )}
+                {isTrustedHtmlPath(entry.path) && (
+                  <a className="file-compact" href={fileTrustedHtmlUrl(entry.path)} target="_blank" rel="noreferrer" title="Open trusted HTML with scripts" aria-label={`Open ${entry.name} as trusted HTML`}>
+                    <FileCode size={13} aria-hidden="true" />
                   </a>
                 )}
                 <a className="file-compact" href={`/api/download?path=${encodeURIComponent(entry.path)}`} title="Download file" aria-label={`Download ${entry.name}`}>

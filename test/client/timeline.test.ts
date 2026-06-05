@@ -321,6 +321,57 @@ describe('timeline', () => {
     expect(mergeTimelineItemsByTimestamp([queued, bang, live]).map((item) => item.id)).toEqual(['live-1', 'bang-1', 'queued-1']);
   });
 
+  it('uses notification sortOrder before timestamps inside the same turn', () => {
+    const first: TimelineItem = {
+      id: 'turn-1:a1',
+      kind: 'assistant',
+      timestamp: 5000,
+      sortOrder: 1,
+      text: 'I will inspect that.',
+      phase: 'commentary',
+      turnId: 'turn-1',
+    };
+    const second: TimelineItem = {
+      id: 'turn-1:cmd-1',
+      kind: 'command',
+      timestamp: 1000,
+      sortOrder: 2,
+      command: 'pwd',
+      cwd: '/repo',
+      output: '/repo\n',
+      status: 'completed',
+      exitCode: 0,
+      turnId: 'turn-1',
+    };
+
+    expect(mergeTimelineItemsByTimestamp([second, first]).map((item) => item.id)).toEqual(['turn-1:a1', 'turn-1:cmd-1']);
+  });
+
+  it('keeps same-turn activity before a persisted final assistant even when live activity has a later timestamp', () => {
+    const final: TimelineItem = {
+      id: 'turn-1:final',
+      kind: 'assistant',
+      timestamp: 1000,
+      text: 'Done.',
+      phase: 'final_answer',
+      turnId: 'turn-1',
+    };
+    const command: TimelineItem = {
+      id: 'turn-1:cmd-1',
+      kind: 'command',
+      timestamp: 5000,
+      sortOrder: 2,
+      command: 'pwd',
+      cwd: '/repo',
+      output: '/repo\n',
+      status: 'completed',
+      exitCode: 0,
+      turnId: 'turn-1',
+    };
+
+    expect(mergeTimelineItemsByTimestamp([final, command]).map((item) => item.id)).toEqual(['turn-1:cmd-1', 'turn-1:final']);
+  });
+
   it('does not apply same-turn final/activity ordering to unscoped items', () => {
     const final: TimelineItem = { id: 'unscoped-final', kind: 'assistant', timestamp: 1000, sortOrder: 1, text: 'Done.', phase: 'final_answer' };
     const command: TimelineItem = {
@@ -552,6 +603,100 @@ describe('timeline', () => {
 
     expect(liveItems.map((item) => item.kind)).toEqual(['streaming', 'assistant']);
     expect(visibleLiveTurnItemsForTimeline([], liveItems).map((item) => item.kind)).toEqual(['assistant']);
+  });
+
+  it('does not keep a source-less delta card active after the finalized assistant item arrives', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'Created the fi' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'a1', text: 'Created the file.', phase: 'final_answer' },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      100,
+    );
+
+    expect(liveItems[0]).toMatchObject({ kind: 'streaming', active: false });
+    expect(visibleLiveTurnItemsForTimeline([], liveItems).map((item) => item.kind)).toEqual(['assistant']);
+  });
+
+  it('marks the streaming card inactive after a terminal notification even before state catches up', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'Done' } },
+        { method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-1' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      100,
+    );
+
+    expect(liveItems).toHaveLength(1);
+    expect(liveItems[0]).toMatchObject({ kind: 'streaming', text: 'Done', active: false });
+  });
+
+  it('starts a fresh source-less streaming card after a completed assistant item', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'First' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'a1', text: 'First finalized.', phase: 'commentary' },
+          },
+        },
+        { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'Second' } },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      100,
+    );
+
+    expect(liveItems.map((item) => item.kind)).toEqual(['streaming', 'assistant', 'streaming']);
+    expect(liveItems.map((item) => (item.kind === 'streaming' ? `${item.text}:${item.active}` : item.kind === 'assistant' ? item.text : item.id))).toEqual([
+      'First:false',
+      'First finalized.',
+      'Second:true',
+    ]);
+  });
+
+  it('marks a delta card inactive while later activity is running', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'I will inspect the file.' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: {
+              type: 'commandExecution',
+              id: 'cmd-1',
+              command: 'pwd',
+              cwd: '/repo',
+              status: 'completed',
+              aggregatedOutput: '/repo\n',
+              exitCode: 0,
+            },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      100,
+    );
+
+    expect(liveItems.map((item) => item.kind)).toEqual(['streaming', 'command']);
+    expect(liveItems[0]).toMatchObject({ kind: 'streaming', active: false });
   });
 
   it('replaces a split streaming card with its finalized message across intervening activity', () => {

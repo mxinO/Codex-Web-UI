@@ -79,6 +79,48 @@ describe('ChatItem details', () => {
     expect(document.querySelector('.markdown-body code')?.textContent).toBe('\\(literal\\)');
   });
 
+  it('renders LaTeX fenced code blocks with KaTeX', async () => {
+    const item: TimelineItem = {
+      id: 'a1',
+      kind: 'assistant',
+      timestamp: 1,
+      text: '```latex\n\\[\n\\int_0^1 x^2\\,dx = \\frac{1}{3}\n\\]\n```\n\n```math\nE=mc^2\n```',
+      phase: null,
+    };
+
+    render(<ChatItem item={item} onOpenDetail={vi.fn()} onApprovalDecision={onApprovalDecision} />);
+
+    await act(async () => {
+      await import('../../src/components/MarkdownView');
+    });
+    await flushLazy();
+
+    expect(document.querySelectorAll('.markdown-body .katex-display').length).toBeGreaterThanOrEqual(2);
+    expect(document.querySelectorAll('.markdown-latex-block .katex-display')).toHaveLength(1);
+    expect(document.querySelector('.markdown-body pre')).toBeNull();
+    expect(document.querySelector('.markdown-body code')).toBeNull();
+  });
+
+  it('renders unlabeled fenced display math while preserving normal code fences', async () => {
+    const item: TimelineItem = {
+      id: 'a1',
+      kind: 'assistant',
+      timestamp: 1,
+      text: '```\n$$\na^2+b^2=c^2\n$$\n```\n\n```\nconst value = \"not math\";\n```',
+      phase: null,
+    };
+
+    render(<ChatItem item={item} onOpenDetail={vi.fn()} onApprovalDecision={onApprovalDecision} />);
+
+    await act(async () => {
+      await import('../../src/components/MarkdownView');
+    });
+    await flushLazy();
+
+    expect(document.querySelectorAll('.markdown-latex-block .katex-display')).toHaveLength(1);
+    expect(document.querySelector('.markdown-body pre code')?.textContent).toContain('const value');
+  });
+
   it('keeps LaTeX-like delimiters literal in markdown destinations and fenced code', async () => {
     const onOpenMentionedFile = vi.fn();
     const item: TimelineItem = {

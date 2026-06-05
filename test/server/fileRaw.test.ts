@@ -4,7 +4,7 @@ import http from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { createFileRawHandler, FILE_RAW_CSP } from '../../server/fileRaw.js';
+import { createFileRawHandler, FILE_RAW_CSP, FILE_RAW_TRUSTED_HTML_CSP } from '../../server/fileRaw.js';
 
 interface TestServer {
   baseUrl: string;
@@ -110,6 +110,36 @@ describe('raw browser file endpoint', () => {
       expect(response.headers.get('cache-control')).toBe('no-store');
       expect(response.headers.get('content-type')).toContain('text/html');
       expect(await response.text()).toContain('<title>Report</title>');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('serves explicitly trusted HTML with sandboxed script support', async () => {
+    const { root } = makeWorkspace();
+    const server = await listen(makeApp({ root }));
+    try {
+      const response = await fetch(`${server.baseUrl}/api/file/raw?path=docs%2Freport.html&trusted=1`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-security-policy')).toBe(FILE_RAW_TRUSTED_HTML_CSP);
+      expect(response.headers.get('content-security-policy')).toContain("script-src 'unsafe-inline'");
+      expect(response.headers.get('content-security-policy')).toContain('sandbox allow-scripts');
+      expect(response.headers.get('content-security-policy')).not.toContain('allow-same-origin');
+      expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+      expect(await response.text()).toContain('<script>alert(1)</script>');
+    } finally {
+      await server.close();
+    }
+  });
+
+  it('does not switch PDFs to trusted HTML mode', async () => {
+    const { root } = makeWorkspace();
+    const server = await listen(makeApp({ root }));
+    try {
+      const response = await fetch(`${server.baseUrl}/api/file/raw?path=docs%2Fpaper.pdf&trusted=1`);
+      expect(response.status).toBe(200);
+      expect(response.headers.get('content-security-policy')).toBe(FILE_RAW_CSP);
+      expect(response.headers.get('content-type')).toContain('application/pdf');
     } finally {
       await server.close();
     }

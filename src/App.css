@@ -2477,6 +2477,12 @@ button.activity-card:focus-visible {
   white-space: pre;
 }
 
+.markdown-latex-block {
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
 .markdown-body .katex-display {
   max-width: 100%;
   overflow-x: auto;

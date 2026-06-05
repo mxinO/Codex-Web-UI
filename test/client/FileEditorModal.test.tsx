@@ -225,5 +225,10 @@ describe('FileEditorModal', () => {
     expect(link?.getAttribute('href')).toBe('/api/file/raw?path=%2Frepo%2Freport.html');
     expect(link?.getAttribute('target')).toBe('_blank');
     expect(link?.getAttribute('rel')).toBe('noreferrer');
+
+    const trustedLink = document.querySelector<HTMLAnchorElement>('a[aria-label="Open /repo/report.html as trusted HTML"]');
+    expect(trustedLink?.getAttribute('href')).toBe('/api/file/raw?path=%2Frepo%2Freport.html&trusted=1');
+    expect(trustedLink?.getAttribute('target')).toBe('_blank');
+    expect(trustedLink?.getAttribute('rel')).toBe('noreferrer');
   });
 });

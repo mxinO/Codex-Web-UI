@@ -51,6 +51,12 @@ function buttonByLabel(label: string): HTMLButtonElement {
   return button;
 }
 
+function linkByLabel(label: string): HTMLAnchorElement {
+  const link = document.querySelector<HTMLAnchorElement>(`a[aria-label="${label}"]`);
+  if (!link) throw new Error(`missing link ${label}`);
+  return link;
+}
+
 afterEach(() => {
   act(() => {
     root?.unmount();
@@ -228,5 +234,23 @@ describe('FileExplorer', () => {
 
     expect(explorer?.style.getPropertyValue('--file-explorer-width')).toBe(`${initialWidth + 16}px`);
     expect(handle?.getAttribute('aria-valuenow')).toBe(String(initialWidth + 16));
+  });
+
+  it('shows a separate trusted HTML raw action for browser-openable HTML files', async () => {
+    const rpc = vi.fn().mockResolvedValue({
+      entries: [
+        { name: 'report.html', path: '/repo-a/report.html', isFile: true },
+        { name: 'paper.pdf', path: '/repo-a/paper.pdf', isFile: true },
+      ],
+    });
+    renderFileExplorer(asRpc(rpc), '/repo-a');
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(linkByLabel('Open report.html in browser').getAttribute('href')).toBe('/api/file/raw?path=%2Frepo-a%2Freport.html');
+    expect(linkByLabel('Open report.html as trusted HTML').getAttribute('href')).toBe('/api/file/raw?path=%2Frepo-a%2Freport.html&trusted=1');
+    expect(linkByLabel('Open paper.pdf in browser').getAttribute('href')).toBe('/api/file/raw?path=%2Frepo-a%2Fpaper.pdf');
+    expect(document.querySelector('a[aria-label="Open paper.pdf as trusted HTML"]')).toBeNull();
   });
 });

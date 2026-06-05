@@ -1,5 +1,14 @@
 import { describe, expect, it } from 'vitest';
-import { fileDownloadUrl, filePreviewUrl, fileRawUrl, isImagePath, isRawBrowserOpenablePath, normalizeMentionedFilePath } from '../../src/lib/filePreview';
+import {
+  fileDownloadUrl,
+  filePreviewUrl,
+  fileRawUrl,
+  fileTrustedHtmlUrl,
+  isImagePath,
+  isRawBrowserOpenablePath,
+  isTrustedHtmlPath,
+  normalizeMentionedFilePath,
+} from '../../src/lib/filePreview';
 import { markdownFileHrefPath, splitFileMentions } from '../../src/lib/fileMentions';
 
 describe('file preview helpers', () => {
@@ -26,7 +35,11 @@ describe('file preview helpers', () => {
     expect(isRawBrowserOpenablePath('/repo/paper.pdf')).toBe(true);
     expect(isRawBrowserOpenablePath('/repo/src/App.tsx')).toBe(false);
     expect(isRawBrowserOpenablePath('/repo/paper.pdf:12')).toBe(false);
+    expect(isTrustedHtmlPath('/repo/report.HTML')).toBe(true);
+    expect(isTrustedHtmlPath('/repo/paper.pdf')).toBe(false);
     expect(fileRawUrl('/repo/reports/a b.html')).toBe('/api/file/raw?path=%2Frepo%2Freports%2Fa%20b.html');
+    expect(fileTrustedHtmlUrl('/repo/reports/a b.html')).toBe('/api/file/raw?path=%2Frepo%2Freports%2Fa%20b.html&trusted=1');
+    expect(fileTrustedHtmlUrl('/repo/paper.pdf')).toBe('/api/file/raw?path=%2Frepo%2Fpaper.pdf');
   });
 });
 

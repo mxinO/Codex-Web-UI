@@ -1,9 +1,10 @@
-import { memo, useMemo, type ReactNode } from 'react';
+import { isValidElement, memo, useMemo, type ReactNode } from 'react';
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeKatex from 'rehype-katex';
 import rehypeHighlight from 'rehype-highlight';
+import katex from 'katex';
 import 'katex/dist/katex.min.css';
 import { decodeFileMentionHref, FILE_MENTION_HREF_PREFIX, markdownFileHrefPath, remarkFileMentions } from '../lib/fileMentions';
 import { fileRawUrl, isRawBrowserOpenablePath } from '../lib/filePreview';
@@ -15,9 +16,98 @@ interface MarkdownViewProps {
 }
 
 const REHYPE_PLUGINS = [rehypeKatex, rehypeHighlight];
+const LATEX_CODE_LANGUAGES = new Set(['katex', 'latex', 'math', 'tex']);
 
 function markdownUrlTransform(url: string): string {
   return url.startsWith(FILE_MENTION_HREF_PREFIX) ? url : defaultUrlTransform(url);
+}
+
+function textFromReactNode(node: ReactNode): string {
+  if (typeof node === 'string' || typeof node === 'number') return String(node);
+  if (Array.isArray(node)) return node.map(textFromReactNode).join('');
+  if (typeof node === 'object' && node !== null && 'props' in node) {
+    return textFromReactNode((node as { props?: { children?: ReactNode } }).props?.children);
+  }
+  return '';
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function textFromHastNode(node: unknown): string {
+  if (!isRecord(node)) return '';
+  if (typeof node.value === 'string') return node.value;
+  return Array.isArray(node.children) ? node.children.map(textFromHastNode).join('') : '';
+}
+
+function classNameFromHastNode(node: unknown): string | undefined {
+  if (!isRecord(node) || !isRecord(node.properties)) return undefined;
+  const className = node.properties.className;
+  if (typeof className === 'string') return className;
+  if (Array.isArray(className)) return className.filter((value): value is string => typeof value === 'string').join(' ');
+  return undefined;
+}
+
+function codeChildFromPreNode(node: unknown): unknown {
+  if (!isRecord(node) || !Array.isArray(node.children)) return null;
+  return node.children.find((child) => isRecord(child) && child.tagName === 'code') ?? null;
+}
+
+function codeLanguage(className: string | undefined): string | null {
+  const match = /(?:^|\s)language-([^\s]+)/.exec(className ?? '');
+  return match?.[1]?.toLowerCase() ?? null;
+}
+
+function stripDisplayMathDelimiters(source: string): string {
+  const trimmed = source.trim();
+  if (trimmed.startsWith('\\[') && trimmed.endsWith('\\]')) return trimmed.slice(2, -2).trim();
+  if (trimmed.startsWith('$$') && trimmed.endsWith('$$')) return trimmed.slice(2, -2).trim();
+  return trimmed;
+}
+
+function isDisplayMathOnly(source: string): boolean {
+  const trimmed = source.trim();
+  if (!trimmed) return false;
+  if (trimmed.startsWith('\\[') && trimmed.endsWith('\\]')) return true;
+  if (trimmed.startsWith('$$') && trimmed.endsWith('$$')) return true;
+  return /^\\begin\{[A-Za-z*]+\}[\s\S]*\\end\{[A-Za-z*]+\}$/.test(trimmed);
+}
+
+function latexBlockHtml(source: string, language: string | null): string | null {
+  const isLabeledLatex = language !== null && LATEX_CODE_LANGUAGES.has(language);
+  if (!isLabeledLatex && !isDisplayMathOnly(source)) return null;
+  const expression = stripDisplayMathDelimiters(source);
+  if (!expression) return null;
+  return katex.renderToString(expression, {
+    displayMode: true,
+    strict: false,
+    throwOnError: false,
+    trust: false,
+  });
+}
+
+function isLatexBlockElement(node: ReactNode): boolean {
+  return isValidElement(node) && typeof node.props?.className === 'string' && node.props.className.split(/\s+/).includes('markdown-latex-block');
+}
+
+function onlyMeaningfulChild(node: ReactNode): ReactNode {
+  if (!Array.isArray(node)) return node;
+  const meaningful = node.filter((child) => !(typeof child === 'string' && child.trim() === ''));
+  return meaningful.length === 1 ? meaningful[0] : node;
+}
+
+function latexBlockFromPreChild(node: ReactNode): ReactNode | null {
+  const child = onlyMeaningfulChild(node);
+  if (isLatexBlockElement(child)) return child;
+  if (isValidElement(child)) return latexBlockFromPreChild(child.props?.children);
+  return null;
+}
+
+function latexBlockHtmlFromPreNode(node: unknown): string | null {
+  const codeNode = codeChildFromPreNode(node);
+  if (!codeNode) return null;
+  return latexBlockHtml(textFromHastNode(codeNode), codeLanguage(classNameFromHastNode(codeNode)));
 }
 
 function previousCharIsBackslash(value: string, index: number): boolean {
@@ -247,6 +337,28 @@ function MarkdownView({ content, onOpenFile, resolveFilePath }: MarkdownViewProp
             {children}
           </a>
         );
+      },
+      code: ({ inline, className, children, node: _node, ...props }: { inline?: boolean; className?: string; children?: ReactNode; node?: unknown }) => {
+        if (!inline) {
+          const html = latexBlockHtml(textFromReactNode(children), codeLanguage(className));
+          if (html) {
+            return <div className="markdown-latex-block" dangerouslySetInnerHTML={{ __html: html }} />;
+          }
+        }
+        return (
+          <code className={className} {...props}>
+            {children}
+          </code>
+        );
+      },
+      pre: ({ children, node, ...props }: { children?: ReactNode; node?: unknown }) => {
+        const html = latexBlockHtmlFromPreNode(node);
+        if (html) {
+          return <div className="markdown-latex-block" dangerouslySetInnerHTML={{ __html: html }} />;
+        }
+        const latexBlock = latexBlockFromPreChild(children);
+        if (latexBlock) return <>{latexBlock}</>;
+        return <pre {...props}>{children}</pre>;
       },
     }),
     [onOpenFile, resolveFilePath],
