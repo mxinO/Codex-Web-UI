@@ -18,7 +18,9 @@ describe('run option storage helpers', () => {
     expect(sanitizeStoredMode('plan')).toBe('plan');
     expect(sanitizeStoredMode('review')).toBeNull();
     expect(sanitizeStoredEffort('xhigh')).toBe('xhigh');
-    expect(sanitizeStoredEffort('maximum')).toBeNull();
+    expect(sanitizeStoredEffort('max')).toBe('max');
+    expect(sanitizeStoredEffort('ultra')).toBe('ultra');
+    expect(sanitizeStoredEffort('   ')).toBeNull();
     expect(sanitizeStoredSandbox('danger-full-access')).toBe('danger-full-access');
     expect(sanitizeStoredSandbox('sandbox:workspace-write')).toBeNull();
   });

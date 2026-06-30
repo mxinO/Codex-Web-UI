@@ -1,5 +1,5 @@
 import type { CodexItem, CodexTurn } from '../types/codex';
-import type { CodexRunOptions } from '../types/ui';
+import type { CodexRunOptions, RuntimeStatusResult } from '../types/ui';
 
 type TimelineItemOrder = { sortOrder?: number | null };
 
@@ -40,7 +40,8 @@ export type TimelineItem = TimelineItemOrder & (
   | { id: string; kind: 'notice'; timestamp: number; text: string; turnId?: string | null }
   | { id: string; kind: 'warning'; timestamp: number; text: string; turnId?: string | null }
   | { id: string; kind: 'error'; timestamp: number; text: string; turnId?: string | null }
-  | { id: string; kind: 'queued'; timestamp: number; message: { id: string; text: string; createdAt: number; options?: Partial<CodexRunOptions> } }
+  | { id: string; kind: 'runtimeStatus'; timestamp: number; status: RuntimeStatusResult }
+  | { id: string; kind: 'queued'; timestamp: number; message: { id: string; text: string; createdAt: number; deliveryState?: 'maybeSent'; options?: Partial<CodexRunOptions> } }
   | { id: string; kind: 'streaming'; timestamp: number; text: string; active: boolean; turnId?: string | null; sourceId?: string | null }
   | { id: string; kind: 'approval'; timestamp: number; requestId: number | string; method: string; params: unknown }
 );
@@ -1272,7 +1273,10 @@ export function claimedQueuedUserItemsFromQueueTransition(
   const claimedMessages: QueuedTimelineMessage[] = [];
   const allowMultipleClaims = previousTurnId === currentTurnId;
   for (const message of previousQueue) {
-    if (currentIds.has(message.id)) break;
+    if (currentIds.has(message.id)) {
+      if (message.deliveryState === 'maybeSent') continue;
+      break;
+    }
     if (options.ignoredRemovedMessageIds?.has(message.id)) continue;
     claimedMessages.push(message);
     if (!allowMultipleClaims) break;

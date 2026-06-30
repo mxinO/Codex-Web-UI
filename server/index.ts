@@ -48,7 +48,7 @@ logInfo('Starting Codex Web UI server', {
 
 const app = express();
 const server = http.createServer(app);
-const stateStore = new HostStateStore(config.stateDir, config.hostname);
+const stateStore = new HostStateStore(config.stateDir, config.hostname, { maxQueueItems: config.queueLimit });
 const token = createAuthToken();
 const tokenHash = hashToken(token);
 const fallbackAuthScope = `${config.hostname}:${config.port}`;

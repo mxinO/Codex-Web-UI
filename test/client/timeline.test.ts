@@ -2194,6 +2194,30 @@ describe('timeline', () => {
     ).toEqual([]);
   });
 
+  it('claims a later removed queued prompt when a maybe-sent head remains visible', () => {
+    const claimed = claimedQueuedUserItemsFromQueueTransition(
+      [
+        { id: 'queued-1', text: 'maybe sent', createdAt: 1000, deliveryState: 'maybeSent' },
+        { id: 'queued-2', text: 'started next turn', createdAt: 1001 },
+      ],
+      [{ id: 'queued-1', text: 'maybe sent', createdAt: 1000, deliveryState: 'maybeSent' }],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-start-pending:thread-1' },
+      () => 10,
+    );
+
+    expect(claimed).toEqual([
+      {
+        id: 'claimed-queued:user:queued-2',
+        kind: 'user',
+        timestamp: 1001,
+        sortOrder: 10,
+        text: 'started next turn',
+        turnId: 'turn-start-pending:thread-1',
+      },
+    ]);
+  });
+
   it('caps retained claimed queued prompts after history cleanup', () => {
     const claimed = Array.from({ length: 55 }, (_, index): Extract<TimelineItem, { kind: 'user' }> => ({
       id: `claimed-queued:user:queued-${index + 1}`,

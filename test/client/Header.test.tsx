@@ -87,4 +87,81 @@ describe('Header', () => {
 
     expect(onRestartCodex).toHaveBeenCalledTimes(1);
   });
+
+  it('opens the model picker and selects a catalog model', () => {
+    const onOpenRuntimeOptions = vi.fn();
+    const onSelectModel = vi.fn();
+    renderHeader({
+      model: 'gpt-5.4',
+      modelOptions: [
+        {
+          id: 'gpt-5.4',
+          model: 'gpt-5.4',
+          displayName: 'GPT-5.4',
+          description: 'General coding model',
+          supportedReasoningEfforts: [],
+          defaultReasoningEffort: null,
+          isDefault: true,
+        },
+        {
+          id: 'gpt-5.4-mini',
+          model: 'gpt-5.4-mini',
+          displayName: 'GPT-5.4 mini',
+          description: 'Faster coding model',
+          supportedReasoningEfforts: [],
+          defaultReasoningEffort: null,
+          isDefault: false,
+        },
+      ],
+      onOpenRuntimeOptions,
+      onSelectModel,
+    });
+
+    const trigger = document.querySelector<HTMLButtonElement>('[aria-label="Choose model"]');
+    act(() => trigger?.click());
+
+    expect(onOpenRuntimeOptions).toHaveBeenCalledTimes(1);
+    expect(document.querySelector('.runtime-option-menu')).not.toBeNull();
+    expect(document.querySelector('.runtime-option-item[aria-pressed="true"]')?.textContent).toContain('GPT-5.4');
+
+    const mini = [...document.querySelectorAll<HTMLElement>('.runtime-option-item')]
+      .find((option) => option.textContent?.includes('GPT-5.4 mini'));
+    act(() => mini?.click());
+
+    expect(onSelectModel).toHaveBeenCalledWith('gpt-5.4-mini');
+    expect(document.querySelector('.runtime-option-menu')).toBeNull();
+  });
+
+  it('offers only the selected model efforts and closes with Escape', () => {
+    const onSelectEffort = vi.fn();
+    renderHeader({
+      effort: 'medium',
+      effortOptions: [
+        { reasoningEffort: 'medium', description: 'Balanced' },
+        { reasoningEffort: 'high', description: 'Deeper reasoning' },
+      ],
+      onSelectEffort,
+    });
+
+    const trigger = document.querySelector<HTMLButtonElement>('[aria-label="Choose effort"]');
+    act(() => trigger?.click());
+    expect(document.querySelectorAll('.runtime-option-item')).toHaveLength(2);
+
+    act(() => {
+      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    });
+    expect(document.querySelector('.runtime-option-menu')).toBeNull();
+    expect(onSelectEffort).not.toHaveBeenCalled();
+  });
+
+  it('disables runtime selectors while changing options or running Codex', () => {
+    renderHeader({
+      model: 'gpt-5.4',
+      effort: 'high',
+      runtimeOptionsDisabled: true,
+    });
+
+    expect(document.querySelector<HTMLButtonElement>('[aria-label="Choose model"]')?.disabled).toBe(true);
+    expect(document.querySelector<HTMLButtonElement>('[aria-label="Choose effort"]')?.disabled).toBe(true);
+  });
 });

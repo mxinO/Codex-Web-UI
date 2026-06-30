@@ -3,6 +3,7 @@ export interface SlashCommandDefinition {
   description: string;
   valueHint?: string;
   stateChanging: boolean;
+  allowDuringTurn?: boolean;
 }
 
 export interface SlashArgumentSuggestion {
@@ -19,6 +20,7 @@ export const SLASH_COMMANDS: SlashCommandDefinition[] = [
   { command: '/effort', description: 'Set reasoning effort', valueHint: '<level>', stateChanging: true },
   { command: '/mode', description: 'Set collaboration mode', valueHint: '<default|plan>', stateChanging: true },
   { command: '/sandbox', description: 'Set sandbox mode', valueHint: '<mode>', stateChanging: true },
+  { command: '/goal', description: 'Set, view, pause, resume, or clear the active task goal', valueHint: '<objective|pause|resume|clear>', stateChanging: true, allowDuringTurn: true },
   { command: '/compact', description: 'Compact conversation when supported by Codex app-server', stateChanging: true },
   { command: '/diff', description: 'Show current worktree or thread diff when supported', stateChanging: false },
 ];
@@ -40,10 +42,16 @@ export const SLASH_ARGUMENT_SUGGESTIONS: Record<string, SlashArgumentSuggestion[
     { value: 'workspace-write', description: 'Write inside the workspace' },
     { value: 'danger-full-access', description: 'No filesystem sandbox' },
   ],
+  '/goal': [
+    { value: 'pause', description: 'Pause the current goal' },
+    { value: 'resume', description: 'Resume a paused goal' },
+    { value: 'clear', description: 'Clear the current goal' },
+  ],
 };
 
 const LOCAL_COMMANDS = new Set(SLASH_COMMANDS.filter((command) => !command.stateChanging).map((command) => command.command));
 const STATE_CHANGING_COMMANDS = new Set(SLASH_COMMANDS.filter((command) => command.stateChanging).map((command) => command.command));
+const ALLOWED_DURING_TURN_COMMANDS = new Set(SLASH_COMMANDS.filter((command) => command.allowDuringTurn).map((command) => command.command));
 
 export interface SlashCommandClassification {
   command: string;
@@ -66,7 +74,7 @@ export function parseSlashCommand(input: string): ParsedSlashCommand {
 
 export function classifySlashCommand(input: string, turnActive: boolean): SlashCommandClassification {
   const { command } = parseSlashCommand(input);
-  if (turnActive && STATE_CHANGING_COMMANDS.has(command)) {
+  if (turnActive && STATE_CHANGING_COMMANDS.has(command) && !ALLOWED_DURING_TURN_COMMANDS.has(command)) {
     return { command, allowed: false, reason: `${command} is disabled while Codex is working` };
   }
   if (LOCAL_COMMANDS.has(command) || STATE_CHANGING_COMMANDS.has(command)) {

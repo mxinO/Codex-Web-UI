@@ -1,5 +1,6 @@
 import os from 'node:os';
 import path from 'node:path';
+import { normalizeQueueLimit } from './queue.js';
 export function readConfig(argv = process.argv.slice(2), env = process.env) {
     const getArg = (name) => {
         const idx = argv.indexOf(name);
@@ -12,7 +13,7 @@ export function readConfig(argv = process.argv.slice(2), env = process.env) {
         stateDir: getArg('--state-dir') ?? env.CODEX_WEB_UI_STATE_DIR ?? path.join(process.cwd(), 'data'),
         noAuth: argv.includes('--no-auth'),
         mock: argv.includes('--mock'),
-        queueLimit: Number(env.CODEX_WEB_UI_QUEUE_LIMIT ?? 20),
+        queueLimit: normalizeQueueLimit(Number(env.CODEX_WEB_UI_QUEUE_LIMIT ?? 20)),
         commandTimeoutMs: Number(env.CODEX_WEB_UI_COMMAND_TIMEOUT_MS ?? 30_000),
         commandOutputBytes: Number(env.CODEX_WEB_UI_COMMAND_OUTPUT_BYTES ?? 256_000),
     };

@@ -382,6 +382,37 @@ describe('useCodexSocket', () => {
     expect(currentSocket?.notifications.map((item) => (item as { params?: { delta?: string } }).params?.delta)).toEqual(['first', 'second']);
   });
 
+  it('does not persist a replay cursor for notifications buffered but never rendered', async () => {
+    await renderHook();
+    const first = MockWebSocket.instances[0];
+    act(() => {
+      first.open();
+      first.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'codex/notification', streamId: 'stream-1', seq: 9, message: { method: 'item/agentMessage/delta', params: { delta: 'lost-if-skipped' } } }),
+        }),
+      );
+    });
+
+    expect(currentSocket?.notifications).toEqual([]);
+    expect(window.localStorage.getItem(`codex-web-ui:notificationReplay:${window.location.host}`)).toBeNull();
+
+    act(() => {
+      root?.unmount();
+    });
+    container?.remove();
+    root = null;
+    container = null;
+
+    await renderHook();
+    const second = MockWebSocket.instances[1];
+    act(() => {
+      second.open();
+    });
+
+    expect(second.sent[0]).toBe(JSON.stringify({ type: 'client/hello', params: { lastNotificationStreamId: null, lastNotificationSeq: null } }));
+  });
+
   it('keeps the latest sequence metadata when coalescing deltas', async () => {
     await renderHook();
     const ws = MockWebSocket.instances[0];

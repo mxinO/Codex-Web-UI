@@ -1,8 +1,6 @@
-export const REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const;
 export const COLLABORATION_MODES = ['default', 'plan'] as const;
 export const SANDBOX_MODES = ['read-only', 'workspace-write', 'danger-full-access'] as const;
 
-const REASONING_EFFORT_SET = new Set<string>(REASONING_EFFORTS);
 const COLLABORATION_MODE_SET = new Set<string>(COLLABORATION_MODES);
 const SANDBOX_MODE_SET = new Set<string>(SANDBOX_MODES);
 
@@ -18,7 +16,8 @@ export function sanitizeStoredModel(value: string | null): string | null {
 }
 
 export function sanitizeStoredEffort(value: string | null): string | null {
-  return validStoredValue(value, REASONING_EFFORT_SET);
+  const trimmed = value?.trim();
+  return trimmed && trimmed.length <= 64 ? trimmed : null;
 }
 
 export function sanitizeStoredMode(value: string | null): string | null {

@@ -3,6 +3,7 @@ import { FileDiff } from 'lucide-react';
 import type { TimelineItem } from '../lib/timeline';
 import ApprovalCard from './ApprovalCard';
 import QueueCard from './QueueCard';
+import RuntimeStatusCard from './RuntimeStatusCard';
 import StreamingCard from './StreamingCard';
 
 const MarkdownView = lazy(() => import('./MarkdownView'));
@@ -86,6 +87,14 @@ function ChatItem({
     return (
       <div className="chat-row chat-row--system">
         <ApprovalCard requestId={item.requestId} method={item.method} params={item.params} onDecision={(decision) => onApprovalDecision(item, decision)} />
+      </div>
+    );
+  }
+
+  if (item.kind === 'runtimeStatus') {
+    return (
+      <div className="chat-row chat-row--system">
+        <RuntimeStatusCard status={item.status} />
       </div>
     );
   }

@@ -346,7 +346,7 @@ describe('InputBox', () => {
       await Promise.resolve();
     });
 
-    expect(onEnqueue).toHaveBeenCalledWith('next', runOptions);
+    expect(onEnqueue).toHaveBeenCalledWith('next', runOptions, 'thread-1');
   });
 
   it('ignores stale file autocomplete responses after draft no longer matches', async () => {

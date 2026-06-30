@@ -1,4 +1,4 @@
-export type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh';
+export type CodexReasoningEffort = string;
 export type CodexSandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
 export type CodexCollaborationMode = 'default' | 'plan';
 
@@ -11,9 +11,24 @@ export interface CodexRunOptions {
 
 export interface QueuedMessage {
   id: string;
+  threadId?: string;
   text: string;
   createdAt: number;
+  deliveryState?: 'maybeSent';
   options?: CodexRunOptions;
+}
+
+export type ThreadGoalStatus = 'active' | 'paused' | 'blocked' | 'usageLimited' | 'budgetLimited' | 'complete';
+
+export interface ThreadGoal {
+  threadId: string;
+  objective: string;
+  status: ThreadGoalStatus;
+  tokenBudget: number | null;
+  tokensUsed: number;
+  timeUsedSeconds: number;
+  createdAt: number;
+  updatedAt: number;
 }
 
 export type GitUntrackedMode = 'normal' | 'all' | 'no';
@@ -67,6 +82,14 @@ export interface GitDiffResult {
   after?: string;
 }
 
+export interface RuntimeSettingsConfirmation {
+  threadId: string;
+  model: string;
+  effort: CodexReasoningEffort | null;
+  source: 'threadStart' | 'threadResume' | 'settingsUpdated';
+  confirmedAt: string;
+}
+
 export interface HostRuntimeState {
   hostname: string;
   activeThreadId: string | null;
@@ -77,6 +100,7 @@ export interface HostRuntimeState {
   effort: CodexReasoningEffort | null;
   mode: CodexCollaborationMode | null;
   sandbox: CodexSandboxMode | null;
+  activeGoal: ThreadGoal | null;
   authTokenHash: string | null;
   appServerUrl: string | null;
   appServerPid: number | null;

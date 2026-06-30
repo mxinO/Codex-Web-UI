@@ -704,17 +704,30 @@ export class CodexAppServer {
         if (isCancelled()) {
             throw new Error('Codex app-server startup was cancelled');
         }
+        const lifecycleId = this.lifecycleId;
         this.url = url;
         const socket = await this.openSocket(url, isCancelled);
         if (isCancelled()) {
             socket.close();
             throw new Error('Codex app-server startup was cancelled');
         }
+        const peer = new JsonRpcPeer(socket);
+        const isCurrentPeer = () => (this.lifecycleId === lifecycleId
+            && this.socket === socket
+            && this.peer === peer);
         this.socket = socket;
-        this.peer = new JsonRpcPeer(socket);
-        this.peer.onNotification((message) => this.forwardNotification(message));
-        this.peer.onServerRequest((message) => this.forwardServerRequest(message));
-        return this.peer.request('initialize', {
+        this.peer = peer;
+        peer.onNotification((message) => {
+            if (isCurrentPeer()) {
+                this.forwardNotification(message);
+            }
+        });
+        peer.onServerRequest((message) => {
+            if (isCurrentPeer()) {
+                this.forwardServerRequest(message);
+            }
+        });
+        return peer.request('initialize', {
             clientInfo: { name: 'codex-web-ui', version: '0.1.0' },
             capabilities: { experimentalApi: true },
         });

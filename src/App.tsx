@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import AuthOverlay from './components/AuthOverlay';
 import ChatTimeline from './components/ChatTimeline';
 import CwdPicker from './components/CwdPicker';
@@ -9,6 +9,7 @@ import WorkspaceSidebar from './components/WorkspaceSidebar';
 import Header from './components/Header';
 import ImageViewerModal from './components/ImageViewerModal';
 import InputBox from './components/InputBox';
+import GoalProgressRow from './components/GoalProgressRow';
 import QueueTray from './components/QueueTray';
 import SessionPicker from './components/SessionPicker';
 import { useCodexSocket } from './hooks/useCodexSocket';
@@ -18,9 +19,11 @@ import { useTheme } from './hooks/useTheme';
 import { appendEphemeralBangItem, bangOutputEventToTimelineItem, getBangCommandOutputDetail } from './lib/bangCommands';
 import { FileContentTooLargeError, readTextFileStream } from './lib/fileContent';
 import { isImagePath, normalizeMentionedFilePath } from './lib/filePreview';
+import { parseGoalCommandValue } from './lib/goalCommands';
+import { effortOptionsForModel, modelOptionsFromResult, reconcileEffortForModel } from './lib/modelOptions';
+import { parseRuntimeStatusResult } from './lib/runtimeStatus';
 import {
   COLLABORATION_MODES,
-  REASONING_EFFORTS,
   SANDBOX_MODES,
   effectiveMode,
   displayRuntimeValue,
@@ -57,7 +60,7 @@ import {
   type TimelineItem,
 } from './lib/timeline';
 import type { CodexThread } from './types/codex';
-import type { CodexRunOptions } from './types/ui';
+import type { CodexModelOption, CodexRunOptions, RuntimeStatusResult, ThreadGoal, ThreadGoalStatus } from './types/ui';
 
 interface OpenEditor {
   path: string;
@@ -73,6 +76,79 @@ interface OpenImage {
 
 type UserTimelineItem = Extract<TimelineItem, { kind: 'user' }>;
 type FileChangeSummaryTimelineItem = Extract<TimelineItem, { kind: 'fileChangeSummary' }>;
+
+interface RuntimeStatusScope {
+  threadId: string | null;
+  threadPath: string | null;
+  reconnectEpoch: number;
+  generation: number;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+const GOAL_STATUSES = new Set<ThreadGoalStatus>(['active', 'paused', 'blocked', 'usageLimited', 'budgetLimited', 'complete']);
+
+function finiteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function stringValue(value: Record<string, unknown>, camelKey: string, snakeKey: string): string | null {
+  const next = value[camelKey] ?? value[snakeKey];
+  return typeof next === 'string' ? next : null;
+}
+
+function numberValue(value: Record<string, unknown>, camelKey: string, snakeKey: string): number | null {
+  return finiteNumber(value[camelKey]) ?? finiteNumber(value[snakeKey]);
+}
+
+function goalFromValue(value: unknown): ThreadGoal | null {
+  if (!isRecord(value)) return null;
+  const threadId = stringValue(value, 'threadId', 'thread_id');
+  const objective = typeof value.objective === 'string' ? value.objective : null;
+  const statusValue = value.status;
+  if (
+    !threadId ||
+    !objective ||
+    typeof statusValue !== 'string' ||
+    !GOAL_STATUSES.has(statusValue as ThreadGoalStatus)
+  ) {
+    return null;
+  }
+  const status = statusValue as ThreadGoalStatus;
+
+  const rawTokenBudget = value.tokenBudget ?? value.token_budget;
+  const tokenBudget = rawTokenBudget === null || rawTokenBudget === undefined ? null : finiteNumber(rawTokenBudget);
+  const tokensUsed = numberValue(value, 'tokensUsed', 'tokens_used');
+  const timeUsedSeconds = numberValue(value, 'timeUsedSeconds', 'time_used_seconds');
+  const createdAt = numberValue(value, 'createdAt', 'created_at');
+  const updatedAt = numberValue(value, 'updatedAt', 'updated_at');
+  if (tokenBudget === null && rawTokenBudget !== null && rawTokenBudget !== undefined) return null;
+  if (tokensUsed === null || timeUsedSeconds === null || createdAt === null || updatedAt === null) return null;
+
+  return {
+    threadId,
+    objective,
+    status,
+    tokenBudget,
+    tokensUsed,
+    timeUsedSeconds,
+    createdAt,
+    updatedAt,
+  };
+}
+
+function goalFromRpcResult(result: unknown): ThreadGoal | null {
+  if (!isRecord(result)) return null;
+  return goalFromValue(result.goal) ?? goalFromValue(getNestedRecord(result, 'data')?.goal) ?? goalFromValue(result);
+}
+
+function goalStatusLabel(status: ThreadGoalStatus): string {
+  if (status === 'usageLimited') return 'usage limited';
+  if (status === 'budgetLimited') return 'budget limited';
+  return status;
+}
 
 function encodeUtf8Base64(value: string): string {
   const bytes = new TextEncoder().encode(value);
@@ -202,11 +278,15 @@ export default function App() {
   const [retainedLiveTurnItems, setRetainedLiveTurnItems] = useState<TimelineItem[]>([]);
   const [retainedFileSummaryItems, setRetainedFileSummaryItems] = useState<FileChangeSummaryTimelineItem[]>([]);
   const [pendingCompactionThreadId, setPendingCompactionThreadId] = useState<string | null>(null);
+  const [goalBusy, setGoalBusy] = useState(false);
   const [answeredApprovals, setAnsweredApprovals] = useState<Set<string>>(() => new Set());
   const [model, setModelState] = useState<string | null>(() => sanitizeStoredModel(localStorageValue('codex-web-ui:model')));
   const [mode, setModeState] = useState<string | null>(initialMode);
   const [effort, setEffortState] = useState<string | null>(() => sanitizeStoredEffort(localStorageValue('codex-web-ui:effort')));
   const [sandbox, setSandboxState] = useState<string | null>(initialSandbox);
+  const [modelOptions, setModelOptions] = useState<CodexModelOption[]>([]);
+  const [modelOptionsLoading, setModelOptionsLoading] = useState(false);
+  const [runtimeOptionsBusy, setRuntimeOptionsBusy] = useState(false);
   const bangCounterRef = useRef(0);
   const pendingUserCounterRef = useRef(0);
   const ephemeralCounterRef = useRef(0);
@@ -234,6 +314,18 @@ export default function App() {
   const lastHandledCompletionCountRef = useRef<number | null>(null);
   const fileOpenGenerationRef = useRef(0);
   const fileOpenAbortRef = useRef<AbortController | null>(null);
+  const modelOptionsRef = useRef<CodexModelOption[]>([]);
+  const modelCatalogLoadedRef = useRef(false);
+  const modelCatalogRequestRef = useRef<Promise<CodexModelOption[]> | null>(null);
+  const modelCatalogGenerationRef = useRef(0);
+  const runtimeOptionsBusyRef = useRef(false);
+  const runtimeStatusScopeRef = useRef<RuntimeStatusScope>({
+    threadId: activeThreadId,
+    threadPath: activeThreadPath,
+    reconnectEpoch: socket.reconnectEpoch,
+    generation: 0,
+  });
+  const runtimeStatusRequestSequenceRef = useRef(0);
   const pendingTurnStartCount = pendingTurnWindow?.threadId === activeThreadId ? pendingTurnWindow.startCount : null;
   notificationCountRef.current = socket.notificationCount;
   const localSortOrder = useCallback((key?: string) => {
@@ -252,6 +344,23 @@ export default function App() {
     { pendingStartCount: pendingTurnStartCount },
   );
 
+  useLayoutEffect(() => {
+    const current = runtimeStatusScopeRef.current;
+    if (
+      current.threadId === activeThreadId &&
+      current.threadPath === activeThreadPath &&
+      current.reconnectEpoch === socket.reconnectEpoch
+    ) {
+      return;
+    }
+    runtimeStatusScopeRef.current = {
+      threadId: activeThreadId,
+      threadPath: activeThreadPath,
+      reconnectEpoch: socket.reconnectEpoch,
+      generation: current.generation + 1,
+    };
+  }, [activeThreadId, activeThreadPath, socket.reconnectEpoch]);
+
   useEffect(() => {
     return () => {
       fileOpenAbortRef.current?.abort();
@@ -265,6 +374,14 @@ export default function App() {
       setSessionError((current) => (current === message ? null : current));
       transientSessionMessageTimerRef.current = null;
     }, durationMs);
+  }, []);
+  const invalidateModelCatalog = useCallback(() => {
+    modelCatalogGenerationRef.current += 1;
+    modelCatalogLoadedRef.current = false;
+    modelCatalogRequestRef.current = null;
+    modelOptionsRef.current = [];
+    setModelOptions([]);
+    setModelOptionsLoading(false);
   }, []);
   const liveNotificationActiveTurnId = liveNotificationWindowRef.current.activeTurnId;
   const liveNotificationStartCount = liveNotificationWindowRef.current.startCount;
@@ -371,7 +488,6 @@ export default function App() {
       ...approvalItems,
     ]);
   }, [approvalItems, claimedQueuedUserItems, ephemeralItems, pendingUserItems, timeline.isViewingLatest, timeline.items, timelineItemsForChatWithRetainedOverlay, visibleLiveTurnItems, visibleRetainedFileSummaryItemsForChat, visibleRetainedLiveTurnItems]);
-  const runOptions = useMemo<CodexRunOptions>(() => ({ model, mode: effectiveMode(mode, model), effort, sandbox }), [effort, mode, model, sandbox]);
   const serverModel = sanitizeStoredModel(state?.model ?? null);
   const serverEffort = sanitizeStoredEffort(state?.effort ?? null);
   const serverMode = sanitizeStoredMode(state?.mode ?? null);
@@ -380,7 +496,17 @@ export default function App() {
   const displayEffort = displayRuntimeValue(activeThreadId, serverEffort, effort);
   const displayMode = displayRuntimeValue(activeThreadId, serverMode, mode);
   const displaySandbox = displayRuntimeValue(activeThreadId, serverSandbox, sandbox);
+  const runModel = activeThreadId ? displayModel : model;
+  const runEffort = activeThreadId ? displayEffort : effort;
+  const runMode = activeThreadId ? displayMode : mode;
+  const runSandbox = activeThreadId ? displaySandbox : sandbox;
+  const runOptions = useMemo<CodexRunOptions>(
+    () => ({ model: runModel, mode: effectiveMode(runMode, runModel), effort: runEffort, sandbox: runSandbox }),
+    [runEffort, runMode, runModel, runSandbox],
+  );
   const isRunning = Boolean(state?.activeTurnId || (pendingCompactionThreadId && pendingCompactionThreadId === activeThreadId));
+  const activeGoal = state?.activeGoal ?? null;
+  const visibleGoal = activeGoal && activeGoal.threadId === activeThreadId && activeGoal.status !== 'complete' ? activeGoal : null;
   const hasActiveStreamingText = useMemo(
     () => visibleLiveTurnItems.some((item) => item.kind === 'streaming' && item.active && item.text.trim().length > 0),
     [visibleLiveTurnItems],
@@ -397,6 +523,7 @@ export default function App() {
     setSessionError('Restarting Codex app-server...');
     try {
       await socket.rpc('webui/codex/restart', undefined, 120_000);
+      invalidateModelCatalog();
       showTransientSessionMessage('Codex app-server restarted');
       if (activeThreadId) void timeline.reload();
     } catch (error) {
@@ -404,7 +531,56 @@ export default function App() {
     } finally {
       setCodexRestarting(false);
     }
-  }, [activeThreadId, isRunning, showTransientSessionMessage, socket.rpc, timeline.reload]);
+  }, [activeThreadId, invalidateModelCatalog, isRunning, showTransientSessionMessage, socket.rpc, timeline.reload]);
+
+  useEffect(() => {
+    if (!activeThreadId || socket.connectionState !== 'connected') return;
+    try {
+      void Promise.resolve(socket.rpc('webui/thread/goal/get', { threadId: activeThreadId }, 5_000)).catch(() => undefined);
+    } catch {
+      // Goal refresh is best-effort; command handlers surface actionable failures.
+    }
+  }, [activeThreadId, socket.connectionState, socket.reconnectEpoch, socket.rpc]);
+
+  const setGoalStatus = useCallback(
+    async (status: ThreadGoalStatus) => {
+      if (!activeThreadId) {
+        setSessionError('Start or resume a session before managing a goal');
+        return;
+      }
+      setGoalBusy(true);
+      try {
+        await socket.rpc('webui/thread/goal/set', { threadId: activeThreadId, status });
+        showTransientSessionMessage(`Goal ${goalStatusLabel(status)}`);
+      } catch (error) {
+        setSessionError(error instanceof Error ? error.message : String(error));
+      } finally {
+        setGoalBusy(false);
+      }
+    },
+    [activeThreadId, showTransientSessionMessage, socket.rpc],
+  );
+
+  const clearGoal = useCallback(async () => {
+    if (!activeThreadId) {
+      setSessionError('Start or resume a session before clearing a goal');
+      return;
+    }
+    setGoalBusy(true);
+    try {
+      await socket.rpc('webui/thread/goal/clear', { threadId: activeThreadId });
+      showTransientSessionMessage('Goal cleared');
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setGoalBusy(false);
+    }
+  }, [activeThreadId, showTransientSessionMessage, socket.rpc]);
+
+  const editGoal = useCallback(() => {
+    if (!activeGoal) return;
+    setComposerDraft(`/goal ${activeGoal.objective}`);
+  }, [activeGoal]);
 
   const updateRetainedLiveTurnItems = useCallback((historyItems: TimelineItem[], additions: TimelineItem[] = []) => {
     setRetainedLiveTurnItems((current) => {
@@ -661,6 +837,140 @@ export default function App() {
     setLocalStorageValue('codex-web-ui:sandbox', value);
   }, []);
 
+  const loadRuntimeOptions = useCallback(async (): Promise<CodexModelOption[]> => {
+    if (modelCatalogLoadedRef.current) return modelOptionsRef.current;
+    if (modelCatalogRequestRef.current) return modelCatalogRequestRef.current;
+
+    const generation = modelCatalogGenerationRef.current;
+    setModelOptionsLoading(true);
+    const request = Promise.resolve()
+      .then(() => socket.rpc<unknown>('webui/model/list'))
+      .then((result) => {
+        if (generation !== modelCatalogGenerationRef.current) return modelOptionsRef.current;
+        const options = modelOptionsFromResult(result);
+        modelOptionsRef.current = options;
+        modelCatalogLoadedRef.current = true;
+        setModelOptions(options);
+        return options;
+      })
+      .catch((error) => {
+        if (generation === modelCatalogGenerationRef.current) {
+          setSessionError(error instanceof Error ? error.message : String(error));
+        }
+        return modelOptionsRef.current;
+      })
+      .finally(() => {
+        if (modelCatalogRequestRef.current === request) modelCatalogRequestRef.current = null;
+        if (generation === modelCatalogGenerationRef.current) setModelOptionsLoading(false);
+      });
+
+    modelCatalogRequestRef.current = request;
+    return request;
+  }, [socket.rpc]);
+
+  const applyRuntimeOptions = useCallback(async (next: { model?: string | null; effort?: string | null; mode?: string | null; sandbox?: string | null }): Promise<boolean> => {
+    if (runtimeOptionsBusyRef.current) return false;
+    if (isRunning) {
+      setSessionError('Stop the active turn before changing model or effort');
+      return false;
+    }
+    if (socket.connectionState !== 'connected') {
+      setSessionError('Reconnect before changing model or effort');
+      return false;
+    }
+
+    if (!activeThreadId) {
+      if (next.model !== undefined) setModel(next.model);
+      if (next.effort !== undefined) setEffort(next.effort);
+      if (next.mode !== undefined) setMode(next.mode);
+      if (next.sandbox !== undefined) setSandbox(next.sandbox);
+      return true;
+    }
+
+    runtimeOptionsBusyRef.current = true;
+    setRuntimeOptionsBusy(true);
+    setSessionError(null);
+    try {
+      const result = await socket.rpc<unknown>('webui/thread/runtime-options/set', {
+        threadId: activeThreadId,
+        ...next,
+      });
+      const record = isRecord(result) ? result : null;
+      const resultModel = sanitizeStoredModel(typeof record?.model === 'string' ? record.model : null);
+      const resultEffort = sanitizeStoredEffort(typeof record?.effort === 'string' ? record.effort : null);
+      const resultMode = sanitizeStoredMode(typeof record?.mode === 'string' ? record.mode : null);
+      const resultSandbox = sanitizeStoredSandbox(typeof record?.sandbox === 'string' ? record.sandbox : null);
+      setModel(resultModel ?? (next.model !== undefined ? next.model : displayModel));
+      setEffort(resultEffort ?? (next.effort !== undefined ? next.effort : displayEffort));
+      setMode(resultMode ?? (next.mode !== undefined ? next.mode : displayMode));
+      setSandbox(resultSandbox ?? (next.sandbox !== undefined ? next.sandbox : displaySandbox));
+      return true;
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : String(error));
+      return false;
+    } finally {
+      runtimeOptionsBusyRef.current = false;
+      setRuntimeOptionsBusy(false);
+    }
+  }, [activeThreadId, displayEffort, displayMode, displayModel, displaySandbox, isRunning, setEffort, setMode, setModel, setSandbox, socket.connectionState, socket.rpc]);
+
+  const selectModel = useCallback(async (value: string) => {
+    const nextModel = sanitizeStoredModel(value);
+    if (!nextModel) {
+      setSessionError('Choose a valid model');
+      return;
+    }
+    const catalog = await loadRuntimeOptions();
+    const nextEffort = reconcileEffortForModel(catalog, nextModel, runEffort);
+    if (await applyRuntimeOptions({ model: nextModel, effort: nextEffort })) {
+      showTransientSessionMessage(`Model set to ${nextModel}`);
+    }
+  }, [applyRuntimeOptions, loadRuntimeOptions, runEffort, showTransientSessionMessage]);
+
+  const selectEffort = useCallback(async (value: string) => {
+    const nextEffort = sanitizeStoredEffort(value);
+    if (!nextEffort) {
+      setSessionError('Choose a valid reasoning effort');
+      return;
+    }
+    const catalog = await loadRuntimeOptions();
+    const supported = effortOptionsForModel(catalog, runModel);
+    if (supported.length > 0 && !supported.some((option) => option.reasoningEffort === nextEffort)) {
+      setSessionError(`Effort for ${runModel} must be one of ${supported.map((option) => option.reasoningEffort).join(', ')}`);
+      return;
+    }
+    if (await applyRuntimeOptions({ effort: nextEffort })) {
+      showTransientSessionMessage(`Effort set to ${nextEffort}`);
+    }
+  }, [applyRuntimeOptions, loadRuntimeOptions, runModel, showTransientSessionMessage]);
+
+  const selectMode = useCallback(async (value: string) => {
+    const nextMode = sanitizeStoredMode(value);
+    if (!nextMode) {
+      setSessionError('Mode must be default or plan');
+      return;
+    }
+    if (await applyRuntimeOptions({ mode: nextMode })) {
+      showTransientSessionMessage(`Mode set to ${nextMode}`);
+    }
+  }, [applyRuntimeOptions, showTransientSessionMessage]);
+
+  const selectSandbox = useCallback(async (value: string) => {
+    const nextSandbox = sanitizeStoredSandbox(value);
+    if (!nextSandbox) {
+      setSessionError('Sandbox must be read-only, workspace-write, or danger-full-access');
+      return;
+    }
+    if (await applyRuntimeOptions({ sandbox: nextSandbox })) {
+      showTransientSessionMessage(`Sandbox set to ${nextSandbox}`);
+    }
+  }, [applyRuntimeOptions, showTransientSessionMessage]);
+
+  const selectedEffortOptions = useMemo(
+    () => effortOptionsForModel(modelOptions, runModel),
+    [modelOptions, runModel],
+  );
+
   const loadSessions = useCallback(async () => {
     setSessionLoading(true);
     setSessionError(null);
@@ -707,6 +1017,30 @@ export default function App() {
     void timeline.reload();
     window.setTimeout(() => void timeline.reload(), 1000);
   }, [timeline.reload]);
+
+  const appendRuntimeStatus = useCallback((status: RuntimeStatusResult) => {
+    const timestamp = Date.now();
+    const id = `runtime-status:${timestamp}:${(ephemeralCounterRef.current += 1)}`;
+    setEphemeralItems((items) => [
+      ...items,
+      { id, kind: 'runtimeStatus', timestamp, sortOrder: localSortOrder(id), status },
+    ]);
+  }, [localSortOrder]);
+
+  const appendRuntimeStatusError = useCallback(() => {
+    const timestamp = Date.now();
+    const id = `runtime-status-error:${timestamp}:${(ephemeralCounterRef.current += 1)}`;
+    setEphemeralItems((items) => [
+      ...items,
+      {
+        id,
+        kind: 'error',
+        timestamp,
+        sortOrder: localSortOrder(id),
+        text: 'Unable to load runtime status. Retry /status.',
+      },
+    ]);
+  }, [localSortOrder]);
 
   const openDetailItem = useCallback((item: TimelineItem) => {
     if (item.kind !== 'fileChange') {
@@ -766,13 +1100,13 @@ export default function App() {
     setSessionLoading(true);
     setSessionError(null);
     try {
-      await socket.rpc('webui/session/resume', { threadId, threadPath, options: runOptions });
+      await socket.rpc('webui/session/resume', { threadId, threadPath });
       window.location.reload();
     } catch (error) {
       setSessionError(error instanceof Error ? error.message : String(error));
       setSessionLoading(false);
     }
-  }, [runOptions, socket.rpc]);
+  }, [socket.rpc]);
 
   useEffect(() => {
     const handleSlashCommand = (event: Event) => {
@@ -780,13 +1114,61 @@ export default function App() {
       const { command, value } = parseSlashCommand(event.detail.input);
 
       if (command === '/help') {
-        setSessionError('Commands: /new, /resume [id], /model <name>, /effort <level>, /mode <value>, /sandbox <value>, /compact, /diff, /status');
+        setSessionError('Commands: /new, /resume [id], /model <name>, /effort <level>, /mode <value>, /sandbox <value>, /goal [objective|pause|resume|clear], /compact, /diff, /status');
         return;
       }
       if (command === '/status') {
-        setSessionError(
-          `Host ${socket.hello?.hostname ?? 'unknown'}; session ${activeThreadId ?? 'none'}; cwd ${state?.activeCwd ?? 'none'}; model ${displayModel ?? 'default'}; effort ${displayEffort ?? 'default'}; mode ${displayMode ?? 'default'}; sandbox ${displaySandbox ?? 'default'}; connection ${socket.connectionState}`,
-        );
+        setSessionError(null);
+        const requestSequence = (runtimeStatusRequestSequenceRef.current += 1);
+        if (!timeline.isViewingLatest) timeline.jumpToLatest();
+        const requestedScope = runtimeStatusScopeRef.current;
+        if (
+          requestedScope.threadId !== activeThreadId ||
+          requestedScope.threadPath !== activeThreadPath ||
+          requestedScope.reconnectEpoch !== socket.reconnectEpoch
+        ) {
+          return;
+        }
+        if (!activeThreadId) {
+          appendRuntimeStatus({
+            hostname: socket.hello?.hostname ?? 'unknown',
+            threadId: null,
+            cwd: state?.activeCwd ?? null,
+            activeTurnId: state?.activeTurnId ?? null,
+            model: displayModel,
+            effort: displayEffort,
+            mode: displayMode,
+            sandbox: displaySandbox,
+            confirmed: false,
+            confirmationSource: null,
+            confirmedAt: null,
+            lastTurn: { status: 'none', context: null, scannedBytes: 0 },
+          });
+          return;
+        }
+
+        const requestedThreadId = activeThreadId;
+        const requestIsCurrent = () => {
+          const currentScope = runtimeStatusScopeRef.current;
+          return (
+            runtimeStatusRequestSequenceRef.current === requestSequence &&
+            currentScope.threadId === requestedScope.threadId &&
+            currentScope.threadPath === requestedScope.threadPath &&
+            currentScope.reconnectEpoch === requestedScope.reconnectEpoch &&
+            currentScope.generation === requestedScope.generation
+          );
+        };
+        void (async () => {
+          try {
+            const rawResult = await socket.rpc<unknown>('webui/thread/status', { threadId: requestedThreadId });
+            if (!requestIsCurrent()) return;
+            const result = parseRuntimeStatusResult(rawResult, requestedThreadId);
+            appendRuntimeStatus(result);
+          } catch {
+            if (!requestIsCurrent()) return;
+            appendRuntimeStatusError();
+          }
+        })();
         return;
       }
       if (command === '/new') {
@@ -800,6 +1182,46 @@ export default function App() {
           return;
         }
         void loadSessions();
+        return;
+      }
+      if (command === '/goal') {
+        if (!activeThreadId) {
+          setSessionError('Start or resume a session before managing a goal');
+          return;
+        }
+        const goalCommand = parseGoalCommandValue(value);
+        if (goalCommand.type === 'error') {
+          setSessionError(goalCommand.message);
+          return;
+        }
+        void (async () => {
+          setGoalBusy(true);
+          try {
+            if (goalCommand.type === 'view') {
+              const result = await socket.rpc('webui/thread/goal/get', { threadId: activeThreadId });
+              const goal = goalFromRpcResult(result);
+              setSessionError(goal ? `Goal ${goalStatusLabel(goal.status)}: ${goal.objective}` : 'No active goal');
+              return;
+            }
+            if (goalCommand.type === 'clear') {
+              await socket.rpc('webui/thread/goal/clear', { threadId: activeThreadId });
+              showTransientSessionMessage('Goal cleared');
+              return;
+            }
+            if (goalCommand.type === 'pause' || goalCommand.type === 'resume') {
+              const status = goalCommand.type === 'pause' ? 'paused' : 'active';
+              await socket.rpc('webui/thread/goal/set', { threadId: activeThreadId, status });
+              showTransientSessionMessage(`Goal ${goalStatusLabel(status)}`);
+              return;
+            }
+            await socket.rpc('webui/thread/goal/set', { threadId: activeThreadId, objective: goalCommand.objective, status: 'paused' });
+            showTransientSessionMessage('Goal set');
+          } catch (error) {
+            setSessionError(error instanceof Error ? error.message : String(error));
+          } finally {
+            setGoalBusy(false);
+          }
+        })();
         return;
       }
       if (command === '/compact') {
@@ -830,8 +1252,7 @@ export default function App() {
           setSessionError('Usage: /model <name>');
           return;
         }
-        setModel(value);
-        setSessionError(`Model set to ${value}`);
+        void selectModel(value);
         return;
       }
       if (command === '/effort') {
@@ -839,12 +1260,7 @@ export default function App() {
           setSessionError('Usage: /effort <level>');
           return;
         }
-        if (!REASONING_EFFORTS.includes(value as (typeof REASONING_EFFORTS)[number])) {
-          setSessionError('Effort must be one of none, minimal, low, medium, high, xhigh');
-          return;
-        }
-        setEffort(value);
-        setSessionError(`Effort set to ${value}`);
+        void selectEffort(value);
         return;
       }
       if (command === '/mode') {
@@ -856,12 +1272,11 @@ export default function App() {
           setSessionError('Mode must be default or plan');
           return;
         }
-        if (!model) {
+        if (!runModel) {
           setSessionError('Set /model before /mode so Codex can apply the mode');
           return;
         }
-        setMode(value);
-        setSessionError(`Mode set to ${value}`);
+        void selectMode(value);
         return;
       }
       if (command === '/sandbox') {
@@ -873,14 +1288,13 @@ export default function App() {
           setSessionError('Sandbox must be read-only, workspace-write, or danger-full-access');
           return;
         }
-        setSandbox(value);
-        setSessionError(`Sandbox set to ${value}`);
+        void selectSandbox(value);
       }
     };
 
     window.addEventListener('webui-slash-command', handleSlashCommand);
     return () => window.removeEventListener('webui-slash-command', handleSlashCommand);
-  }, [activeThreadId, displayEffort, displayMode, displayModel, displaySandbox, loadSessions, mode, model, resumeSession, setEffort, setMode, setModel, setSandbox, socket.connectionState, socket.hello?.hostname, socket.rpc, state?.activeCwd]);
+  }, [activeThreadId, activeThreadPath, appendRuntimeStatus, appendRuntimeStatusError, displayEffort, displayMode, displayModel, displaySandbox, loadSessions, resumeSession, runModel, selectEffort, selectMode, selectModel, selectSandbox, showTransientSessionMessage, socket.hello?.hostname, socket.reconnectEpoch, socket.rpc, state?.activeCwd, state?.activeTurnId, timeline.isViewingLatest, timeline.jumpToLatest]);
 
   const editQueued = useCallback(async (message: ClientQueuedMessage) => {
     setSessionError(null);
@@ -1027,21 +1441,28 @@ export default function App() {
         model={displayModel}
         mode={displayMode}
         effort={displayEffort}
+        modelOptions={modelOptions}
+        effortOptions={selectedEffortOptions}
+        runtimeOptionsDisabled={isRunning || codexRestarting || runtimeOptionsBusy || sessionLoading || goalBusy || socket.connectionState !== 'connected'}
+        runtimeOptionsLoading={modelOptionsLoading}
+        onOpenRuntimeOptions={() => void loadRuntimeOptions()}
+        onSelectModel={(value) => void selectModel(value)}
+        onSelectEffort={(value) => void selectEffort(value)}
         sandbox={displaySandbox}
         appServerHealth={socket.hello?.appServerHealth ?? null}
         theme={theme}
         onToggleTheme={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
-        sessionBusy={sessionLoading}
+        sessionBusy={sessionLoading || runtimeOptionsBusy}
         sessionError={sessionError}
-        onOpenSessions={socket.connectionState === 'connected' ? () => void loadSessions() : undefined}
-        onNewSession={socket.connectionState === 'connected' ? openNewSessionPicker : undefined}
-        onRestartCodex={socket.connectionState === 'connected' && !isRunning ? () => void restartCodex() : undefined}
+        onOpenSessions={socket.connectionState === 'connected' && !runtimeOptionsBusy ? () => void loadSessions() : undefined}
+        onNewSession={socket.connectionState === 'connected' && !runtimeOptionsBusy ? openNewSessionPicker : undefined}
+        onRestartCodex={socket.connectionState === 'connected' && !isRunning && !runtimeOptionsBusy ? () => void restartCodex() : undefined}
         codexRestarting={codexRestarting}
         sessionPicker={
           <SessionPicker
             threads={threads}
             visible={sessionPickerOpen}
-            busy={sessionLoading}
+            busy={sessionLoading || runtimeOptionsBusy}
             onClose={() => setSessionPickerOpen(false)}
             onSelect={(threadId, threadPath) => void resumeSession(threadId, threadPath)}
             onNew={openNewSessionPicker}
@@ -1054,7 +1475,7 @@ export default function App() {
           {state?.activeCwd && <WorkspaceSidebar root={state.activeCwd} rpc={socket.rpc} onOpenFile={(path, readOnly) => void openFile(path, readOnly)} />}
           <section className="workspace-main" aria-label="Chat workspace">
             <div className="main-content">
-              {activeThreadId ? (
+              {activeThreadId || ephemeralItems.some((item) => item.kind === 'runtimeStatus' && item.status.threadId === null) ? (
                 <ChatTimeline
                   items={chatItems}
                   onLoadOlder={timeline.loadOlder}
@@ -1079,6 +1500,16 @@ export default function App() {
             </div>
             {activeFileSummary && <FileChangeTray summary={activeFileSummary} onOpenDiff={openFileSummaryDiff} />}
             <QueueTray messages={queuedMessages} onEdit={handleQueuedEdit} onCancel={handleQueuedRemove} />
+            {visibleGoal && (
+              <GoalProgressRow
+                goal={visibleGoal}
+                busy={goalBusy || runtimeOptionsBusy}
+                onPause={() => void setGoalStatus('paused')}
+                onResume={() => void setGoalStatus('active')}
+                onEdit={editGoal}
+                onClear={() => void clearGoal()}
+              />
+            )}
             <InputBox
               rpc={socket.rpc}
               threadId={activeThreadId}
@@ -1086,7 +1517,7 @@ export default function App() {
               activeCwd={state?.activeCwd ?? null}
               runOptions={runOptions}
               draftOverride={composerDraft}
-              disabled={socket.connectionState !== 'connected' || codexRestarting}
+              disabled={socket.connectionState !== 'connected' || codexRestarting || runtimeOptionsBusy}
               onDraftConsumed={() => setComposerDraft(null)}
               onEnqueue={enqueue}
               onDirectSubmit={addPendingUserMessage}

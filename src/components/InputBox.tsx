@@ -14,7 +14,7 @@ interface InputBoxProps {
   draftOverride: string | null;
   disabled?: boolean;
   onDraftConsumed: () => void;
-  onEnqueue: (text: string, options?: CodexRunOptions) => Promise<void>;
+  onEnqueue: (text: string, options?: CodexRunOptions, threadId?: string | null) => Promise<void>;
   onDirectSubmit?: (text: string) => void | (() => void);
   onDirectSubmitError?: (text: string, error: string) => void;
 }
@@ -225,7 +225,7 @@ export default function InputBox({
       }
 
       if (isRunning) {
-        await onEnqueue(text, runOptions);
+        await onEnqueue(text, runOptions, threadId);
         setDraft('');
         return;
       }

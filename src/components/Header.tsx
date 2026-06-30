@@ -1,6 +1,8 @@
 import { List, Moon, Plus, RefreshCw, Sun } from 'lucide-react';
 import type { ReactNode } from 'react';
 import type { AppServerHealth, ConnectionState } from '../hooks/useCodexSocket';
+import type { CodexModelOption, CodexReasoningEffortOption } from '../types/ui';
+import RuntimeOptionPicker from './RuntimeOptionPicker';
 
 interface HeaderProps {
   hostname: string | null;
@@ -10,6 +12,13 @@ interface HeaderProps {
   model?: string | null;
   mode?: string | null;
   effort?: string | null;
+  modelOptions?: CodexModelOption[];
+  effortOptions?: CodexReasoningEffortOption[];
+  runtimeOptionsDisabled?: boolean;
+  runtimeOptionsLoading?: boolean;
+  onOpenRuntimeOptions?: () => void;
+  onSelectModel?: (model: string) => void;
+  onSelectEffort?: (effort: string) => void;
   sandbox?: string | null;
   theme: 'dark' | 'light';
   onToggleTheme: () => void;
@@ -59,9 +68,34 @@ export default function Header(props: HeaderProps) {
           {trimPath(props.cwd)}
         </span>
       )}
-      {props.model && <span className="badge">{props.model}</span>}
+      <RuntimeOptionPicker
+        label="Model"
+        value={props.model ?? null}
+        options={(props.modelOptions ?? []).map((model) => ({
+          value: model.model,
+          label: model.displayName,
+          description: model.description,
+          isDefault: model.isDefault,
+        }))}
+        disabled={props.runtimeOptionsDisabled}
+        loading={props.runtimeOptionsLoading}
+        onOpen={props.onOpenRuntimeOptions}
+        onSelect={props.onSelectModel}
+      />
       {props.mode && <span className="badge">{props.mode}</span>}
-      {props.effort && <span className="badge">{props.effort}</span>}
+      <RuntimeOptionPicker
+        label="Effort"
+        value={props.effort ?? null}
+        options={(props.effortOptions ?? []).map((effort) => ({
+          value: effort.reasoningEffort,
+          label: effort.reasoningEffort,
+          description: effort.description,
+        }))}
+        disabled={props.runtimeOptionsDisabled}
+        loading={props.runtimeOptionsLoading}
+        onOpen={props.onOpenRuntimeOptions}
+        onSelect={props.onSelectEffort}
+      />
       {props.sandbox && <span className="badge">{props.sandbox}</span>}
       {props.sessionError && (
         <span className="topbar-error" title={props.sessionError}>

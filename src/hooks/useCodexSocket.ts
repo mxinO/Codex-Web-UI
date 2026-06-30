@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { timelineNotificationMeta, withTimelineNotificationMeta } from '../lib/timeline';
-import type { CodexRunOptions } from '../types/ui';
+import type { CodexRunOptions, ThreadGoal } from '../types/ui';
 
 export type ConnectionState = 'connecting' | 'connected' | 'disconnected' | 'auth-error';
 
@@ -27,8 +27,9 @@ interface ServerHello {
     effort: string | null;
     mode: string | null;
     sandbox: string | null;
+    activeGoal: ThreadGoal | null;
     theme: 'dark' | 'light';
-    queue: Array<{ id: string; text: string; createdAt: number; options?: Partial<CodexRunOptions> }>;
+    queue: Array<{ id: string; threadId?: string; text: string; createdAt: number; deliveryState?: 'maybeSent'; options?: Partial<CodexRunOptions> }>;
   };
   requests?: unknown[];
 }
@@ -205,6 +206,24 @@ function writeStoredNotificationReplayState(value: StoredNotificationReplayState
   }
 }
 
+function latestReplayStateAfterNotifications(
+  current: StoredNotificationReplayState,
+  notifications: unknown[],
+): StoredNotificationReplayState {
+  let next = current;
+  for (const notification of notifications) {
+    const meta = timelineNotificationMeta(notification);
+    if (!meta) continue;
+    const seq = meta?.seq;
+    if (typeof seq !== 'number' || !Number.isFinite(seq) || seq < 0) continue;
+    const streamId = meta.streamId ?? next.streamId;
+    if (streamId !== next.streamId || next.seq === null || seq > next.seq) {
+      next = { streamId: streamId ?? null, seq };
+    }
+  }
+  return next;
+}
+
 export function useCodexSocket() {
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
   const [hello, setHello] = useState<ServerHello | null>(null);
@@ -246,6 +265,11 @@ export function useCodexSocket() {
     const buffered = notificationBufferRef.current;
     if (buffered.length === 0) return;
     notificationBufferRef.current = [];
+    const nextReplayState = latestReplayStateAfterNotifications(storedReplayStateRef.current, buffered);
+    if (nextReplayState.streamId !== storedReplayStateRef.current.streamId || nextReplayState.seq !== storedReplayStateRef.current.seq) {
+      storedReplayStateRef.current = nextReplayState;
+      writeStoredNotificationReplayState(nextReplayState);
+    }
     setNotificationCount((count) => count + buffered.length);
     setNotifications((items) => [...items, ...buffered].slice(-MAX_RETAINED_NOTIFICATIONS));
   }, []);
@@ -303,11 +327,6 @@ export function useCodexSocket() {
       const oldest = seen.values().next().value;
       if (typeof oldest !== 'string') break;
       seen.delete(oldest);
-    }
-    const current = storedReplayStateRef.current;
-    if (normalizedStreamId !== current.streamId || current.seq === null || seq > current.seq) {
-      storedReplayStateRef.current = { streamId: normalizedStreamId ?? null, seq };
-      writeStoredNotificationReplayState(storedReplayStateRef.current);
     }
     return true;
   }, []);

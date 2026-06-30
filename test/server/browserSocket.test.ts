@@ -177,9 +177,36 @@ function nextRpcResponse(ws: WebSocket, id: number): Promise<RpcMessage> {
   });
 }
 
+function nextCodexNotification(ws: WebSocket, method: string): Promise<RpcMessage> {
+  return new Promise((resolve) => {
+    const onMessage = (data: RawData) => {
+      const message = JSON.parse(String(data)) as RpcMessage & { message?: { method?: string } };
+      if (message.type === 'codex/notification' && message.message?.method === method) {
+        ws.off('message', onMessage);
+        resolve(message);
+      }
+    };
+    ws.on('message', onMessage);
+  });
+}
+
 async function flushPromises(): Promise<void> {
   await Promise.resolve();
   await Promise.resolve();
+}
+
+async function expectPending(promise: Promise<unknown>): Promise<void> {
+  let settled = false;
+  void promise.then(
+    () => {
+      settled = true;
+    },
+    () => {
+      settled = true;
+    },
+  );
+  await new Promise<void>((resolve) => setTimeout(resolve, 20));
+  expect(settled).toBe(false);
 }
 
 async function waitForRequest(request: ReturnType<typeof vi.fn>): Promise<void> {
@@ -313,6 +340,64 @@ describe('attachBrowserSocket session RPCs', () => {
       activeThreadId: 'thread-1',
       activeCwd: '/normalized/project',
       recentCwds: ['/normalized/project'],
+    });
+  });
+
+  it('rejects a stale thread start response after the app-server generation changes', async () => {
+    const startResult = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/start') return startResult.promise as Promise<T>;
+      return Promise.reject(new Error(`unexpected method: ${method}`));
+    });
+    const { ws, stateStore, start, health, emitHealthChange } = await makeHarness(request);
+    health.mockReturnValue({ connected: false, dead: true, error: 'app-server stopped', readyzUrl: null, url: null });
+    start.mockImplementationOnce(async () => {
+      health.mockReturnValue({
+        connected: true,
+        dead: false,
+        error: null,
+        readyzUrl: 'http://127.0.0.1:1/readyz',
+        url: 'ws://127.0.0.1:1',
+      });
+    });
+
+    const response = nextRpcResponse(ws, 225);
+    ws.send(JSON.stringify({ type: 'rpc', id: 225, method: 'webui/session/start', params: { cwd: '/work/project' } }));
+    await waitForRequest(start);
+    await waitForRequest(request);
+
+    health.mockReturnValue({ connected: false, dead: true, error: 'app-server restarted', readyzUrl: null, url: null });
+    emitHealthChange();
+    health.mockReturnValue({
+      connected: true,
+      dead: false,
+      error: null,
+      readyzUrl: 'http://127.0.0.1:2/readyz',
+      url: 'ws://127.0.0.1:2',
+    });
+    startResult.resolve({
+      thread: { id: 'thread-stale', cwd: '/work/project' },
+      model: 'gpt-stale',
+      reasoningEffort: 'high',
+    });
+
+    expect(await response).toEqual({
+      type: 'rpc/error',
+      id: 225,
+      error: 'Codex app-server changed while starting session',
+    });
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: null,
+      activeThreadPath: null,
+      model: null,
+      effort: null,
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 226, method: 'webui/thread/status', params: { threadId: 'thread-stale' } }));
+    expect(await nextRpcResponse(ws, 226)).toEqual({
+      type: 'rpc/error',
+      id: 226,
+      error: 'thread is not the active session',
     });
   });
 
@@ -796,6 +881,930 @@ describe('attachBrowserSocket session RPCs', () => {
     expect(stateStore.read()).toMatchObject({ activeThreadId: null, activeTurnId: null });
   });
 
+  it('proxies the visible model catalog without retaining a server cache', async () => {
+    const catalog = {
+      data: [
+        {
+          id: 'gpt-5.5',
+          model: 'gpt-5.5',
+          displayName: 'GPT-5.5',
+          description: 'Latest coding model',
+          hidden: false,
+          supportedReasoningEfforts: [{ reasoningEffort: 'high', description: 'Deep reasoning' }],
+          defaultReasoningEffort: 'high',
+          isDefault: true,
+        },
+      ],
+      nextCursor: null,
+    };
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue(catalog);
+    const { ws } = await makeHarness(request);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 57, method: 'webui/model/list' }));
+
+    expect(await nextRpcResponse(ws, 57)).toEqual({ type: 'rpc/result', id: 57, result: catalog });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledWith('model/list', { cursor: null, limit: 100, includeHidden: false });
+  });
+
+  it('collects every visible model catalog page', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (_method, params) => {
+      const cursor = (params as { cursor?: string | null }).cursor;
+      return cursor === null
+        ? { data: [{ id: 'model-a', model: 'model-a' }], nextCursor: 'page-2' }
+        : { data: [{ id: 'model-b', model: 'model-b' }], nextCursor: null };
+    });
+    const { ws } = await makeHarness(request);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 69, method: 'webui/model/list' }));
+
+    expect(await nextRpcResponse(ws, 69)).toEqual({
+      type: 'rpc/result',
+      id: 69,
+      result: {
+        data: [{ id: 'model-a', model: 'model-a' }, { id: 'model-b', model: 'model-b' }],
+        nextCursor: null,
+      },
+    });
+    expect(request).toHaveBeenNthCalledWith(1, 'model/list', { cursor: null, limit: 100, includeHidden: false });
+    expect(request).toHaveBeenNthCalledWith(2, 'model/list', { cursor: 'page-2', limit: 100, includeHidden: false });
+  });
+
+  it('waits for matching app-server settings confirmation before reporting success', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({});
+    const { ws, stateStore, notify } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+        activeCwd: '/work/project',
+        activeTurnId: null,
+        model: 'gpt-5.4',
+        effort: 'medium',
+        mode: 'plan',
+        sandbox: 'workspace-write',
+      },
+    });
+
+    const response = nextRpcResponse(ws, 58);
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 58,
+        method: 'webui/thread/runtime-options/set',
+        params: { threadId: 'thread-1', model: 'gpt-5.6-sol', effort: 'ultra' },
+      }),
+    );
+    await waitForRequest(request);
+
+    expect(request).toHaveBeenCalledWith('thread/settings/update', {
+      threadId: 'thread-1',
+      model: 'gpt-5.6-sol',
+      effort: 'ultra',
+    });
+    await expectPending(response);
+    expect(stateStore.read()).toMatchObject({ model: 'gpt-5.4', effort: 'medium' });
+
+    notify('thread/settings/updated', {
+      threadId: 'thread-old',
+      threadSettings: { model: 'gpt-5.6-sol', effort: 'ultra' },
+    });
+    await expectPending(response);
+    expect(stateStore.read()).toMatchObject({ model: 'gpt-5.4', effort: 'medium' });
+
+    const notificationMessages = nextMessages(ws, 2);
+    notify('thread/settings/updated', {
+      threadId: 'thread-1',
+      threadSettings: { model: 'gpt-5.6-sol', effort: 'ultra' },
+    });
+    const [hello] = await notificationMessages;
+
+    expect(await response).toEqual({
+      type: 'rpc/result',
+      id: 58,
+      result: { model: 'gpt-5.6-sol', effort: 'ultra' },
+    });
+    expect(hello).toMatchObject({
+      type: 'server/hello',
+      state: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+        activeCwd: '/work/project',
+        model: 'gpt-5.6-sol',
+        effort: 'ultra',
+        mode: 'plan',
+        sandbox: 'workspace-write',
+      },
+    });
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeCwd: '/work/project',
+      model: 'gpt-5.6-sol',
+      effort: 'ultra',
+      mode: 'plan',
+      sandbox: 'workspace-write',
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 581, method: 'webui/thread/status', params: { threadId: 'thread-1' } }));
+    expect(await nextRpcResponse(ws, 581)).toMatchObject({
+      type: 'rpc/result',
+      id: 581,
+      result: {
+        threadId: 'thread-1',
+        model: 'gpt-5.6-sol',
+        effort: 'ultra',
+        confirmed: true,
+        confirmationSource: 'settingsUpdated',
+        confirmedAt: expect.any(String),
+      },
+    });
+  });
+
+  it('ignores nonmatching active-thread settings while update confirmation is pending', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({});
+    const { ws, stateStore, notify } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeCwd: '/work/project',
+        activeTurnId: null,
+        model: 'gpt-current',
+        effort: 'medium',
+      },
+    });
+
+    const response = nextRpcResponse(ws, 593);
+    ws.send(JSON.stringify({
+      type: 'rpc',
+      id: 593,
+      method: 'webui/thread/runtime-options/set',
+      params: { threadId: 'thread-1', model: 'gpt-requested', effort: 'ultra' },
+    }));
+    await waitForRequest(request);
+
+    const forwarded = nextCodexNotification(ws, 'thread/settings/updated');
+    notify('thread/settings/updated', {
+      threadId: 'thread-1',
+      threadSettings: { model: 'gpt-stale', effort: 'low' },
+    });
+
+    await expect(forwarded).resolves.toMatchObject({
+      type: 'codex/notification',
+      message: {
+        method: 'thread/settings/updated',
+        params: {
+          threadId: 'thread-1',
+          threadSettings: { model: 'gpt-stale', effort: 'low' },
+        },
+      },
+    });
+    await expectPending(response);
+    expect(stateStore.read()).toMatchObject({ model: 'gpt-current', effort: 'medium' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 594, method: 'webui/thread/status', params: { threadId: 'thread-1' } }));
+    expect(await nextRpcResponse(ws, 594)).toMatchObject({
+      type: 'rpc/result',
+      id: 594,
+      result: {
+        model: 'gpt-current',
+        effort: 'medium',
+        confirmed: false,
+        confirmationSource: null,
+      },
+    });
+
+    notify('thread/settings/updated', {
+      threadId: 'thread-1',
+      threadSettings: { model: 'gpt-requested', effort: 'ultra' },
+    });
+    expect(await response).toEqual({
+      type: 'rpc/result',
+      id: 593,
+      result: { model: 'gpt-requested', effort: 'ultra' },
+    });
+  });
+
+  it('returns an honest timeout error and cleans up when settings confirmation never arrives', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({});
+    const { ws, stateStore, notify } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeTurnId: null,
+        model: 'gpt-5.4',
+        effort: 'medium',
+      },
+    });
+
+    ws.send(JSON.stringify({
+      type: 'rpc',
+      id: 582,
+      method: 'webui/thread/runtime-options/set',
+      params: { threadId: 'thread-1', model: 'gpt-timeout', effort: 'high' },
+    }));
+
+    expect(await nextRpcResponse(ws, 582)).toEqual({
+      type: 'rpc/error',
+      id: 582,
+      error: 'timed out waiting for Codex to confirm model and effort update',
+    });
+    expect(stateStore.read()).toMatchObject({ model: 'gpt-5.4', effort: 'medium' });
+
+    const retryResponse = nextRpcResponse(ws, 583);
+    ws.send(JSON.stringify({
+      type: 'rpc',
+      id: 583,
+      method: 'webui/thread/runtime-options/set',
+      params: { threadId: 'thread-1', model: 'gpt-retry', effort: 'low' },
+    }));
+    await waitForRequestCalls(request, 2);
+    notify('thread/settings/updated', {
+      threadId: 'thread-1',
+      threadSettings: { model: 'gpt-retry', effort: 'low' },
+    });
+
+    expect(await retryResponse).toEqual({
+      type: 'rpc/result',
+      id: 583,
+      result: { model: 'gpt-retry', effort: 'low' },
+    });
+  });
+
+  it('reports authoritative runtime confirmation and latest rollout context during a turn', async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-runtime-status-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    const rolloutPath = join(sessionDir, 'rollout-thread-status.jsonl');
+    writeFileSync(rolloutPath, [
+      JSON.stringify({
+        timestamp: '2026-06-30T01:00:00.000Z',
+        type: 'turn_context',
+        payload: { turn_id: 'turn-old', model: 'gpt-old', effort: 'medium' },
+      }),
+      JSON.stringify({
+        timestamp: '2026-06-30T02:00:00.000Z',
+        type: 'turn_context',
+        payload: { turn_id: 'turn-latest', model: 'gpt-5.6-sol', effort: 'ultra' },
+      }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started' } }),
+      '',
+    ].join('\n'));
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({
+      thread: { id: 'thread-status', cwd: '/work/status', path: rolloutPath },
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'ultra',
+      sandbox: { type: 'readOnly' },
+    });
+    const { ws, stateStore } = await makeHarness(request);
+
+    ws.send(JSON.stringify({
+      type: 'rpc',
+      id: 584,
+      method: 'webui/session/start',
+      params: {
+        cwd: '/work/status',
+        options: { model: 'gpt-5.6-sol', effort: 'ultra', mode: 'plan', sandbox: 'read-only' },
+      },
+    }));
+    expect(await nextRpcResponse(ws, 584)).toMatchObject({ type: 'rpc/result', id: 584 });
+    stateStore.write({ ...stateStore.read(), activeTurnId: 'turn-running' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 585, method: 'webui/thread/status', params: { threadId: 'thread-status' } }));
+
+    expect(await nextRpcResponse(ws, 585)).toEqual({
+      type: 'rpc/result',
+      id: 585,
+      result: {
+        hostname: 'test-host',
+        threadId: 'thread-status',
+        cwd: '/work/status',
+        activeTurnId: 'turn-running',
+        model: 'gpt-5.6-sol',
+        effort: 'ultra',
+        mode: 'plan',
+        sandbox: 'read-only',
+        confirmed: true,
+        confirmationSource: 'threadStart',
+        confirmedAt: expect.any(String),
+        lastTurn: {
+          status: 'found',
+          context: {
+            turnId: 'turn-latest',
+            model: 'gpt-5.6-sol',
+            effort: 'ultra',
+            recordedAt: '2026-06-30T02:00:00.000Z',
+          },
+          scannedBytes: expect.any(Number),
+        },
+      },
+    });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects a runtime status snapshot when its path and app-server generation change during lookup', async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-runtime-status-race-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    const oldRolloutPath = join(sessionDir, 'rollout-old.jsonl');
+    const newRolloutPath = join(sessionDir, 'rollout-new.jsonl');
+    writeFileSync(oldRolloutPath, `${JSON.stringify({
+      timestamp: '2026-06-30T01:00:00.000Z',
+      type: 'turn_context',
+      payload: { turn_id: 'turn-old', model: 'gpt-old', effort: 'low' },
+    })}\n`);
+    writeFileSync(newRolloutPath, `${JSON.stringify({
+      timestamp: '2026-06-30T02:00:00.000Z',
+      type: 'turn_context',
+      payload: { turn_id: 'turn-new', model: 'gpt-new', effort: 'high' },
+    })}\n`);
+
+    const lookupStarted = deferred<void>();
+    const continueLookup = deferred<void>();
+    const originalOpen = fs.open.bind(fs);
+    const openSpy = vi.spyOn(fs, 'open').mockImplementation(async (...args) => {
+      if (String(args[0]) === oldRolloutPath) {
+        lookupStarted.resolve(undefined);
+        await continueLookup.promise;
+      }
+      return originalOpen(...args);
+    });
+    cleanups.push(() => openSpy.mockRestore());
+
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, health, emitHealthChange } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-status-race',
+        activeThreadPath: oldRolloutPath,
+        activeCwd: '/work/old',
+        model: 'gpt-old',
+        effort: 'low',
+      },
+    });
+
+    const response = nextRpcResponse(ws, 593);
+    ws.send(JSON.stringify({
+      type: 'rpc',
+      id: 593,
+      method: 'webui/thread/status',
+      params: { threadId: 'thread-status-race' },
+    }));
+    await lookupStarted.promise;
+
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadPath: newRolloutPath,
+      activeCwd: '/work/new',
+      model: 'gpt-new',
+      effort: 'high',
+    });
+    health.mockReturnValue({ connected: false, dead: true, error: 'app-server restarted', readyzUrl: null, url: null });
+    emitHealthChange();
+    health.mockReturnValue({
+      connected: true,
+      dead: false,
+      error: null,
+      readyzUrl: 'http://127.0.0.1:2/readyz',
+      url: 'ws://127.0.0.1:2',
+    });
+    continueLookup.resolve(undefined);
+
+    expect(await response).toEqual({
+      type: 'rpc/error',
+      id: 593,
+      error: 'thread status changed while reading runtime context; retry',
+    });
+  });
+
+  it('rejects runtime status for a thread other than the active session', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws } = await makeHarness(request, {
+      initialState: { activeThreadId: 'thread-active', activeThreadPath: '/sessions/active.jsonl' },
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 586, method: 'webui/thread/status', params: { threadId: 'thread-old' } }));
+
+    expect(await nextRpcResponse(ws, 586)).toEqual({
+      type: 'rpc/error',
+      id: 586,
+      error: 'thread is not the active session',
+    });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('reports no last turn for a newly started unmaterialized session', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({
+      thread: { id: 'thread-empty-status', cwd: '/work/empty' },
+      model: 'gpt-5.5',
+      reasoningEffort: 'high',
+    });
+    const { ws } = await makeHarness(request);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 587, method: 'webui/session/start', params: { cwd: '/work/empty' } }));
+    expect(await nextRpcResponse(ws, 587)).toMatchObject({ type: 'rpc/result', id: 587 });
+
+    ws.send(JSON.stringify({
+      type: 'rpc',
+      id: 588,
+      method: 'webui/thread/status',
+      params: { threadId: 'thread-empty-status' },
+    }));
+    expect(await nextRpcResponse(ws, 588)).toMatchObject({
+      type: 'rpc/result',
+      id: 588,
+      result: {
+        threadId: 'thread-empty-status',
+        confirmed: true,
+        confirmationSource: 'threadStart',
+        lastTurn: { status: 'none', context: null, scannedBytes: 0 },
+      },
+    });
+  });
+
+  it('ignores old-thread settings notifications without replacing resume confirmation', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({
+      thread: { id: 'thread-active', cwd: '/work/active' },
+      model: 'gpt-active',
+      reasoningEffort: 'high',
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 589, method: 'webui/session/resume', params: { threadId: 'thread-active' } }));
+    expect(await nextRpcResponse(ws, 589)).toMatchObject({ type: 'rpc/result', id: 589 });
+
+    notify('thread/settings/updated', {
+      threadId: 'thread-old',
+      threadSettings: { model: 'gpt-stale', effort: 'low' },
+    });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-active', model: 'gpt-active', effort: 'high' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 590, method: 'webui/thread/status', params: { threadId: 'thread-active' } }));
+    expect(await nextRpcResponse(ws, 590)).toMatchObject({
+      type: 'rpc/result',
+      id: 590,
+      result: {
+        model: 'gpt-active',
+        effort: 'high',
+        confirmed: true,
+        confirmationSource: 'threadResume',
+      },
+    });
+  });
+
+  it('resets runtime confirmation when the app-server generation changes', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({
+      thread: { id: 'thread-active', cwd: '/work/active' },
+      model: 'gpt-active',
+      reasoningEffort: 'high',
+    });
+    const { ws, emitHealthChange, health } = await makeHarness(request);
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 591, method: 'webui/session/resume', params: { threadId: 'thread-active' } }));
+    expect(await nextRpcResponse(ws, 591)).toMatchObject({ type: 'rpc/result', id: 591 });
+
+    health.mockReturnValue({ connected: false, dead: true, error: 'app-server exited', readyzUrl: null, url: null });
+    emitHealthChange();
+    ws.send(JSON.stringify({ type: 'rpc', id: 592, method: 'webui/thread/status', params: { threadId: 'thread-active' } }));
+
+    expect(await nextRpcResponse(ws, 592)).toMatchObject({
+      type: 'rpc/result',
+      id: 592,
+      result: {
+        model: 'gpt-active',
+        effort: 'high',
+        confirmed: false,
+        confirmationSource: null,
+        confirmedAt: null,
+      },
+    });
+  });
+
+  it('does not overwrite runtime state when a turn starts during the settings update', async () => {
+    const resume = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockReturnValue(resume.promise);
+    const { ws, stateStore, notify } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeTurnId: null,
+        model: 'gpt-5.4',
+        effort: 'medium',
+      },
+    });
+
+    const response = nextRpcResponse(ws, 62);
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 62,
+        method: 'webui/thread/runtime-options/set',
+        params: { threadId: 'thread-1', model: 'gpt-5.6-sol', effort: 'ultra' },
+      }),
+    );
+    await waitForRequestCalls(request, 1);
+    stateStore.write({ ...stateStore.read(), activeTurnId: 'turn-1' });
+    resume.resolve({
+      thread: { id: 'thread-1', cwd: '/work/project' },
+      model: 'gpt-5.6-sol',
+      reasoningEffort: 'ultra',
+    });
+    notify('thread/settings/updated', {
+      threadId: 'thread-1',
+      threadSettings: { model: 'gpt-5.6-sol', effort: 'ultra' },
+    });
+
+    expect(await response).toEqual({
+      type: 'rpc/error',
+      id: 62,
+      error: 'thread state changed while updating model or effort',
+    });
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-1',
+      model: 'gpt-5.6-sol',
+      effort: 'ultra',
+    });
+  });
+
+  it('rejects a direct turn start while a settings update is in flight', async () => {
+    const settings = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation((method) => {
+      if (method === 'thread/settings/update') return settings.promise;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, notify } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeTurnId: null,
+        model: 'gpt-5.4',
+        effort: 'medium',
+      },
+    });
+
+    const settingsResponse = nextRpcResponse(ws, 65);
+    ws.send(JSON.stringify({
+      type: 'rpc',
+      id: 65,
+      method: 'webui/thread/runtime-options/set',
+      params: { threadId: 'thread-1', model: 'gpt-5.6-sol', effort: 'ultra' },
+    }));
+    await waitForRequestCalls(request, 1);
+
+    ws.send(JSON.stringify({
+      type: 'rpc',
+      id: 66,
+      method: 'webui/turn/start',
+      params: { threadId: 'thread-1', text: 'start too early' },
+    }));
+    expect(await nextRpcResponse(ws, 66)).toEqual({
+      type: 'rpc/error',
+      id: 66,
+      error: 'model or effort update is in progress; retry the message',
+    });
+    expect(request).toHaveBeenCalledTimes(1);
+
+    settings.resolve({});
+    notify('thread/settings/updated', {
+      threadId: 'thread-1',
+      threadSettings: { model: 'gpt-5.6-sol', effort: 'ultra' },
+    });
+    expect(await settingsResponse).toEqual({
+      type: 'rpc/result',
+      id: 65,
+      result: { model: 'gpt-5.6-sol', effort: 'ultra' },
+    });
+  });
+
+  it('rejects a settings update while a session change is in flight', async () => {
+    const resume = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation((method) => {
+      if (method === 'thread/resume') return resume.promise;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeTurnId: null,
+        model: 'gpt-5.4',
+        effort: 'medium',
+      },
+    });
+
+    const resumeResponse = nextRpcResponse(ws, 67);
+    ws.send(JSON.stringify({
+      type: 'rpc',
+      id: 67,
+      method: 'webui/session/resume',
+      params: { threadId: 'thread-2' },
+    }));
+    await waitForRequestCalls(request, 1);
+
+    ws.send(JSON.stringify({
+      type: 'rpc',
+      id: 68,
+      method: 'webui/thread/runtime-options/set',
+      params: { threadId: 'thread-1', model: 'gpt-5.6-sol', effort: 'ultra' },
+    }));
+    expect(await nextRpcResponse(ws, 68)).toEqual({
+      type: 'rpc/error',
+      id: 68,
+      error: 'session change is in progress',
+    });
+    expect(request).toHaveBeenCalledTimes(1);
+
+    resume.resolve({ thread: { id: 'thread-2', cwd: '/work/two', turns: [] } });
+    expect(await resumeResponse).toMatchObject({ type: 'rpc/result', id: 67 });
+  });
+
+  it('clears an unsupported effort when the selected model has no effort options', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({});
+    const { ws, stateStore, notify } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeTurnId: null,
+        model: 'gpt-5.4',
+        effort: 'high',
+      },
+    });
+
+    const response = nextRpcResponse(ws, 63);
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 63,
+        method: 'webui/thread/runtime-options/set',
+        params: { threadId: 'thread-1', model: 'custom-model', effort: null },
+      }),
+    );
+
+    await waitForRequest(request);
+    notify('thread/settings/updated', {
+      threadId: 'thread-1',
+      threadSettings: { model: 'custom-model', effort: null },
+    });
+
+    expect(await response).toEqual({
+      type: 'rpc/result',
+      id: 63,
+      result: { model: 'custom-model', effort: null },
+    });
+    expect(request).toHaveBeenCalledWith('thread/settings/update', {
+      threadId: 'thread-1',
+      model: 'custom-model',
+      effort: null,
+    });
+    expect(stateStore.read()).toMatchObject({ model: 'custom-model', effort: null });
+  });
+
+  it('falls back to thread resume when an older app-server lacks settings update', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/settings/update') throw new Error('Method not found: thread/settings/update');
+      if (method === 'thread/resume') {
+        return {
+          thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' },
+          model: 'gpt-5.5',
+          reasoningEffort: 'high',
+        };
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+        activeCwd: '/work/project',
+        activeTurnId: null,
+        model: 'gpt-5.4',
+        effort: 'medium',
+      },
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 64,
+        method: 'webui/thread/runtime-options/set',
+        params: { threadId: 'thread-1', model: 'gpt-5.5', effort: 'high' },
+      }),
+    );
+
+    expect(await nextRpcResponse(ws, 64)).toEqual({
+      type: 'rpc/result',
+      id: 64,
+      result: { model: 'gpt-5.5', effort: 'high' },
+    });
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/settings/update', {
+      threadId: 'thread-1',
+      model: 'gpt-5.5',
+      effort: 'high',
+    });
+    expect(request).toHaveBeenNthCalledWith(2, 'thread/resume', {
+      threadId: 'thread-1',
+      path: '/sessions/thread-1.jsonl',
+      experimentalRawEvents: true,
+      persistExtendedHistory: true,
+      excludeTurns: true,
+      model: 'gpt-5.5',
+      config: { model_reasoning_effort: 'high' },
+    }, 120000);
+    expect(stateStore.read()).toMatchObject({ model: 'gpt-5.5', effort: 'high' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 641, method: 'webui/thread/status', params: { threadId: 'thread-1' } }));
+    expect(await nextRpcResponse(ws, 641)).toMatchObject({
+      type: 'rpc/result',
+      id: 641,
+      result: {
+        model: 'gpt-5.5',
+        effort: 'high',
+        confirmed: true,
+        confirmationSource: 'threadResume',
+      },
+    });
+  });
+
+  it('does not claim effort was cleared when an older app-server cannot clear it', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockRejectedValue(new Error('Method not found: thread/settings/update'));
+    const { ws, stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeTurnId: null,
+        model: 'gpt-5.4',
+        effort: 'high',
+      },
+    });
+
+    ws.send(JSON.stringify({
+      type: 'rpc',
+      id: 70,
+      method: 'webui/thread/runtime-options/set',
+      params: { threadId: 'thread-1', model: 'custom-model', effort: null },
+    }));
+
+    expect(await nextRpcResponse(ws, 70)).toEqual({
+      type: 'rpc/error',
+      id: 70,
+      error: 'This Codex app-server version cannot clear reasoning effort; update Codex',
+    });
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(stateStore.read()).toMatchObject({ model: 'gpt-5.4', effort: 'high' });
+  });
+
+  it('updates collaboration mode and sandbox through thread settings', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({});
+    const { ws, stateStore, notify } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeCwd: '/work/project',
+        activeTurnId: null,
+        model: 'gpt-5.6-sol',
+        effort: 'medium',
+        mode: 'default',
+        sandbox: 'workspace-write',
+      },
+    });
+
+    const response = nextRpcResponse(ws, 71);
+    ws.send(JSON.stringify({
+      type: 'rpc',
+      id: 71,
+      method: 'webui/thread/runtime-options/set',
+      params: { threadId: 'thread-1', mode: 'plan', sandbox: 'read-only' },
+    }));
+
+    await waitForRequest(request);
+    notify('thread/settings/updated', {
+      threadId: 'thread-1',
+      threadSettings: { model: 'gpt-5.6-sol', effort: 'medium' },
+    });
+
+    expect(await response).toEqual({
+      type: 'rpc/result',
+      id: 71,
+      result: { model: 'gpt-5.6-sol', effort: 'medium' },
+    });
+    expect(request).toHaveBeenCalledWith('thread/settings/update', {
+      threadId: 'thread-1',
+      collaborationMode: {
+        mode: 'plan',
+        settings: {
+          model: 'gpt-5.6-sol',
+          reasoning_effort: 'medium',
+          developer_instructions: null,
+        },
+      },
+      sandboxPolicy: {
+        type: 'readOnly',
+        access: { type: 'fullAccess' },
+        networkAccess: false,
+      },
+    });
+    expect(stateStore.read()).toMatchObject({ mode: 'plan', sandbox: 'read-only' });
+  });
+
+  it('rejects runtime settings while goal activation is in flight', async () => {
+    const goal = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation((method) => {
+      if (method === 'thread/goal/set') return goal.promise;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws } = await makeHarness(request, {
+      initialState: { activeThreadId: 'thread-1', activeTurnId: null, model: 'gpt-5.4', effort: 'medium' },
+    });
+
+    const goalResponse = nextRpcResponse(ws, 72);
+    ws.send(JSON.stringify({
+      type: 'rpc',
+      id: 72,
+      method: 'webui/thread/goal/set',
+      params: { threadId: 'thread-1', status: 'active' },
+    }));
+    await waitForRequestCalls(request, 1);
+
+    ws.send(JSON.stringify({
+      type: 'rpc',
+      id: 73,
+      method: 'webui/thread/runtime-options/set',
+      params: { threadId: 'thread-1', model: 'gpt-5.6-sol' },
+    }));
+    expect(await nextRpcResponse(ws, 73)).toEqual({
+      type: 'rpc/error',
+      id: 73,
+      error: 'goal update is in progress',
+    });
+
+    goal.resolve({});
+    expect(await goalResponse).toMatchObject({ type: 'rpc/result', id: 72 });
+  });
+
+  it('rejects runtime model and effort changes while the active thread is running', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        model: 'gpt-5.4',
+        effort: 'medium',
+      },
+    });
+    stateStore.write({ ...stateStore.read(), activeTurnId: 'turn-1' });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 59,
+        method: 'webui/thread/runtime-options/set',
+        params: { threadId: 'thread-1', model: 'gpt-5.5', effort: 'high' },
+      }),
+    );
+
+    expect(await nextRpcResponse(ws, 59)).toEqual({
+      type: 'rpc/error',
+      id: 59,
+      error: 'cannot change model or effort while Codex is working',
+    });
+    expect(request).not.toHaveBeenCalled();
+    expect(stateStore.read()).toMatchObject({ model: 'gpt-5.4', effort: 'medium' });
+  });
+
+  it('rejects runtime model and effort changes for an inactive thread', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws } = await makeHarness(request, {
+      initialState: { activeThreadId: 'thread-1', activeTurnId: null },
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 60,
+        method: 'webui/thread/runtime-options/set',
+        params: { threadId: 'thread-2', model: 'gpt-5.5', effort: 'high' },
+      }),
+    );
+
+    expect(await nextRpcResponse(ws, 60)).toEqual({
+      type: 'rpc/error',
+      id: 60,
+      error: 'thread is not the active session',
+    });
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('preserves runtime model and effort when the app-server update fails', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockRejectedValue(new Error('model unavailable'));
+    const { ws, stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeTurnId: null,
+        model: 'gpt-5.4',
+        effort: 'medium',
+      },
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 61,
+        method: 'webui/thread/runtime-options/set',
+        params: { threadId: 'thread-1', model: 'gpt-5.5', effort: 'high' },
+      }),
+    );
+
+    expect(await nextRpcResponse(ws, 61)).toEqual({ type: 'rpc/error', id: 61, error: 'model unavailable' });
+    expect(stateStore.read()).toMatchObject({ model: 'gpt-5.4', effort: 'medium' });
+  });
+
   it('forwards run options when starting sessions', async () => {
     const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ thread: { id: 'thread-1', cwd: '/work/project' } });
     const { ws } = await makeHarness(request);
@@ -1097,6 +2106,335 @@ describe('attachBrowserSocket session RPCs', () => {
     await flushPromises();
 
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null });
+  });
+
+  it('clears pending manual compaction state when compaction completion omits the final turn id', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'compact-pending:thread-1',
+    });
+
+    notify('thread/compacted', { threadId: 'thread-1' });
+    await flushPromises();
+
+    expect(request).not.toHaveBeenCalled();
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null });
+  });
+
+  it('does not clear pending manual compaction state on a stale thread-scoped task_complete without turn id', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'compact-pending:thread-1',
+      queue: [{ id: 'queued-1', threadId: 'thread-1', text: 'next', createdAt: 1 }],
+    });
+
+    notify('event_msg', { payload: { type: 'task_complete', thread_id: 'thread-1' } });
+    await flushPromises();
+
+    expect(request).not.toHaveBeenCalled();
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: 'compact-pending:thread-1',
+      queue: [{ id: 'queued-1', threadId: 'thread-1', text: 'next', createdAt: 1 }],
+    });
+  });
+
+  it('sets the active thread goal through app-server', async () => {
+    const goal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1',
+      objective: 'Finish the migration',
+      status: 'active',
+      tokenBudget: null,
+      tokensUsed: 12,
+      timeUsedSeconds: 3,
+      createdAt: 100,
+      updatedAt: 101,
+    };
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method, params) => {
+      if (method === 'thread/goal/set') return { goal };
+      throw new Error(`unexpected method ${method} ${JSON.stringify(params)}`);
+    });
+    const { ws, stateStore } = await makeHarness(request, {
+      initialState: { activeThreadId: 'thread-1', activeCwd: '/work/project', activeThreadPath: '/sessions/thread-1.jsonl', activeTurnId: null },
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 44,
+        method: 'webui/thread/goal/set',
+        params: { threadId: 'thread-1', objective: 'Finish the migration', status: 'active' },
+      }),
+    );
+    const response = await nextRpcResponse(ws, 44);
+
+    expect(request).toHaveBeenCalledWith('thread/goal/set', {
+      threadId: 'thread-1',
+      objective: 'Finish the migration',
+      status: 'active',
+    });
+    expect(response).toEqual({ type: 'rpc/result', id: 44, result: { goal } });
+    expect(stateStore.read().activeGoal).toEqual(goal);
+  });
+
+  it('does not interrupt a normal active turn when saving a paused goal objective', async () => {
+    const goal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1',
+      objective: 'Finish the migration',
+      status: 'paused',
+      tokenBudget: null,
+      tokensUsed: 12,
+      timeUsedSeconds: 3,
+      createdAt: 100,
+      updatedAt: 101,
+    };
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method, params) => {
+      if (method === 'thread/goal/set') return { goal };
+      throw new Error(`unexpected method ${method} ${JSON.stringify(params)}`);
+    });
+    const { ws, stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeCwd: '/work/project',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+      },
+    });
+    stateStore.write({ ...stateStore.read(), activeTurnId: 'normal-turn-1' });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 440,
+        method: 'webui/thread/goal/set',
+        params: { threadId: 'thread-1', objective: 'Finish the migration', status: 'paused' },
+      }),
+    );
+    const response = await nextRpcResponse(ws, 440);
+
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledWith('thread/goal/set', {
+      threadId: 'thread-1',
+      objective: 'Finish the migration',
+      status: 'paused',
+    });
+    expect(response).toEqual({ type: 'rpc/result', id: 440, result: { goal } });
+    expect(stateStore.read()).toMatchObject({ activeGoal: goal, activeTurnId: 'normal-turn-1' });
+  });
+
+  it('updates active goal state before forwarding goal notifications', async () => {
+    const goal = {
+      threadId: 'thread-1',
+      objective: 'Keep tests green',
+      status: 'paused',
+      tokenBudget: 1000,
+      tokensUsed: 125,
+      timeUsedSeconds: 30,
+      createdAt: 100,
+      updatedAt: 200,
+    };
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: null });
+
+    const messages = nextMessages(ws, 2);
+    notify('thread/goal/updated', { threadId: 'thread-1', turnId: null, goal });
+
+    expect(await messages).toEqual([
+      expect.objectContaining({
+        type: 'server/hello',
+        state: expect.objectContaining({ activeGoal: goal }),
+      }),
+      {
+        type: 'codex/notification',
+        streamId: expect.any(String),
+        seq: 1,
+        message: { jsonrpc: '2.0', method: 'thread/goal/updated', params: { threadId: 'thread-1', turnId: null, goal } },
+      },
+    ]);
+    expect(stateStore.read().activeGoal).toEqual(goal);
+  });
+
+  it('clears active goal state from app-server notifications', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { stateStore, notify } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeGoal: {
+          threadId: 'thread-1',
+          objective: 'Keep tests green',
+          status: 'active',
+          tokenBudget: null,
+          tokensUsed: 125,
+          timeUsedSeconds: 30,
+          createdAt: 100,
+          updatedAt: 200,
+        },
+      },
+    });
+
+    notify('thread/goal/cleared', { threadId: 'thread-1' });
+    await flushPromises();
+
+    expect(stateStore.read().activeGoal).toBeNull();
+  });
+
+  it('broadcasts active goal state when Codex sends an unscoped goal clear notification', async () => {
+    const goal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1',
+      objective: 'Keep tests green',
+      status: 'active',
+      tokenBudget: null,
+      tokensUsed: 125,
+      timeUsedSeconds: 30,
+      createdAt: 100,
+      updatedAt: 200,
+    };
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, notify } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeGoal: goal,
+      },
+    });
+
+    const messages = nextMessages(ws, 2);
+    notify('thread/goal/cleared');
+
+    expect(await messages).toEqual([
+      expect.objectContaining({
+        type: 'server/hello',
+        state: expect.objectContaining({ activeGoal: null }),
+      }),
+      {
+        type: 'codex/notification',
+        streamId: expect.any(String),
+        seq: 1,
+        message: { jsonrpc: '2.0', method: 'thread/goal/cleared' },
+      },
+    ]);
+    expect(stateStore.read().activeGoal).toBeNull();
+  });
+
+  it('interrupts the active turn when clearing an active goal', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/goal/clear') return { ok: true } as T;
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'turn/interrupt') return { ok: true } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const goal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1',
+      objective: 'Keep tests green',
+      status: 'active',
+      tokenBudget: null,
+      tokensUsed: 125,
+      timeUsedSeconds: 30,
+      createdAt: 100,
+      updatedAt: 200,
+    };
+    const { ws, stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+        activeCwd: '/work/project',
+        activeGoal: goal,
+      },
+    });
+    stateStore.write({ ...stateStore.read(), activeTurnId: 'goal-turn-1' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 45, method: 'webui/thread/goal/clear', params: { threadId: 'thread-1' } }));
+    expect(await nextRpcResponse(ws, 45)).toEqual({ type: 'rpc/result', id: 45, result: { ok: true } });
+    await waitForRequestCalls(request, 3);
+
+    expect(request).toHaveBeenCalledWith('thread/goal/clear', { threadId: 'thread-1' });
+    expect(request).toHaveBeenCalledWith('turn/interrupt', { threadId: 'thread-1', turnId: 'goal-turn-1' });
+    expect(stateStore.read()).toMatchObject({ activeGoal: null, activeTurnId: null });
+  });
+
+  it('interrupts an active goal turn before waiting for a slow goal clear RPC', async () => {
+    const clearGoal = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/goal/clear') return clearGoal.promise as Promise<T>;
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'turn/interrupt') return { ok: true } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const goal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1',
+      objective: 'Keep tests green',
+      status: 'active',
+      tokenBudget: null,
+      tokensUsed: 125,
+      timeUsedSeconds: 30,
+      createdAt: 100,
+      updatedAt: 200,
+    };
+    const { ws, stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+        activeCwd: '/work/project',
+        activeGoal: goal,
+      },
+    });
+    stateStore.write({ ...stateStore.read(), activeTurnId: 'goal-turn-1' });
+
+    const response = nextRpcResponse(ws, 47);
+    ws.send(JSON.stringify({ type: 'rpc', id: 47, method: 'webui/thread/goal/clear', params: { threadId: 'thread-1' } }));
+    await waitForRequestCalls(request, 3);
+
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', {
+      threadId: 'thread-1',
+      path: '/sessions/thread-1.jsonl',
+      experimentalRawEvents: true,
+      persistExtendedHistory: true,
+      excludeTurns: true,
+    }, 120000);
+    expect(request).toHaveBeenNthCalledWith(2, 'turn/interrupt', { threadId: 'thread-1', turnId: 'goal-turn-1' });
+    expect(request).toHaveBeenNthCalledWith(3, 'thread/goal/clear', { threadId: 'thread-1' });
+    expect(stateStore.read()).toMatchObject({ activeTurnId: null });
+
+    clearGoal.resolve({ ok: true });
+    expect(await response).toEqual({ type: 'rpc/result', id: 47, result: { ok: true } });
+  });
+
+  it('does not interrupt a normal active turn when clearing a paused goal', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/goal/clear') return { ok: true } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const goal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1',
+      objective: 'Keep tests green',
+      status: 'paused',
+      tokenBudget: null,
+      tokensUsed: 125,
+      timeUsedSeconds: 30,
+      createdAt: 100,
+      updatedAt: 200,
+    };
+    const { ws, stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+        activeCwd: '/work/project',
+        activeGoal: goal,
+      },
+    });
+    stateStore.write({ ...stateStore.read(), activeTurnId: 'normal-turn-1' });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 46, method: 'webui/thread/goal/clear', params: { threadId: 'thread-1' } }));
+    expect(await nextRpcResponse(ws, 46)).toEqual({ type: 'rpc/result', id: 46, result: { ok: true } });
+
+    expect(request).toHaveBeenCalledWith('thread/goal/clear', { threadId: 'thread-1' });
+    expect(request).not.toHaveBeenCalledWith('turn/interrupt', expect.anything());
+    expect(stateStore.read()).toMatchObject({ activeGoal: null, activeTurnId: 'normal-turn-1' });
   });
 });
 
@@ -3931,7 +5269,6 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
         activeThreadPath: '/sessions/thread-1.jsonl',
         activeTurnId: 'turn-stale',
         activeCwd: '/work/project',
-        queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }],
       },
     });
 
@@ -3942,10 +5279,61 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
         activeThreadPath: '/sessions/thread-1.jsonl',
         activeTurnId: null,
         activeCwd: '/work/project',
-        queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }],
+        queue: [],
       },
     });
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null });
+  });
+
+  it('starts an active-session queued message after clearing a stale persisted active turn on attach', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'turn/start') return { turn: { id: 'turn-next' } } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+        activeTurnId: 'turn-stale',
+        activeCwd: '/work/project',
+        queue: [{ id: 'queued-1', threadId: 'thread-1', text: 'next', createdAt: 1 }],
+      },
+    });
+
+    await waitForRequestCalls(request, 2);
+
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', {
+      threadId: 'thread-1',
+      path: '/sessions/thread-1.jsonl',
+      experimentalRawEvents: true,
+      persistExtendedHistory: true,
+      excludeTurns: true,
+    }, 120000);
+    expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'next', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-next', queue: [] });
+  });
+
+  it('does not start inactive-session queued messages after clearing a stale persisted active turn on attach', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const inactiveQueued = { id: 'queued-2', threadId: 'thread-2', text: 'inactive next', createdAt: 1 };
+    const { stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+        activeTurnId: 'turn-stale',
+        activeCwd: '/work/project',
+        queue: [inactiveQueued],
+      },
+    });
+
+    await flushPromises();
+
+    expect(request).not.toHaveBeenCalled();
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [inactiveQueued] });
   });
 
   it('clears the active turn when the Codex app-server dies', async () => {
@@ -4117,7 +5505,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     const interruptPromise = new Promise<unknown>((resolve) => {
       resolveInterrupt = resolve;
     });
-    const queued = { id: 'queued-1', text: 'queued prompt', createdAt: 1 };
+    const queued = { id: 'queued-1', threadId: 'thread-1', text: 'queued prompt', createdAt: 1 };
     const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
       if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T;
       if (method === 'turn/interrupt') return interruptPromise as T;
@@ -4164,7 +5552,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       { jsonrpc: '2.0', method: 'event_msg', params: { threadId: 'thread-1', turnId: 'turn-1' }, payload: { type: 'task_interrupted' } },
     ],
   ] satisfies Array<[string, Parameters<NotificationHandler>[0]]>)('treats %s as a queued-message barrier', async (_name, notification) => {
-    const queued = { id: 'queued-1', text: 'queued prompt', createdAt: 1 };
+    const queued = { id: 'queued-1', threadId: 'thread-1', text: 'queued prompt', createdAt: 1 };
     const request = vi.fn<CodexAppServer['request']>();
     const { stateStore, notifyRaw } = await makeHarness(request);
     stateStore.write({
@@ -4184,7 +5572,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
   });
 
   it('does not let a stale unscoped terminal clear a newer active turn', async () => {
-    const queued = { id: 'queued-1', text: 'queued prompt', createdAt: 1 };
+    const queued = { id: 'queued-1', threadId: 'thread-1', text: 'queued prompt', createdAt: 1 };
     const request = vi.fn<CodexAppServer['request']>();
     const { stateStore, notifyRaw } = await makeHarness(request);
     stateStore.write({
@@ -4204,7 +5592,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
   });
 
   it('does not let a stale unscoped terminal clear a pending queued start', async () => {
-    const queued = { id: 'queued-1', text: 'queued prompt', createdAt: 1 };
+    const queued = { id: 'queued-1', threadId: 'thread-1', text: 'queued prompt', createdAt: 1 };
     const request = vi.fn<CodexAppServer['request']>();
     const { stateStore, notifyRaw } = await makeHarness(request);
     stateStore.write({
@@ -4227,7 +5615,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     ['turn/completed notification', { jsonrpc: '2.0', method: 'turn/completed' }],
     ['task_complete event', { jsonrpc: '2.0', method: 'event_msg', payload: { type: 'task_complete' } }],
   ] satisfies Array<[string, Parameters<NotificationHandler>[0]]>)('does not let an unscoped %s advance a newer active turn', async (_name, notification) => {
-    const queued = { id: 'queued-1', text: 'queued prompt', createdAt: 1 };
+    const queued = { id: 'queued-1', threadId: 'thread-1', text: 'queued prompt', createdAt: 1 };
     const request = vi.fn<CodexAppServer['request']>();
     const { stateStore, notifyRaw } = await makeHarness(request);
     stateStore.write({
@@ -4244,6 +5632,202 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
 
     expect(request.mock.calls.map(([method]) => method)).not.toContain('turn/start');
     expect(stateStore.read()).toMatchObject({ activeTurnId: 'turn-new', queue: [queued] });
+  });
+
+  it('clears an observed active turn on unscoped task_complete so the next message can start', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({} as T);
+      if (method === 'thread/turns/list') {
+        return Promise.resolve({
+          data: [{ id: 'turn-live', status: 'completed', items: [], startedAt: null, completedAt: null }],
+          nextCursor: null,
+        } as T);
+      }
+      if (method === 'turn/start') return Promise.resolve({ turn: { id: 'turn-second' } } as T);
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notifyRaw } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: null,
+      activeCwd: '/work/project',
+    });
+
+    notifyRaw({ jsonrpc: '2.0', method: 'event_msg', payload: { type: 'task_started', thread_id: 'thread-1', turn_id: 'turn-live' } });
+    await flushPromises();
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-live' });
+
+    notifyRaw({ jsonrpc: '2.0', method: 'event_msg', payload: { type: 'task_complete' } });
+    await waitForActiveTurnCleared(stateStore);
+
+    const response = nextRpcResponse(ws, 154);
+    ws.send(JSON.stringify({ type: 'rpc', id: 154, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'second' } }));
+
+    expect(await response).toEqual({ type: 'rpc/result', id: 154, result: { turn: { id: 'turn-second' } } });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-second' });
+  });
+
+  it('does not let a stale unscoped task_complete clear a newer observed active turn', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({} as T);
+      if (method === 'turn/start') return Promise.resolve({ turn: { id: 'turn-new' } } as T);
+      if (method === 'thread/turns/list') {
+        return Promise.resolve({
+          data: [{ id: 'turn-new', status: 'inProgress', items: [], startedAt: null, completedAt: null }],
+          nextCursor: null,
+        } as T);
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const queued = { id: 'queued-1', threadId: 'thread-1', text: 'queued prompt', createdAt: 1 };
+    const { stateStore, notifyRaw } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-old',
+      activeCwd: '/work/project',
+      queue: [queued],
+    });
+
+    notifyRaw({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-old' } });
+    await waitForRequestCalls(request, 2);
+    notifyRaw({ jsonrpc: '2.0', method: 'turn/started', params: { threadId: 'thread-1', turnId: 'turn-new' } });
+    await flushPromises();
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-new', queue: [] });
+
+    notifyRaw({ jsonrpc: '2.0', method: 'event_msg', payload: { type: 'task_complete' } });
+    await flushPromises();
+
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-new', queue: [] });
+  });
+
+  it('does not let a stale thread-scoped task_complete without turn id clear a newer observed active turn', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({} as T);
+      if (method === 'turn/start') return Promise.resolve({ turn: { id: 'turn-new' } } as T);
+      if (method === 'thread/turns/list') {
+        return Promise.resolve({
+          data: [{ id: 'turn-new', status: 'inProgress', items: [], startedAt: null, completedAt: null }],
+          nextCursor: null,
+        } as T);
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const queued = { id: 'queued-1', threadId: 'thread-1', text: 'queued prompt', createdAt: 1 };
+    const { stateStore, notifyRaw } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-old',
+      activeCwd: '/work/project',
+      queue: [queued],
+    });
+
+    notifyRaw({ jsonrpc: '2.0', method: 'turn/completed', params: { threadId: 'thread-1', turnId: 'turn-old' } });
+    await waitForRequestCalls(request, 2);
+    notifyRaw({ jsonrpc: '2.0', method: 'turn/started', params: { threadId: 'thread-1', turnId: 'turn-new' } });
+    await flushPromises();
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-new', queue: [] });
+
+    notifyRaw({ jsonrpc: '2.0', method: 'event_msg', payload: { type: 'task_complete', thread_id: 'thread-1' } });
+    await flushPromises();
+
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-new', queue: [] });
+  });
+
+  it('drains remaining queued prompts after verified unscoped task_complete while steer is in flight', async () => {
+    const steer = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({} as T);
+      if (method === 'turn/steer') return steer.promise as Promise<T>;
+      if (method === 'thread/turns/list') {
+        return Promise.resolve({
+          data: [{ id: 'turn-1', status: 'completed', items: [], startedAt: null, completedAt: null }],
+          nextCursor: null,
+        } as T);
+      }
+      if (method === 'turn/start') return Promise.resolve({ turn: { id: 'turn-next' } } as T);
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notifyRaw } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+    });
+    notifyRaw({ jsonrpc: '2.0', method: 'turn/started', params: { threadId: 'thread-1', turnId: 'turn-1' } });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 155, method: 'webui/queue/enqueue', params: { text: 'first' } }));
+    expect(await nextRpcResponse(ws, 155)).toMatchObject({ type: 'rpc/result', id: 155 });
+    await waitForRequestCalls(request, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 156, method: 'webui/queue/enqueue', params: { text: 'second' } }));
+    expect(await nextRpcResponse(ws, 156)).toMatchObject({ type: 'rpc/result', id: 156 });
+
+    notifyRaw({ jsonrpc: '2.0', method: 'event_msg', payload: { type: 'task_complete' } });
+    await waitForActiveTurnCleared(stateStore);
+    steer.resolve({ turnId: 'turn-1' });
+    await waitForRequestCalls(request, 4);
+
+    expect(request).toHaveBeenCalledWith('turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'second', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-next', queue: [] });
+  });
+
+  it('starts remaining queued prompts when a steer times out before no-turn task_complete verification finishes', async () => {
+    const steer = deferred<unknown>();
+    const turns = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({} as T);
+      if (method === 'turn/steer') return steer.promise as Promise<T>;
+      if (method === 'thread/turns/list') return turns.promise as Promise<T>;
+      if (method === 'turn/start') return Promise.resolve({ turn: { id: 'turn-next' } } as T);
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notifyRaw } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+    });
+    notifyRaw({ jsonrpc: '2.0', method: 'turn/started', params: { threadId: 'thread-1', turnId: 'turn-1' } });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 157, method: 'webui/queue/enqueue', params: { text: 'first' } }));
+    expect(await nextRpcResponse(ws, 157)).toMatchObject({ type: 'rpc/result', id: 157 });
+    await waitForRequestCalls(request, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 158, method: 'webui/queue/enqueue', params: { text: 'second' } }));
+    expect(await nextRpcResponse(ws, 158)).toMatchObject({ type: 'rpc/result', id: 158 });
+
+    notifyRaw({ jsonrpc: '2.0', method: 'event_msg', payload: { type: 'task_complete' } });
+    await waitForRequestCalls(request, 3);
+    steer.reject(new Error('JSON-RPC request timed out: turn/steer'));
+    await flushPromises();
+    expect(stateStore.read().queue).toMatchObject([{ text: 'first' }, { text: 'second' }]);
+
+    turns.resolve({
+      data: [{ id: 'turn-1', status: 'completed', items: [], startedAt: null, completedAt: null }],
+      nextCursor: null,
+    });
+    await waitForRequestCalls(request, 4);
+
+    expect(request).toHaveBeenCalledWith('turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'second', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-next',
+      queue: [{ text: 'first', deliveryState: 'maybeSent' }],
+    });
   });
 
   it('lets stop clear an active turn when the resumed thread is no longer known to Codex', async () => {
@@ -4266,6 +5850,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
   it('enqueues, updates, and removes queued messages', async () => {
     const request = vi.fn<CodexAppServer['request']>();
     const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1' });
 
     ws.send(JSON.stringify({ type: 'rpc', id: 10, method: 'webui/queue/enqueue', params: { text: ' first ' } }));
     const enqueueResponse = await nextMessage(ws);
@@ -4281,6 +5866,105 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     const removeResponse = await nextMessage(ws);
     expect(removeResponse).toEqual({ type: 'rpc/result', id: 12, result: [] });
     expect(stateStore.read().queue).toEqual([]);
+  });
+
+  it('rejects queued messages without an active or requested session', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore } = await makeHarness(request);
+
+    const response = nextRpcResponse(ws, 110);
+    ws.send(JSON.stringify({ type: 'rpc', id: 110, method: 'webui/queue/enqueue', params: { text: 'floating' } }));
+
+    expect(await response).toEqual({ type: 'rpc/error', id: 110, error: 'threadId is required' });
+    expect(stateStore.read().queue).toEqual([]);
+  });
+
+  it('shows only queued messages owned by the active session', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-2', cwd: '/work/other', path: '/sessions/thread-2.jsonl', turns: [] } } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: null,
+      activeCwd: '/work/project',
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 13, method: 'webui/queue/enqueue', params: { text: 'thread one queued' } }));
+    const queued = (await nextRpcResponse(ws, 13)).result as Array<{ id: string; text: string; threadId?: string }>;
+    expect(queued).toMatchObject([{ text: 'thread one queued', threadId: 'thread-1' }]);
+    expect(stateStore.read().queue).toMatchObject([{ text: 'thread one queued', threadId: 'thread-1' }]);
+
+    const resumeMessages = nextMessages(ws, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 14, method: 'webui/session/resume', params: { threadId: 'thread-2' } }));
+    const messages = await resumeMessages;
+    expect(messages).toContainEqual(expect.objectContaining({ type: 'rpc/result', id: 14 }));
+    const hello = messages.find((message) => message.type === 'server/hello');
+
+    expect(hello).toMatchObject({
+      type: 'server/hello',
+      state: expect.objectContaining({ activeThreadId: 'thread-2', queue: [] }),
+    });
+    expect(stateStore.read().queue).toMatchObject([{ text: 'thread one queued', threadId: 'thread-1' }]);
+  });
+
+  it('does not remove queued messages owned by an inactive session', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const inactiveQueued = { id: 'queued-thread-1', threadId: 'thread-1', text: 'inactive queued', createdAt: 1 };
+    const activeQueued = { id: 'queued-thread-2', threadId: 'thread-2', text: 'active queued', createdAt: 2 };
+    const { ws, stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-2',
+        queue: [inactiveQueued, activeQueued],
+      },
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 132,
+        method: 'webui/queue/remove',
+        params: { id: 'queued-thread-1', includeStatus: true },
+      }),
+    );
+
+    expect(await nextRpcResponse(ws, 132)).toEqual({
+      type: 'rpc/result',
+      id: 132,
+      result: { removed: false, queue: [activeQueued] },
+    });
+    expect(stateStore.read().queue).toEqual([inactiveQueued, activeQueued]);
+  });
+
+  it('does not update queued messages owned by an inactive session', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const inactiveQueued = { id: 'queued-thread-1', threadId: 'thread-1', text: 'inactive queued', createdAt: 1 };
+    const activeQueued = { id: 'queued-thread-2', threadId: 'thread-2', text: 'active queued', createdAt: 2 };
+    const { ws, stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-2',
+        queue: [inactiveQueued, activeQueued],
+      },
+    });
+
+    ws.send(
+      JSON.stringify({
+        type: 'rpc',
+        id: 133,
+        method: 'webui/queue/update',
+        params: { id: 'queued-thread-1', text: 'edited from stale tab' },
+      }),
+    );
+
+    expect(await nextRpcResponse(ws, 133)).toEqual({
+      type: 'rpc/result',
+      id: 133,
+      result: [activeQueued],
+    });
+    expect(stateStore.read().queue).toEqual([inactiveQueued, activeQueued]);
   });
 
   it('reports whether a queued remove actually removed a queued message', async () => {
@@ -4316,8 +6000,8 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       throw new Error(`unexpected method: ${method}`);
     });
     const { ws, stateStore } = await makeHarness(request);
-    const blocked = { id: 'queued-blocked', text: 'blocked', createdAt: 1, options: { model: 'other-model' } };
-    const steerable = { id: 'queued-steerable', text: 'steerable', createdAt: 2 };
+    const blocked = { id: 'queued-blocked', threadId: 'thread-1', text: 'blocked', createdAt: 1, options: { model: 'other-model' } };
+    const steerable = { id: 'queued-steerable', threadId: 'thread-1', text: 'steerable', createdAt: 2 };
     stateStore.write({
       ...stateStore.read(),
       activeThreadId: 'thread-1',
@@ -4598,6 +6282,46 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [] });
   });
 
+  it('clears the active turn when a thread-scoped task_complete arrives while a queued steer is in flight', async () => {
+    const steer = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T);
+      if (method === 'turn/steer') return steer.promise as Promise<T>;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 143, method: 'webui/queue/enqueue', params: { text: 'second message' } }));
+    expect(await nextRpcResponse(ws, 143)).toMatchObject({ type: 'rpc/result', id: 143 });
+    await waitForRequestCalls(request, 2);
+
+    request.mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T);
+      if (method === 'turn/steer') return steer.promise as Promise<T>;
+      if (method === 'thread/turns/list') {
+        return Promise.resolve({
+          data: [{ id: 'turn-1', status: 'completed', items: [], startedAt: null, completedAt: null }],
+          nextCursor: null,
+        } as T);
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    notify('event_msg', { payload: { type: 'task_complete', thread_id: 'thread-1' } });
+    await waitForActiveTurnCleared(stateStore);
+    steer.resolve({ turnId: 'turn-1' });
+    await flushPromises();
+
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'turn/steer', 'thread/turns/list']);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [] });
+  });
+
   it('starts remaining queued messages after an in-flight steer succeeds following completion', async () => {
     const firstSteer = deferred<unknown>();
     const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
@@ -4690,7 +6414,46 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     await flushPromises();
 
     expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'turn/steer']);
-    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [{ text: 'maybe sent' }] });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [{ text: 'maybe sent', deliveryState: 'maybeSent' }] });
+  });
+
+  it('starts later queued messages after a timed-out steer is restored as maybe sent', async () => {
+    const steer = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } } as T);
+      if (method === 'turn/steer') return steer.promise as Promise<T>;
+      if (method === 'turn/start') return Promise.resolve({ turn: { id: 'turn-2' } } as T);
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+    });
+
+    ws.send(JSON.stringify({ type: 'rpc', id: 151, method: 'webui/queue/enqueue', params: { text: 'maybe sent' } }));
+    expect(await nextRpcResponse(ws, 151)).toMatchObject({ type: 'rpc/result', id: 151 });
+    await waitForRequestCalls(request, 2);
+    ws.send(JSON.stringify({ type: 'rpc', id: 152, method: 'webui/queue/enqueue', params: { text: 'next prompt' } }));
+    expect(await nextRpcResponse(ws, 152)).toMatchObject({ type: 'rpc/result', id: 152 });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-1' });
+    await waitForActiveTurnCleared(stateStore);
+    steer.reject(new Error('JSON-RPC request timed out: turn/steer'));
+    await waitForRequestCalls(request, 3);
+
+    expect(request).toHaveBeenNthCalledWith(3, 'turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'next prompt', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-2',
+      queue: [{ text: 'maybe sent', deliveryState: 'maybeSent' }],
+    });
   });
 
   it('does not drain later queued messages into a turn whose completion is still finalizing', async () => {
@@ -4850,7 +6613,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-2', queue: [] });
   });
 
-  it('defers a failed queued steer until its original session is active again', async () => {
+  it('persists a failed queued steer for its inactive owning session', async () => {
     const steer = deferred<unknown>();
     const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
       if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: '/work/project' } } as T);
@@ -4873,11 +6636,66 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     steer.reject(new Error('steer failed after session switch'));
     await flushPromises();
 
-    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-2', activeTurnId: 'turn-2', queue: [] });
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-2',
+      activeTurnId: 'turn-2',
+      queue: [{ threadId: 'thread-1', text: 'thread one only' }],
+    });
 
     ws.send(JSON.stringify({ type: 'rpc', id: 145, method: 'webui/session/resume', params: { threadId: 'thread-1' } }));
     expect(await nextRpcResponse(ws, 145)).toMatchObject({ type: 'rpc/result', id: 145 });
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [{ text: 'thread one only' }] });
+  });
+
+  it('globally bounds failed queued steer recovery across many inactive sessions', async () => {
+    const steerGates: Array<Deferred<unknown>> = [];
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({} as T);
+      if (method === 'turn/steer') {
+        const gate = deferred<unknown>();
+        steerGates.push(gate);
+        return gate.promise as Promise<T>;
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request, { config: { queueLimit: 2 } });
+    const responseTypes: string[] = [];
+
+    for (let index = 0; index < 5; index += 1) {
+      const threadId = `thread-${index}`;
+      stateStore.write({
+        ...stateStore.read(),
+        activeThreadId: threadId,
+        activeTurnId: `turn-${index}`,
+      });
+
+      const response = nextRpcResponse(ws, 200 + index);
+      ws.send(JSON.stringify({
+        type: 'rpc',
+        id: 200 + index,
+        method: 'webui/queue/enqueue',
+        params: { text: `recovery ${index}` },
+      }));
+      const message = await response;
+      responseTypes.push(message.type);
+
+      if (message.type === 'rpc/result') {
+        await waitForRequestCalls(request, steerGates.length * 2);
+        stateStore.write({
+          ...stateStore.read(),
+          activeThreadId: `switched-${index}`,
+          activeTurnId: `turn-switched-${index}`,
+        });
+        steerGates.at(-1)?.reject(new Error(`steer ${index} failed after session switch`));
+        await flushPromises();
+      }
+    }
+
+    expect(responseTypes).toEqual(['rpc/result', 'rpc/result', 'rpc/error', 'rpc/error', 'rpc/error']);
+    expect(stateStore.read().queue.map((message) => [message.threadId, message.text])).toEqual([
+      ['thread-1', 'recovery 1'],
+      ['thread-0', 'recovery 0'],
+    ]);
   });
 
   it('does not write a direct started turn id into a different active session', async () => {
@@ -5163,7 +6981,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       ...stateStore.read(),
       activeThreadId: 'thread-1',
       activeTurnId: 'turn-old',
-      queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }],
+      queue: [{ id: 'queued-1', threadId: 'thread-1', text: 'next', createdAt: 1 }],
     });
 
     notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
@@ -5197,7 +7015,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       ...stateStore.read(),
       activeThreadId: 'thread-1',
       activeTurnId: 'turn-old',
-      queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }],
+      queue: [{ id: 'queued-1', threadId: 'thread-1', text: 'next', createdAt: 1 }],
     });
 
     notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
@@ -5228,7 +7046,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
         ...stateStore.read(),
         activeThreadId: 'thread-1',
         activeTurnId: 'turn-old',
-        queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }],
+        queue: [{ id: 'queued-1', threadId: 'thread-1', text: 'next', createdAt: 1 }],
       });
 
       notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
@@ -5262,7 +7080,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
         ...stateStore.read(),
         activeThreadId: 'thread-1',
         activeTurnId: 'turn-old',
-        queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }],
+        queue: [{ id: 'queued-1', threadId: 'thread-1', text: 'next', createdAt: 1 }],
       });
 
       notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
@@ -5314,7 +7132,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       activeThreadPath: threadPath,
       activeCwd: root,
       activeTurnId: 'turn-old',
-      queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }],
+      queue: [{ id: 'queued-1', threadId: 'thread-1', text: 'next', createdAt: 1 }],
     });
 
     notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
@@ -5345,14 +7163,14 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) =>
       method === 'thread/resume' ? Promise.resolve({} as T) : (startPromise as Promise<T>),
     );
-    const secondQueued = { id: 'queued-2', text: 'second', createdAt: 2 };
+    const secondQueued = { id: 'queued-2', threadId: 'thread-1', text: 'second', createdAt: 2 };
     const { stateStore, notify } = await makeHarness(request);
     stateStore.write({
       ...stateStore.read(),
       activeThreadId: 'thread-1',
       activeTurnId: 'turn-old',
       queue: [
-        { id: 'queued-1', text: 'first', createdAt: 1 },
+        { id: 'queued-1', threadId: 'thread-1', text: 'first', createdAt: 1 },
         secondQueued,
       ],
     });
@@ -5381,20 +7199,26 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     let startCount = 0;
     const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
       if (method === 'thread/resume') return Promise.resolve({} as T);
+      if (method === 'thread/turns/list') {
+        return Promise.resolve({
+          data: [{ id: 'turn-next', status: 'completed', items: [], startedAt: null, completedAt: null }],
+          nextCursor: null,
+        } as T);
+      }
       if (method === 'turn/start') {
         startCount += 1;
         return startCount === 1 ? (startPromise as Promise<T>) : Promise.resolve({ turn: { id: 'turn-after-early' } } as T);
       }
       throw new Error(`unexpected method: ${method}`);
     });
-    const secondQueued = { id: 'queued-2', text: 'second', createdAt: 2 };
+    const secondQueued = { id: 'queued-2', threadId: 'thread-1', text: 'second', createdAt: 2 };
     const { stateStore, notify } = await makeHarness(request);
     stateStore.write({
       ...stateStore.read(),
       activeThreadId: 'thread-1',
       activeTurnId: 'turn-old',
       queue: [
-        { id: 'queued-1', text: 'first', createdAt: 1 },
+        { id: 'queued-1', threadId: 'thread-1', text: 'first', createdAt: 1 },
         secondQueued,
       ],
     });
@@ -5418,6 +7242,144 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-after-early', queue: [] });
   });
 
+  it('starts the next queued prompt after a thread-scoped task_complete without turn id arrives before queued turn start returns', async () => {
+    let resolveStart: (value: unknown) => void = () => undefined;
+    const startPromise = new Promise<unknown>((resolve) => {
+      resolveStart = resolve;
+    });
+    let startCount = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({} as T);
+      if (method === 'thread/turns/list') {
+        return Promise.resolve({
+          data: [{ id: 'turn-next', status: 'completed', items: [], startedAt: null, completedAt: null }],
+          nextCursor: null,
+        } as T);
+      }
+      if (method === 'turn/start') {
+        startCount += 1;
+        return startCount === 1 ? (startPromise as Promise<T>) : Promise.resolve({ turn: { id: 'turn-after-early' } } as T);
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const secondQueued = { id: 'queued-2', threadId: 'thread-1', text: 'second', createdAt: 2 };
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-old',
+      queue: [
+        { id: 'queued-1', threadId: 'thread-1', text: 'first', createdAt: 1 },
+        secondQueued,
+      ],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    await waitForRequestCalls(request, 2);
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-next' });
+    notify('event_msg', { payload: { type: 'task_complete', thread_id: 'thread-1' } });
+    await flushPromises();
+
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [secondQueued] });
+
+    resolveStart({ turn: { id: 'turn-next' } });
+    await waitForRequestCalls(request, 4);
+
+    expect(request).toHaveBeenNthCalledWith(4, 'turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'second', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-after-early', queue: [] });
+  });
+
+  it('does not apply a delayed no-turn completion to a newer queued turn after file summary finalization', async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const threadPath = join(sessionDir, 'rollout-2026-05-05T00-00-00-thread-no-turn-terminal-race.jsonl');
+    const filePath = join(root, 'no-turn-terminal-race.txt');
+    writeFileSync(threadPath, '');
+    writeFileSync(filePath, 'after\n');
+    const store = new FileEditStore(sessionFileEditDbPath(threadPath));
+    store.recordSnapshot({ turnId: 'turn-next', itemId: 'edit-1', path: filePath, before: 'before\n' });
+    store.close();
+
+    const finalizeObserved = deferred<void>();
+    const originalFinalizeFile = FileEditStore.prototype.finalizeFile;
+    const finalizeSpy = vi.spyOn(FileEditStore.prototype, 'finalizeFile').mockImplementation(function (
+      this: FileEditStore,
+      input: Parameters<FileEditStore['finalizeFile']>[0],
+    ) {
+      const result = originalFinalizeFile.call(this, input);
+      if (input.turnId === 'turn-next' && input.path === filePath) finalizeObserved.resolve(undefined);
+      return result;
+    });
+    cleanups.push(() => finalizeSpy.mockRestore());
+
+    const statGate = deferred<ReturnType<typeof statSync>>();
+    const originalStat = fs.stat.bind(fs);
+    const statSpy = vi.spyOn(fs, 'stat').mockImplementation(((target: unknown, ...args: unknown[]) => {
+      if (String(target) === filePath) return statGate.promise;
+      return (originalStat as (...innerArgs: unknown[]) => Promise<unknown>)(target, ...args);
+    }) as never);
+    cleanups.push(() => statSpy.mockRestore());
+
+    let resolveFirstStart: (value: unknown) => void = () => undefined;
+    const firstStart = new Promise<unknown>((resolve) => {
+      resolveFirstStart = resolve;
+    });
+    let startCount = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({ thread: { id: 'thread-1', cwd: root, path: threadPath } } as T);
+      if (method === 'thread/turns/list') {
+        return Promise.resolve({
+          data: [{ id: 'turn-next', status: 'completed', items: [], startedAt: null, completedAt: null }],
+          nextCursor: null,
+        } as T);
+      }
+      if (method === 'turn/start') {
+        startCount += 1;
+        return startCount === 1 ? (firstStart as Promise<T>) : Promise.resolve({ turn: { id: 'turn-second' } } as T);
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const secondQueued = { id: 'queued-2', threadId: 'thread-1', text: 'second', createdAt: 2 };
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: threadPath,
+      activeCwd: root,
+      activeTurnId: 'turn-old',
+      queue: [
+        { id: 'queued-1', threadId: 'thread-1', text: 'first', createdAt: 1 },
+        secondQueued,
+      ],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    await waitForRequestCalls(request, 2);
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-next' });
+    notify('event_msg', { payload: { type: 'task_complete', thread_id: 'thread-1' } });
+    for (let attempt = 0; attempt < 20 && statSpy.mock.calls.length === 0; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    expect(statSpy).toHaveBeenCalled();
+
+    resolveFirstStart({ turn: { id: 'turn-next' } });
+    await waitForRequestCalls(request, 4);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-second', queue: [] });
+
+    statGate.resolve(statSync(filePath));
+    await finalizeObserved.promise;
+    await flushPromises();
+    await flushPromises();
+
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-second', queue: [] });
+  });
+
   it('treats Codex task_complete event messages as turn completion', async () => {
     const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ turn: { id: 'turn-next' } });
     const { stateStore, notify } = await makeHarness(request);
@@ -5425,7 +7387,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       ...stateStore.read(),
       activeThreadId: 'thread-1',
       activeTurnId: 'turn-old',
-      queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }],
+      queue: [{ id: 'queued-1', threadId: 'thread-1', text: 'next', createdAt: 1 }],
     });
 
     notify('event_msg', { payload: { type: 'task_complete', thread_id: 'thread-1', turn_id: 'turn-old' } });
@@ -5433,6 +7395,43 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
 
     expect(request).toHaveBeenNthCalledWith(1, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true, excludeTurns: true }, 120000);
     expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'next', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-next', queue: [] });
+  });
+
+  it('treats thread-scoped Codex task_complete event messages without turn ids as active turn completion', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/turns/list') {
+        return Promise.resolve({
+          data: [{ id: 'turn-old', status: 'completed', items: [], startedAt: null, completedAt: null }],
+          nextCursor: null,
+        } as T);
+      }
+      if (method === 'thread/resume') return Promise.resolve({} as T);
+      if (method === 'turn/start') return Promise.resolve({ turn: { id: 'turn-next' } } as T);
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-old',
+      queue: [{ id: 'queued-1', threadId: 'thread-1', text: 'next', createdAt: 1 }],
+    });
+
+    notify('event_msg', { payload: { type: 'task_complete', thread_id: 'thread-1' } });
+    await waitForRequestCalls(request, 3);
+
+    expect(request).toHaveBeenNthCalledWith(1, 'thread/turns/list', {
+      threadId: 'thread-1',
+      limit: 20,
+      sortDirection: 'desc',
+      itemsView: 'notLoaded',
+    }, 10000);
+    expect(request).toHaveBeenNthCalledWith(2, 'thread/resume', { threadId: 'thread-1', experimentalRawEvents: true, persistExtendedHistory: true, excludeTurns: true }, 120000);
+    expect(request).toHaveBeenNthCalledWith(3, 'turn/start', {
       threadId: 'thread-1',
       input: [{ type: 'text', text: 'next', text_elements: [] }],
     }, TURN_START_RPC_TIMEOUT_MS);
@@ -5450,6 +7449,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       queue: [
         {
           id: 'queued-1',
+          threadId: 'thread-1',
           text: 'next',
           createdAt: 1,
           options: { model: 'gpt-5.5', effort: 'medium', sandbox: 'workspace-write' },
@@ -5486,6 +7486,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       queue: [
         {
           id: 'queued-1',
+          threadId: 'thread-1',
           text: 'next',
           createdAt: 1,
           options: { mode: 'plan', effort: 'high' },
@@ -5516,13 +7517,13 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       throw new Error(`unexpected method: ${method}`);
     });
     const { stateStore, notify } = await makeHarness(request);
-    const secondQueued = { id: 'queued-2', text: 'second', createdAt: 2 };
+    const secondQueued = { id: 'queued-2', threadId: 'thread-1', text: 'second', createdAt: 2 };
     stateStore.write({
       ...stateStore.read(),
       activeThreadId: 'thread-1',
       activeTurnId: 'turn-old',
       queue: [
-        { id: 'queued-1', text: 'first', createdAt: 1 },
+        { id: 'queued-1', threadId: 'thread-1', text: 'first', createdAt: 1 },
         secondQueued,
       ],
     });
@@ -5551,8 +7552,8 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
   });
 
   it('restores a claimed queued message when queued turn start fails', async () => {
-    const claimed = { id: 'queued-1', text: 'first', createdAt: 1 };
-    const secondQueued = { id: 'queued-2', text: 'second', createdAt: 2 };
+    const claimed = { id: 'queued-1', threadId: 'thread-1', text: 'first', createdAt: 1 };
+    const secondQueued = { id: 'queued-2', threadId: 'thread-1', text: 'second', createdAt: 2 };
     const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) =>
       method === 'thread/resume' ? Promise.resolve({} as T) : Promise.reject(new Error('start failed')),
     );
@@ -5575,9 +7576,34 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     });
   });
 
+  it('globally bounds queue entries when restoring a claimed queued message', async () => {
+    const claimed = { id: 'queued-thread-1', threadId: 'thread-1', text: 'current prompt', createdAt: 1 };
+    const inactiveFirst = { id: 'queued-thread-2a', threadId: 'thread-2', text: 'inactive first', createdAt: 2 };
+    const inactiveSecond = { id: 'queued-thread-2b', threadId: 'thread-2', text: 'inactive second', createdAt: 3 };
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) =>
+      method === 'thread/resume' ? Promise.resolve({} as T) : Promise.reject(new Error('start failed')),
+    );
+    const { stateStore, notify } = await makeHarness(request, { config: { queueLimit: 2 } });
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-old',
+      queue: [claimed, inactiveFirst, inactiveSecond],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    await waitForRequestCalls(request, 2);
+
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: null,
+      queue: [claimed, inactiveFirst],
+    });
+  });
+
   it('restores a claimed queued message when queued turn start times out before a task starts', async () => {
-    const claimed = { id: 'queued-1', text: 'first', createdAt: 1 };
-    const secondQueued = { id: 'queued-2', text: 'second', createdAt: 2 };
+    const claimed = { id: 'queued-1', threadId: 'thread-1', text: 'first', createdAt: 1 };
+    const secondQueued = { id: 'queued-2', threadId: 'thread-1', text: 'second', createdAt: 2 };
     const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) =>
       method === 'thread/resume' ? Promise.resolve({} as T) : Promise.reject(new Error('JSON-RPC request timed out: turn/start')),
     );
@@ -5600,7 +7626,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
   });
 
   it('removes a restored queued message if its timed-out turn starts late', async () => {
-    const claimed = { id: 'queued-1', text: 'first', createdAt: 1 };
+    const claimed = { id: 'queued-1', threadId: 'thread-1', text: 'first', createdAt: 1 };
     const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) =>
       method === 'thread/resume' ? Promise.resolve({} as T) : Promise.reject(new Error('JSON-RPC request timed out: turn/start')),
     );
@@ -5624,6 +7650,310 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     await flushPromises();
     expect(request).toHaveBeenCalledTimes(2);
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [] });
+  });
+
+  it('removes inactive session recovery when its timed-out turn starts late', async () => {
+    const claimed = { id: 'queued-1', threadId: 'thread-1', text: 'first', createdAt: 1 };
+    const other = { id: 'queued-2', threadId: 'thread-2', text: 'other session', createdAt: 2 };
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) =>
+      method === 'thread/resume' ? Promise.resolve({} as T) : Promise.reject(new Error('JSON-RPC request timed out: turn/start')),
+    );
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-old',
+      queue: [claimed, other],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    await waitForRequestCalls(request, 2);
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null, queue: [claimed, other] });
+
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-2', activeTurnId: 'turn-2' });
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-late' });
+    await flushPromises();
+
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-2',
+      activeTurnId: 'turn-2',
+      queue: [other],
+    });
+  });
+
+  it('bounds timed-out start tracking across many threads and prunes removed recovery messages', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({} as T);
+      if (method === 'turn/start') return Promise.reject(new Error('JSON-RPC request timed out: turn/start'));
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request, { config: { queueLimit: 2 } });
+    const recovered = Array.from({ length: 5 }, (_, index) => ({
+      id: `queued-${index}`,
+      threadId: `thread-${index}`,
+      text: `timed out ${index}`,
+      createdAt: index,
+    }));
+
+    for (let index = 0; index < recovered.length; index += 1) {
+      const current = stateStore.read();
+      if (current.queue.length >= 2) {
+        const oldest = current.queue[current.queue.length - 1];
+        stateStore.write({ ...current, activeThreadId: oldest.threadId ?? null, activeTurnId: null });
+        const removeResponse = nextRpcResponse(ws, 300 + index);
+        ws.send(JSON.stringify({ type: 'rpc', id: 300 + index, method: 'webui/queue/remove', params: { id: oldest.id } }));
+        expect(await removeResponse).toMatchObject({ type: 'rpc/result' });
+      }
+
+      const claimed = recovered[index];
+      stateStore.write({
+        ...stateStore.read(),
+        activeThreadId: claimed.threadId,
+        activeTurnId: `turn-old-${index}`,
+        queue: [...stateStore.read().queue, claimed],
+      });
+
+      notify('turn/completed', { threadId: claimed.threadId, turnId: `turn-old-${index}` });
+      await waitForRequestCalls(request, (index + 1) * 2);
+      await waitForActiveTurnCleared(stateStore);
+      expect(stateStore.read().queue[0]).toMatchObject(claimed);
+    }
+
+    expect(stateStore.read().queue.map((message) => message.id)).toEqual(['queued-4', 'queued-3']);
+
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-4', activeTurnId: null });
+    notify('turn/started', { threadId: 'thread-4', turnId: 'turn-late-4' });
+    await flushPromises();
+    expect(stateStore.read().queue.map((message) => message.id)).toEqual(['queued-3']);
+
+    const staleRecovery = { ...recovered[0], deliveryState: 'maybeSent' as const };
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-0',
+      activeTurnId: null,
+      queue: [...stateStore.read().queue, staleRecovery],
+    });
+    notify('turn/started', { threadId: 'thread-0', turnId: 'turn-late-0' });
+    await flushPromises();
+
+    expect(stateStore.read().queue).toContainEqual(staleRecovery);
+    expect(request).toHaveBeenCalledTimes(10);
+  });
+
+  it('does not attribute an old late start to a newer pending direct start on the same thread', async () => {
+    const claimed = { id: 'queued-1', threadId: 'thread-1', text: 'first', createdAt: 1 };
+    const directStart = deferred<unknown>();
+    let turnStartCalls = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({} as T);
+      if (method === 'turn/start') {
+        turnStartCalls += 1;
+        if (turnStartCalls === 1) return Promise.reject(new Error('JSON-RPC request timed out: turn/start'));
+        return directStart.promise as Promise<T>;
+      }
+      if (method === 'turn/steer') return Promise.resolve({} as T);
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-old',
+      queue: [claimed],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    await waitForRequestCalls(request, 2);
+    expect(stateStore.read()).toMatchObject({ activeTurnId: null, queue: [claimed] });
+
+    const response = nextRpcResponse(ws, 154);
+    ws.send(JSON.stringify({ type: 'rpc', id: 154, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'direct' } }));
+    await waitForRequestCalls(request, 3);
+
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-old-late' });
+    await flushPromises();
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-start-pending:thread-1',
+      queue: [{ ...claimed, deliveryState: 'maybeSent' }],
+    });
+
+    directStart.resolve({ turn: { id: 'turn-direct' } });
+    expect(await response).toEqual({ type: 'rpc/result', id: 154, result: { turn: { id: 'turn-direct' } } });
+    await flushPromises();
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-direct',
+      queue: [],
+    });
+  });
+
+  it.each([
+    ['a non-timeout error', 'direct start failed'],
+    ['a timeout error', 'JSON-RPC request timed out: turn/start'],
+  ])('reconciles an ambiguous started turn when the newer direct start rejects with %s', async (_label, errorMessage) => {
+    const claimed = { id: 'queued-1', threadId: 'thread-1', text: 'first', createdAt: 1 };
+    const directStart = deferred<unknown>();
+    let turnStartCalls = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({} as T);
+      if (method === 'turn/start') {
+        turnStartCalls += 1;
+        if (turnStartCalls === 1) return Promise.reject(new Error('JSON-RPC request timed out: turn/start'));
+        return directStart.promise as Promise<T>;
+      }
+      if (method === 'turn/steer') return Promise.resolve({} as T);
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-old',
+      queue: [claimed],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    await waitForRequestCalls(request, 2);
+
+    const response = nextRpcResponse(ws, 160);
+    ws.send(JSON.stringify({ type: 'rpc', id: 160, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'direct' } }));
+    await waitForRequestCalls(request, 3);
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-ambiguous' });
+    await flushPromises();
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-start-pending:thread-1',
+      queue: [{ ...claimed, deliveryState: 'maybeSent' }],
+    });
+
+    directStart.reject(new Error(errorMessage));
+    expect(await response).toEqual({ type: 'rpc/error', id: 160, error: errorMessage });
+    await flushPromises();
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-ambiguous',
+      queue: [{ ...claimed, deliveryState: 'maybeSent' }],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-ambiguous' });
+    await waitForActiveTurnCleared(stateStore);
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: null,
+      queue: [{ ...claimed, deliveryState: 'maybeSent' }],
+    });
+  });
+
+  it('preserves timeout recovery when a newer direct start times out before its late notification', async () => {
+    const claimed = { id: 'queued-1', threadId: 'thread-1', text: 'first', createdAt: 1 };
+    let turnStartCalls = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({} as T);
+      if (method === 'turn/start') {
+        turnStartCalls += 1;
+        return Promise.reject(new Error('JSON-RPC request timed out: turn/start'));
+      }
+      if (method === 'turn/steer') return Promise.resolve({} as T);
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-old',
+      queue: [claimed],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    await waitForRequestCalls(request, 2);
+    expect(turnStartCalls).toBe(1);
+    expect(stateStore.read()).toMatchObject({ activeTurnId: null, queue: [claimed] });
+
+    const response = nextRpcResponse(ws, 161);
+    ws.send(JSON.stringify({ type: 'rpc', id: 161, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'direct' } }));
+    expect(await response).toEqual({
+      type: 'rpc/error',
+      id: 161,
+      error: 'JSON-RPC request timed out: turn/start',
+    });
+    expect(turnStartCalls).toBe(2);
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-start-pending:thread-1',
+      queue: [claimed],
+    });
+
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-late-direct' });
+    await flushPromises();
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-late-direct',
+      queue: [{ ...claimed, deliveryState: 'maybeSent' }],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-late-direct' });
+    await waitForActiveTurnCleared(stateStore);
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: null,
+      queue: [{ ...claimed, deliveryState: 'maybeSent' }],
+    });
+  });
+
+  it('preserves restored recovery as maybe sent when a definitely newer direct turn starts', async () => {
+    const claimed = { id: 'queued-1', threadId: 'thread-1', text: 'first', createdAt: 1 };
+    const directStart = deferred<unknown>();
+    let turnStartCalls = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(<T = unknown>(method: string) => {
+      if (method === 'thread/resume') return Promise.resolve({} as T);
+      if (method === 'turn/start') {
+        turnStartCalls += 1;
+        if (turnStartCalls === 1) return Promise.reject(new Error('JSON-RPC request timed out: turn/start'));
+        return directStart.promise as Promise<T>;
+      }
+      if (method === 'turn/steer') return Promise.resolve({} as T);
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-old',
+      queue: [claimed],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
+    await waitForRequestCalls(request, 2);
+    expect(stateStore.read()).toMatchObject({ activeTurnId: null, queue: [claimed] });
+
+    const response = nextRpcResponse(ws, 153);
+    ws.send(JSON.stringify({ type: 'rpc', id: 153, method: 'webui/turn/start', params: { threadId: 'thread-1', text: 'direct' } }));
+    await waitForRequestCalls(request, 3);
+
+    directStart.resolve({ turn: { id: 'turn-direct' } });
+    expect(await response).toEqual({ type: 'rpc/result', id: 153, result: { turn: { id: 'turn-direct' } } });
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-direct',
+      queue: [{ ...claimed, deliveryState: 'maybeSent' }],
+    });
+
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-direct' });
+    await flushPromises();
+    expect(request).toHaveBeenCalledTimes(3);
+    expect(stateStore.read()).toMatchObject({
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-direct',
+      queue: [{ ...claimed, deliveryState: 'maybeSent' }],
+    });
   });
 
   it('preserves queued messages on completion when no thread is active', async () => {
@@ -5650,7 +7980,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       ...stateStore.read(),
       activeThreadId: 'thread-1',
       activeTurnId: 'turn-old',
-      queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }],
+      queue: [{ id: 'queued-1', threadId: 'thread-1', text: 'next', createdAt: 1 }],
     });
 
     notify('turn/completed', { threadId: 'thread-1', turnId: 'turn-old' });
@@ -5658,13 +7988,13 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     resolveStart({ turn: { id: 'turn-from-thread-1' } });
     await flushPromises();
 
-    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-2', activeTurnId: null, queue: [{ id: 'queued-1', text: 'next', createdAt: 1 }] });
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-2', activeTurnId: null, queue: [{ id: 'queued-1', threadId: 'thread-1', text: 'next', createdAt: 1 }] });
   });
 
   it('ignores stale completion notifications from a different active session', async () => {
     const request = vi.fn<CodexAppServer['request']>();
     const { stateStore, notify } = await makeHarness(request);
-    const queued = [{ id: 'queued-1', text: 'next', createdAt: 1 }];
+    const queued = [{ id: 'queued-1', threadId: 'thread-current', text: 'next', createdAt: 1 }];
     stateStore.write({
       ...stateStore.read(),
       activeThreadId: 'thread-current',
@@ -5685,7 +8015,7 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
   it('ignores stale completion notifications for a previous turn in the active session', async () => {
     const request = vi.fn<CodexAppServer['request']>();
     const { stateStore, notify } = await makeHarness(request);
-    const queued = [{ id: 'queued-1', text: 'next', createdAt: 1 }];
+    const queued = [{ id: 'queued-1', threadId: 'thread-1', text: 'next', createdAt: 1 }];
     stateStore.write({
       ...stateStore.read(),
       activeThreadId: 'thread-1',

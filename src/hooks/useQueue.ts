@@ -3,8 +3,10 @@ import type { CodexRunOptions } from '../types/ui';
 
 export interface ClientQueuedMessage {
   id: string;
+  threadId?: string;
   text: string;
   createdAt: number;
+  deliveryState?: 'maybeSent';
   options?: Partial<CodexRunOptions>;
 }
 
@@ -17,8 +19,8 @@ export function useQueue(rpc: <T>(method: string, params?: unknown) => Promise<T
   const [queue, setQueue] = useState<ClientQueuedMessage[]>(initialQueue);
 
   const enqueue = useCallback(
-    async (text: string, options?: CodexRunOptions) => {
-      const next = await rpc<ClientQueuedMessage[]>('webui/queue/enqueue', { text, options });
+    async (text: string, options?: CodexRunOptions, threadId?: string | null) => {
+      const next = await rpc<ClientQueuedMessage[]>('webui/queue/enqueue', { text, options, threadId });
       setQueue(next);
     },
     [rpc],

@@ -30,8 +30,27 @@ import {
 import type { HostStateStore } from './hostState.js';
 import type { JsonRpcServerRequest } from './jsonRpc.js';
 import { logWarn } from './logger.js';
-import { enqueueMessage, removeQueuedMessage, shiftQueuedMessage, updateQueuedMessage } from './queue.js';
-import type { CodexCollaborationMode, CodexReasoningEffort, CodexRunOptions, CodexSandboxMode, GitDiffResult, HostRuntimeState, QueuedMessage } from './types.js';
+import {
+  enqueueMessage,
+  normalizeQueueLimit,
+  prependQueuedMessagesForThread,
+  queueForThread,
+  removeQueuedMessage,
+  shiftQueuedMessage,
+  updateQueuedMessage,
+} from './queue.js';
+import { readLatestTurnRuntimeContext, type TurnRuntimeContextLookup } from './turnRuntimeStatus.js';
+import type {
+  CodexCollaborationMode,
+  CodexRunOptions,
+  CodexSandboxMode,
+  GitDiffResult,
+  HostRuntimeState,
+  QueuedMessage,
+  RuntimeSettingsConfirmation,
+  ThreadGoal,
+  ThreadGoalStatus,
+} from './types.js';
 
 interface BrowserSocketDeps {
   config: ServerConfig;
@@ -61,6 +80,22 @@ interface TurnStartParams {
   threadId: string;
   text: string;
   options?: CodexRunOptions;
+}
+
+interface RuntimeSettingsNotification {
+  threadId: string;
+  model: string;
+  effort: string | null;
+}
+
+interface RuntimeSettingsUpdateWaiter {
+  threadId: string;
+  model: string | undefined;
+  effort: string | null | undefined;
+  generation: number;
+  promise: Promise<{ confirmed: true } | { confirmed: false; error: Error }>;
+  resolve: (result: { confirmed: true } | { confirmed: false; error: Error }) => void;
+  timer: ReturnType<typeof setTimeout> | null;
 }
 
 interface QueuedTurnClaim {
@@ -168,9 +203,9 @@ function getRequiredStringArray(params: unknown, key: string): string[] | null {
   return values.every((value) => typeof value === 'string') ? values : null;
 }
 
-const REASONING_EFFORTS = new Set<CodexReasoningEffort>(['none', 'minimal', 'low', 'medium', 'high', 'xhigh']);
 const SANDBOX_MODES = new Set<CodexSandboxMode>(['read-only', 'workspace-write', 'danger-full-access']);
 const COLLABORATION_MODES = new Set<CodexCollaborationMode>(['default', 'plan']);
+const GOAL_STATUSES = new Set<ThreadGoalStatus>(['active', 'paused', 'blocked', 'usageLimited', 'budgetLimited', 'complete']);
 const TURN_ITEMS_VIEWS = new Set(['notLoaded', 'summary', 'full'] as const);
 const GIT_DIFF_SCOPES = new Set<GitDiffResult['scope']>(['staged', 'unstaged', 'untracked']);
 const BROWSE_DIRECTORY_LIMIT = 500;
@@ -185,11 +220,13 @@ const FILE_DIFF_PATCH_MAX_INCOMPLETE_TURNS = 200;
 const COMPACTION_PENDING_TURN_PREFIX = 'compact-pending:';
 const TURN_START_PENDING_TURN_PREFIX = 'turn-start-pending:';
 const THREAD_TURNS_LIST_RPC_TIMEOUT_MS = 2 * 60 * 1000;
+const UNSCOPED_TERMINAL_VERIFY_RPC_TIMEOUT_MS = 10 * 1000;
 const TURN_START_RPC_TIMEOUT_MS = 10 * 60 * 1000;
 const TURN_STEER_RPC_TIMEOUT_MS = 10 * 60 * 1000;
 const RECENT_NOTIFICATION_MAX_ENTRIES = 500;
 const RECENT_NOTIFICATION_MAX_BYTES = 2 * 1024 * 1024;
 const RECENT_NOTIFICATION_SINGLE_MAX_BYTES = 256 * 1024;
+const RUNTIME_SETTINGS_CONFIRMATION_TIMEOUT_MS = 2_000;
 
 function getOptionalString(params: unknown, key: string): string | null {
   if (!isRecord(params) || !hasOwn(params, key)) return null;
@@ -215,8 +252,11 @@ function runOptionsFromParams(params: unknown): CodexRunOptions | undefined {
   const model = getOptionalString(source, 'model');
   if (model) options.model = model;
 
-  const effort = getOptionalEnum(source, 'effort', REASONING_EFFORTS);
-  if (effort) options.effort = effort;
+  const effort = getOptionalString(source, 'effort');
+  if (effort) {
+    if (effort.length > 64) throw new Error('effort must be at most 64 characters');
+    options.effort = effort;
+  }
 
   const mode = getOptionalEnum(source, 'mode', COLLABORATION_MODES);
   if (mode && options.model) options.mode = mode;
@@ -314,12 +354,11 @@ function sandboxModeFromPolicy(value: unknown): CodexSandboxMode | null {
 
 function runtimeStatusFromThreadResult(result: unknown, fallback?: CodexRunOptions): Pick<HostRuntimeState, 'model' | 'effort' | 'mode' | 'sandbox'> {
   const model = getStringPath(result, ['model']) ?? getStringPath(result, ['data', 'model']) ?? fallback?.model ?? null;
-  const effort =
-    enumValue(getValuePath(result, ['reasoningEffort']), REASONING_EFFORTS) ??
-    enumValue(getValuePath(result, ['reasoning_effort']), REASONING_EFFORTS) ??
-    enumValue(getValuePath(result, ['effort']), REASONING_EFFORTS) ??
-    fallback?.effort ??
-    null;
+  const effortValue =
+    getStringPath(result, ['reasoningEffort']) ??
+    getStringPath(result, ['reasoning_effort']) ??
+    getStringPath(result, ['effort']);
+  const effort = effortValue && effortValue.length <= 64 ? effortValue : fallback?.effort ?? null;
   const sandbox =
     sandboxModeFromPolicy(getValuePath(result, ['sandbox'])) ??
     sandboxModeFromPolicy(getValuePath(result, ['data', 'sandbox'])) ??
@@ -331,6 +370,22 @@ function runtimeStatusFromThreadResult(result: unknown, fallback?: CodexRunOptio
     mode: fallback?.mode ?? null,
     sandbox,
   };
+}
+
+function runtimeSettingsFromNotification(message: { method?: unknown; params?: unknown }): RuntimeSettingsNotification | null {
+  if (message.method !== 'thread/settings/updated' || !isRecord(message.params)) return null;
+  const threadId = getStringPath(message.params, ['threadId']);
+  const threadSettings = getValuePath(message.params, ['threadSettings']);
+  if (!threadId || !isRecord(threadSettings)) return null;
+
+  const model = getStringPath(threadSettings, ['model']);
+  if (!model || !hasOwn(threadSettings, 'effort')) return null;
+  const rawEffort = threadSettings.effort;
+  if (rawEffort !== null && typeof rawEffort !== 'string') return null;
+  const effort = typeof rawEffort === 'string' ? rawEffort.trim() : null;
+  if ((typeof rawEffort === 'string' && !effort) || (effort && effort.length > 64)) return null;
+
+  return { threadId, model, effort };
 }
 
 function applyRunOptionsToRuntimeState(state: HostRuntimeState, options?: CodexRunOptions): HostRuntimeState {
@@ -391,7 +446,89 @@ function notificationTurnId(message: { params?: unknown; payload?: unknown }): s
   );
 }
 
+function finiteNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+function optionalFiniteNumber(value: unknown): number | null {
+  return value === null || value === undefined ? null : finiteNumber(value);
+}
+
+function threadGoalFromValue(value: unknown): ThreadGoal | null {
+  if (!isRecord(value)) return null;
+  const threadId = getStringPath(value, ['threadId']) ?? getStringPath(value, ['thread_id']);
+  const objective = getStringPath(value, ['objective']);
+  const status = enumValue(getValuePath(value, ['status']), GOAL_STATUSES);
+  const tokensUsed = finiteNumber(getValuePath(value, ['tokensUsed'])) ?? finiteNumber(getValuePath(value, ['tokens_used']));
+  const timeUsedSeconds = finiteNumber(getValuePath(value, ['timeUsedSeconds'])) ?? finiteNumber(getValuePath(value, ['time_used_seconds']));
+  const createdAt = finiteNumber(getValuePath(value, ['createdAt'])) ?? finiteNumber(getValuePath(value, ['created_at']));
+  const updatedAt = finiteNumber(getValuePath(value, ['updatedAt'])) ?? finiteNumber(getValuePath(value, ['updated_at']));
+  if (!threadId || !objective || !status || tokensUsed === null || timeUsedSeconds === null || createdAt === null || updatedAt === null) {
+    return null;
+  }
+
+  const tokenBudget =
+    optionalFiniteNumber(getValuePath(value, ['tokenBudget'])) ?? optionalFiniteNumber(getValuePath(value, ['token_budget']));
+
+  return {
+    threadId,
+    objective: objective.slice(0, 4000),
+    status,
+    tokenBudget,
+    tokensUsed,
+    timeUsedSeconds,
+    createdAt,
+    updatedAt,
+  };
+}
+
+function threadGoalFromResult(result: unknown): ThreadGoal | null {
+  return threadGoalFromValue(getValuePath(result, ['goal'])) ?? threadGoalFromValue(getValuePath(result, ['data', 'goal'])) ?? threadGoalFromValue(result);
+}
+
+function threadGoalFromNotification(message: { params?: unknown; payload?: unknown }): ThreadGoal | null {
+  const payload = notificationPayload(message);
+  return threadGoalFromValue(getValuePath(message.params, ['goal'])) ?? threadGoalFromValue(getValuePath(payload, ['goal']));
+}
+
 type TerminalDisposition = 'advance-queue' | 'barrier';
+type ActiveCompletionTarget = { threadId: string; turnId: string };
+
+const TERMINAL_TURN_STATUSES = new Set(['completed', 'failed', 'interrupted', 'canceled', 'cancelled']);
+
+function turnsFromTurnListResult(result: unknown): unknown[] {
+  if (Array.isArray(result)) return result;
+  if (!isRecord(result)) return [];
+  if (Array.isArray(result.data)) return result.data;
+  if (isRecord(result.data) && Array.isArray(result.data.turns)) return result.data.turns;
+  if (Array.isArray(result.turns)) return result.turns;
+  if (isRecord(result.thread) && Array.isArray(result.thread.turns)) return result.thread.turns;
+  return [];
+}
+
+function turnRecordId(turn: unknown): string | null {
+  return getStringPath(turn, ['id']) ?? getStringPath(turn, ['turnId']) ?? getStringPath(turn, ['turn_id']);
+}
+
+function turnStatusText(status: unknown): string | null {
+  if (typeof status === 'string' && status.trim()) return status.trim();
+  return getStringPath(status, ['type']) ?? getStringPath(status, ['status']) ?? getStringPath(status, ['state']);
+}
+
+function turnRecordHasCompletedAt(turn: unknown): boolean {
+  const completedAt = getValuePath(turn, ['completedAt']) ?? getValuePath(turn, ['completed_at']);
+  return completedAt !== null && completedAt !== undefined;
+}
+
+function isTerminalTurnRecord(turn: unknown): boolean {
+  const status = turnStatusText(getValuePath(turn, ['status']) ?? getValuePath(turn, ['state']));
+  if (status) return TERMINAL_TURN_STATUSES.has(status.toLowerCase());
+  return turnRecordHasCompletedAt(turn);
+}
+
+function turnListShowsTerminalTurn(result: unknown, turnId: string): boolean {
+  return turnsFromTurnListResult(result).some((turn) => turnRecordId(turn) === turnId && isTerminalTurnRecord(turn));
+}
 
 function queuedRunOptionsMatchActiveTurn(state: HostRuntimeState, message: QueuedMessage): boolean {
   const options = message.options;
@@ -551,10 +688,20 @@ function completionMatchesActiveTurn(
   activeTurnId: string | null | undefined,
   activeThreadId: string | null | undefined,
   completedTurnId: string | null,
-  options: { allowMissingTurnId: boolean } = { allowMissingTurnId: true },
+  options: { allowMissingTurnId: boolean; completedThreadId?: string | null } = { allowMissingTurnId: true },
 ): boolean {
   if (!activeTurnId) return false;
-  if (!completedTurnId) return options.allowMissingTurnId && isPendingCompactionTurnForThread(activeTurnId, activeThreadId);
+  if (options.completedThreadId && activeThreadId && options.completedThreadId !== activeThreadId) return false;
+  if (!completedTurnId) {
+    if (!options.allowMissingTurnId) return false;
+    if (isPendingCompactionTurnForThread(activeTurnId, activeThreadId)) return true;
+    return Boolean(
+      options.completedThreadId &&
+        activeThreadId &&
+        options.completedThreadId === activeThreadId &&
+        !isPendingTurnForThread(activeTurnId, activeThreadId),
+    );
+  }
   if (completedTurnId === activeTurnId) return true;
   return isPendingCompactionTurnForThread(activeTurnId, activeThreadId);
 }
@@ -567,6 +714,11 @@ function isTurnStartTimeout(error: unknown): boolean {
 function isTurnSteerTimeout(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /timed out:\s*turn\/steer|request timed out:\s*turn\/steer/i.test(message);
+}
+
+function isMethodNotFoundError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /(?:method not found|unknown method|unsupported method|\b-32601\b)/i.test(message);
 }
 
 function lastNotificationSeq(params: unknown): number | null {
@@ -791,7 +943,10 @@ interface TurnContext {
   threadId: string | null;
   threadPath: string | null;
   cwd: string | null;
+  ambiguousTurnId?: string;
 }
+
+type TimedOutQueuedStart = Pick<QueuedMessage, 'id' | 'text'>;
 
 interface FileDiffParams {
   threadId: string | null;
@@ -1141,9 +1296,53 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const resumeThreadPromises = new Map<string, Promise<void>>();
   const knownThreadPaths = new Map<string, string>();
   let appServerGeneration = 0;
+  let runtimeSettingsConfirmation: RuntimeSettingsConfirmation | null = null;
+  let runtimeSettingsUpdateWaiter: RuntimeSettingsUpdateWaiter | null = null;
   let restartInFlight: Promise<unknown> | null = null;
-  const timedOutQueuedStarts = new Map<string, QueuedMessage>();
-  const deferredQueuedMessagesByThread = new Map<string, QueuedMessage[]>();
+  let sessionChangeInFlight = false;
+  const timedOutQueuedStarts = new Map<string, TimedOutQueuedStart>();
+  const retainedDirectStartContexts = new Map<string, TurnContext>();
+  let directStartContextGeneration = 0;
+
+  const clearRetainedDirectStartContexts = (threadId?: string): HostRuntimeState => {
+    const threadIds = threadId ? [threadId] : Array.from(retainedDirectStartContexts.keys());
+    const recoveries: Array<{ threadId: string; recovery: TimedOutQueuedStart }> = [];
+    for (const retainedThreadId of threadIds) {
+      if (!retainedDirectStartContexts.delete(retainedThreadId)) continue;
+      const recovery = timedOutQueuedStarts.get(retainedThreadId);
+      if (!recovery) continue;
+      timedOutQueuedStarts.delete(retainedThreadId);
+      recoveries.push({ threadId: retainedThreadId, recovery });
+    }
+    if (recoveries.length === 0) return deps.stateStore.read();
+    return deps.stateStore.update((current) => ({
+      ...current,
+      queue: current.queue.map((message) => (
+        recoveries.some(({ threadId: owner, recovery }) => (
+          message.threadId === owner && message.id === recovery.id && message.text === recovery.text
+        ))
+          ? { ...message, deliveryState: 'maybeSent' as const }
+          : message
+      )),
+    }));
+  };
+
+  const invalidateRetainedDirectStartContexts = (threadId?: string): HostRuntimeState => {
+    directStartContextGeneration += 1;
+    return clearRetainedDirectStartContexts(threadId);
+  };
+
+  const retainDirectStartContext = (context: TurnContext): void => {
+    if (!context.threadId) return;
+    retainedDirectStartContexts.delete(context.threadId);
+    retainedDirectStartContexts.set(context.threadId, context);
+    const limit = normalizeQueueLimit(deps.config.queueLimit);
+    while (retainedDirectStartContexts.size > limit) {
+      const oldestThreadId = retainedDirectStartContexts.keys().next().value;
+      if (typeof oldestThreadId !== 'string') break;
+      clearRetainedDirectStartContexts(oldestThreadId);
+    }
+  };
   const recentNotifications: Array<{ seq: number; message: unknown; bytes: number }> = [];
   let recentNotificationSeq = 0;
   let recentNotificationBytes = 0;
@@ -1155,10 +1354,86 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const completingTurnKeys = new Set<string>();
   const terminalTurnKeys = new Set<string>();
   const completedTurnKeys = new Set<string>();
+  const verifyingUnscopedTerminalKeys = new Set<string>();
+  const observedTurnStartKeys = new Set<string>();
+  const runtimeOptionUpdates = new Set<string>();
+  const goalUpdates = new Set<string>();
   const turnThreadPaths = new Map<string, string>();
   const turnCwds = new Map<string, string>();
   const livePatchTurnKeys = new Set<string>();
   const capturedPatchEventKeys = new Set<string>();
+
+  const recordRuntimeSettingsConfirmation = (
+    threadId: string | null,
+    runtimeStatus: Pick<HostRuntimeState, 'model' | 'effort'>,
+    source: RuntimeSettingsConfirmation['source'],
+  ): void => {
+    runtimeSettingsConfirmation = threadId && runtimeStatus.model
+      ? {
+          threadId,
+          model: runtimeStatus.model,
+          effort: runtimeStatus.effort,
+          source,
+          confirmedAt: new Date().toISOString(),
+        }
+      : null;
+  };
+
+  const settleRuntimeSettingsUpdateWaiter = (
+    waiter: RuntimeSettingsUpdateWaiter,
+    result: { confirmed: true } | { confirmed: false; error: Error },
+  ): void => {
+    if (waiter.timer) clearTimeout(waiter.timer);
+    waiter.timer = null;
+    if (runtimeSettingsUpdateWaiter === waiter) runtimeSettingsUpdateWaiter = null;
+    waiter.resolve(result);
+  };
+
+  const cancelRuntimeSettingsUpdateWaiter = (waiter: RuntimeSettingsUpdateWaiter, error: Error): void => {
+    if (runtimeSettingsUpdateWaiter !== waiter) return;
+    settleRuntimeSettingsUpdateWaiter(waiter, { confirmed: false, error });
+  };
+
+  const createRuntimeSettingsUpdateWaiter = (
+    threadId: string,
+    model: string | undefined,
+    effort: string | null | undefined,
+  ): RuntimeSettingsUpdateWaiter => {
+    if (runtimeSettingsUpdateWaiter) throw new Error('a runtime settings confirmation is already pending');
+    let resolve!: RuntimeSettingsUpdateWaiter['resolve'];
+    const promise = new Promise<{ confirmed: true } | { confirmed: false; error: Error }>((settle) => {
+      resolve = settle;
+    });
+    const waiter: RuntimeSettingsUpdateWaiter = {
+      threadId,
+      model,
+      effort,
+      generation: appServerGeneration,
+      promise,
+      resolve,
+      timer: null,
+    };
+    waiter.timer = setTimeout(() => {
+      cancelRuntimeSettingsUpdateWaiter(waiter, new Error('timed out waiting for Codex to confirm model and effort update'));
+    }, RUNTIME_SETTINGS_CONFIRMATION_TIMEOUT_MS);
+    runtimeSettingsUpdateWaiter = waiter;
+    return waiter;
+  };
+
+  const runtimeSettingsMatchWaiter = (
+    waiter: RuntimeSettingsUpdateWaiter,
+    settings: RuntimeSettingsNotification,
+  ): boolean =>
+    waiter.generation === appServerGeneration &&
+    waiter.threadId === settings.threadId &&
+    (waiter.model === undefined || waiter.model === settings.model) &&
+    (waiter.effort === undefined || waiter.effort === settings.effort);
+
+  const resolveMatchingRuntimeSettingsUpdateWaiter = (settings: RuntimeSettingsNotification): void => {
+    const waiter = runtimeSettingsUpdateWaiter;
+    if (!waiter || !runtimeSettingsMatchWaiter(waiter, settings)) return;
+    settleRuntimeSettingsUpdateWaiter(waiter, { confirmed: true });
+  };
 
   const turnKey = (threadId: string | null, turnId: string): string => `${threadId ?? ''}\0${turnId}`;
 
@@ -1191,6 +1466,14 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
   const invalidateResumedThreads = () => {
     appServerGeneration += 1;
+    invalidateRetainedDirectStartContexts();
+    runtimeSettingsConfirmation = null;
+    if (runtimeSettingsUpdateWaiter) {
+      cancelRuntimeSettingsUpdateWaiter(
+        runtimeSettingsUpdateWaiter,
+        new Error('Codex app-server changed before confirming model and effort update'),
+      );
+    }
     resumedThreadIds.clear();
     resumeThreadPromises.clear();
   };
@@ -1259,7 +1542,13 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
   const isTerminalOrCompletingTurn = (threadId: string | null, turnId: string | null): boolean => {
     if (!turnId) return false;
-    return hasCompletedTurn(threadId, turnId) || completingTurnKeys.has(turnKey(threadId, turnId)) || completingTurnKeys.has(turnKey(null, turnId));
+    return (
+      hasCompletedTurn(threadId, turnId) ||
+      completingTurnKeys.has(turnKey(threadId, turnId)) ||
+      completingTurnKeys.has(turnKey(null, turnId)) ||
+      verifyingUnscopedTerminalKeys.has(turnKey(threadId, turnId)) ||
+      verifyingUnscopedTerminalKeys.has(turnKey(null, turnId))
+    );
   };
 
   const rememberTurnThreadPath = (threadId: string | null, turnId: string | null, threadPath: string | null) => {
@@ -1410,6 +1699,19 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
   };
 
+  const rememberObservedTurnStart = (threadId: string | null, turnId: string | null) => {
+    if (!turnId) return;
+    observedTurnStartKeys.add(turnKey(threadId, turnId));
+    while (observedTurnStartKeys.size > 200) {
+      const oldest = observedTurnStartKeys.keys().next().value;
+      if (typeof oldest !== 'string') break;
+      observedTurnStartKeys.delete(oldest);
+    }
+  };
+
+  const hasObservedTurnStart = (threadId: string | null, turnId: string | null): boolean =>
+    Boolean(turnId && (observedTurnStartKeys.has(turnKey(threadId, turnId)) || observedTurnStartKeys.has(turnKey(null, turnId))));
+
   const patchEventKey = (threadId: string | null, turnId: string, filePath: string, patch: string): string =>
     `${turnKey(threadId, turnId)}\0${filePath}\0${patchContentHash(patch)}`;
 
@@ -1432,11 +1734,18 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     return { threadId, threadPath: knownThreadPaths.get(threadId) ?? null, cwd: null };
   };
 
+  const pendingTurnStartContext = (threadId: string | null): TurnContext | null => {
+    if (!threadId) return pendingTurnStartContexts[0] ?? null;
+    return pendingTurnStartContexts.find((context) => context.threadId === threadId) ?? null;
+  };
+
   const takePendingTurnStartContext = (threadId: string | null): TurnContext | null => {
-    const index = threadId ? pendingTurnStartContexts.findIndex((context) => context.threadId === threadId) : 0;
+    const context = pendingTurnStartContext(threadId);
+    if (!context) return null;
+    const index = pendingTurnStartContexts.indexOf(context);
     if (index < 0) return null;
-    const [context] = pendingTurnStartContexts.splice(index, 1);
-    return context ?? null;
+    pendingTurnStartContexts.splice(index, 1);
+    return context;
   };
 
   const captureFileChangeSnapshots = (params: unknown, requestId: number | string) => {
@@ -1831,16 +2140,50 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
   };
 
+  const clientState = (state: HostRuntimeState): HostRuntimeState => ({
+    ...state,
+    activeGoal: state.activeGoal?.threadId === state.activeThreadId ? state.activeGoal : null,
+    queue: queueForThread(state.queue, state.activeThreadId),
+  });
+
   const sendHello = (client: WebSocket, state: HostRuntimeState = deps.stateStore.read()) => {
     send(client, {
       type: 'server/hello',
       hostname: deps.config.hostname,
       startCwd: deps.startCwd ?? null,
       notificationStreamId,
-      state,
+      state: clientState(state),
       appServerHealth: deps.codex.health(),
       requests: Array.from(pendingServerRequests.values()),
     });
+  };
+
+  const setActiveGoalForThread = (goal: ThreadGoal): HostRuntimeState | null => {
+    const next = deps.stateStore.update((state) => (state.activeThreadId === goal.threadId ? { ...state, activeGoal: goal } : state));
+    return next.activeThreadId === goal.threadId ? next : null;
+  };
+
+  const clearActiveGoalForThread = (threadId: string | null): HostRuntimeState | null => {
+    let clearedThreadId: string | null = null;
+    const next = deps.stateStore.update((state) => {
+      if (!state.activeGoal) return state;
+      const targetThreadId = threadId ?? state.activeGoal.threadId;
+      if (state.activeThreadId !== targetThreadId || state.activeGoal.threadId !== targetThreadId) return state;
+      clearedThreadId = targetThreadId;
+      return { ...state, activeGoal: null };
+    });
+    return clearedThreadId && next.activeThreadId === clearedThreadId ? next : null;
+  };
+
+  const handleGoalNotification = (message: { method?: unknown; params?: unknown; payload?: unknown }): HostRuntimeState | null => {
+    if (message.method === 'thread/goal/updated') {
+      const goal = threadGoalFromNotification(message);
+      return goal ? setActiveGoalForThread(goal) : null;
+    }
+    if (message.method === 'thread/goal/cleared') {
+      return clearActiveGoalForThread(notificationThreadId(message));
+    }
+    return null;
   };
 
   const notificationByteLength = (message: unknown): number => {
@@ -1891,6 +2234,9 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     if (!current.activeTurnId) return current;
     if ('threadId' in expected && current.activeThreadId !== expected.threadId) return current;
     if ('turnId' in expected && current.activeTurnId !== expected.turnId) return current;
+    if (current.activeThreadId && isPendingTurnStartForThread(current.activeTurnId, current.activeThreadId)) {
+      invalidateRetainedDirectStartContexts(current.activeThreadId);
+    }
 
     const next = deps.stateStore.update((state) => {
       if (!state.activeTurnId) return state;
@@ -1941,10 +2287,15 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   };
 
   const clearMissingActiveThread = (threadId: string, error: unknown): HostRuntimeState => {
+    invalidateRetainedDirectStartContexts(threadId);
     resumedThreadIds.delete(threadId);
     startedPendingRolloutThreadIds.delete(threadId);
     resumeThreadPromises.delete(threadId);
     knownThreadPaths.delete(threadId);
+    if (runtimeSettingsConfirmation?.threadId === threadId) runtimeSettingsConfirmation = null;
+    if (runtimeSettingsUpdateWaiter?.threadId === threadId) {
+      cancelRuntimeSettingsUpdateWaiter(runtimeSettingsUpdateWaiter, new Error('active thread disappeared before confirming model and effort update'));
+    }
     const current = deps.stateStore.read();
     if (current.activeThreadId !== threadId) return current;
 
@@ -1955,6 +2306,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         activeThreadId: null,
         activeThreadPath: null,
         activeTurnId: null,
+        activeGoal: null,
         model: null,
         effort: null,
         mode: null,
@@ -1969,7 +2321,13 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     return next;
   };
 
-  clearActiveTurn({}, { broadcast: false });
+  const stateBeforeAttachActiveTurnClear = deps.stateStore.read();
+  const shouldDrainQueueAfterAttachActiveTurnClear = Boolean(
+    stateBeforeAttachActiveTurnClear.activeThreadId &&
+      stateBeforeAttachActiveTurnClear.activeTurnId &&
+      queueForThread(stateBeforeAttachActiveTurnClear.queue, stateBeforeAttachActiveTurnClear.activeThreadId).length > 0,
+  );
+  const attachActiveThreadIdAfterClear = clearActiveTurn({}, { broadcast: false }).activeThreadId;
 
   const broadcastRequestResolved = (requestId: number | string) => {
     for (const client of wss.clients) {
@@ -2006,6 +2364,20 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     const call = () => (timeoutMs === undefined ? deps.codex.request<T>(method, params) : deps.codex.request<T>(method, params, timeoutMs));
     const starting = ensureCodexStarted();
     return starting ? starting.then(call) : call();
+  };
+
+  const verifyUnscopedActiveCompletionTarget = async (target: ActiveCompletionTarget): Promise<boolean> => {
+    try {
+      const result = await requestCodex(
+        'thread/turns/list',
+        { threadId: target.threadId, limit: 20, sortDirection: 'desc', itemsView: 'notLoaded' },
+        UNSCOPED_TERMINAL_VERIFY_RPC_TIMEOUT_MS,
+      );
+      return turnListShowsTerminalTurn(result, target.turnId);
+    } catch (error) {
+      logWarn('Failed to verify unscoped terminal turn state', error);
+      return false;
+    }
   };
 
   const ensureThreadResumed = (threadId: string, requestedThreadPath?: string | null): Promise<void> => {
@@ -2047,7 +2419,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           ...runtimeStatus,
         };
       });
-      if (updatedActiveThread) broadcastHello(nextState);
+      if (updatedActiveThread) {
+        if (generation === appServerGeneration) recordRuntimeSettingsConfirmation(threadId, runtimeStatus, 'threadResume');
+        broadcastHello(nextState);
+      }
       const health = deps.codex.health();
       if (generation === appServerGeneration && health.connected && !health.dead) {
         resumedThreadIds.add(threadId);
@@ -2075,9 +2450,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     return resumePromise;
   };
 
-  const startTurn = async ({ threadId, text, options }: TurnStartParams) => {
+  const startTurn = async ({ threadId, text, options }: TurnStartParams, onContext?: (context: TurnContext) => void) => {
     await ensureThreadResumed(threadId);
     const context = startContextForThread(threadId);
+    onContext?.(context);
     pendingTurnStartContexts.push(context);
     try {
       const result = await requestCodex<{ turn: { id: string } }>(
@@ -2118,43 +2494,76 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     );
   };
 
-  const deferQueuedMessageForThread = (threadId: string, queuedMessage: QueuedMessage): void => {
-    const current = deferredQueuedMessagesByThread.get(threadId) ?? [];
-    if (!current.some((message) => message.id === queuedMessage.id)) current.push(queuedMessage);
-    deferredQueuedMessagesByThread.set(threadId, current.slice(-deps.config.queueLimit));
+  const interruptActiveTurnForThread = async (threadId: string): Promise<HostRuntimeState | null> => {
+    const state = deps.stateStore.read();
+    if (state.activeThreadId !== threadId || !state.activeTurnId) return null;
+
+    const activeTurnId = state.activeTurnId;
+    const activeThreadPath = state.activeThreadPath;
+    const health = deps.codex.health();
+    if (!health.connected || health.dead) {
+      await finalizeActiveTurnBeforeClear(threadId, activeTurnId, activeThreadPath);
+      return clearActiveTurn({ threadId, turnId: activeTurnId }, { broadcast: false });
+    }
+
+    try {
+      await ensureThreadResumed(threadId);
+      await requestCodex('turn/interrupt', { threadId, turnId: activeTurnId });
+    } catch (error) {
+      if (!shouldClearActiveTurnAfterInterruptFailure(error)) throw error;
+    }
+    await finalizeActiveTurnBeforeClear(threadId, activeTurnId, activeThreadPath);
+    return clearActiveTurn({ threadId, turnId: activeTurnId }, { broadcast: false });
   };
 
-  const restoreDeferredQueuedMessagesForThread = (threadId: string): HostRuntimeState | null => {
-    const deferred = deferredQueuedMessagesByThread.get(threadId);
-    if (!deferred || deferred.length === 0) return null;
-    let restored = false;
-    const state = deps.stateStore.update((current) => {
-      if (current.activeThreadId !== threadId) return current;
-      restored = true;
-      const existingIds = new Set(current.queue.map((message) => message.id));
-      const restoredMessages = deferred.filter((message) => !existingIds.has(message.id));
-      return restoredMessages.length > 0
-        ? { ...current, queue: [...restoredMessages, ...current.queue].slice(0, deps.config.queueLimit) }
-        : current;
-    });
-    if (restored) deferredQueuedMessagesByThread.delete(threadId);
-    return restored ? state : null;
+  const shouldInterruptActiveGoalTurn = (threadId: string): boolean => {
+    const state = deps.stateStore.read();
+    return state.activeThreadId === threadId && state.activeGoal?.threadId === threadId && state.activeGoal.status === 'active' && Boolean(state.activeTurnId);
   };
 
-  const restoreQueuedMessageToFront = (threadId: string, queuedMessage: QueuedMessage): HostRuntimeState | null => {
-    let restored = false;
+  const pruneTimedOutQueuedStarts = (queue: QueuedMessage[]): void => {
+    for (const [threadId, recovery] of timedOutQueuedStarts) {
+      const stillQueued = queue.some((message) => (
+        message.threadId === threadId && message.id === recovery.id && message.text === recovery.text
+      ));
+      if (!stillQueued) timedOutQueuedStarts.delete(threadId);
+    }
+  };
+
+  const markTimedOutRecoveryMaybeSent = (threadId: string, recovery: TimedOutQueuedStart): HostRuntimeState => {
+    const state = deps.stateStore.update((current) => ({
+      ...current,
+      queue: current.queue.map((message) => (
+        message.threadId === threadId && message.id === recovery.id && message.text === recovery.text
+          ? { ...message, deliveryState: 'maybeSent' as const }
+          : message
+      )),
+    }));
+    pruneTimedOutQueuedStarts(state.queue);
+    return state;
+  };
+
+  const removeTimedOutRecovery = (threadId: string, recovery: TimedOutQueuedStart): HostRuntimeState => {
+    const state = deps.stateStore.update((current) => ({
+      ...current,
+      queue: current.queue.filter((message) => (
+        message.threadId !== threadId || message.id !== recovery.id || message.text !== recovery.text
+      )),
+    }));
+    pruneTimedOutQueuedStarts(state.queue);
+    return state;
+  };
+
+  const restoreQueuedMessageToFront = (threadId: string, queuedMessage: QueuedMessage): HostRuntimeState => {
     const state = deps.stateStore.update((current) => {
-      if (current.activeThreadId !== threadId) return current;
-      restored = true;
+      const queue = prependQueuedMessagesForThread(current.queue, threadId, [queuedMessage], deps.config.queueLimit);
       return {
         ...current,
-        queue: current.queue.some((message) => message.id === queuedMessage.id)
-          ? current.queue
-        : [queuedMessage, ...current.queue].slice(0, deps.config.queueLimit),
+        queue,
       };
     });
-    if (!restored) deferQueuedMessageForThread(threadId, queuedMessage);
-    return restored ? state : null;
+    pruneTimedOutQueuedStarts(state.queue);
+    return state;
   };
 
   const startQueuedTurnFromIdle = (threadId: string, queuedMessage: QueuedMessage): void => {
@@ -2184,6 +2593,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           rememberTurnThreadPath(threadId, nextTurnId, next.activeThreadPath);
           rememberTurnCwd(threadId, nextTurnId, next.activeCwd);
           rememberLivePatchTurn(threadId, nextTurnId);
+          rememberObservedTurnStart(threadId, nextTurnId);
         }
         broadcastHello(next);
       } catch (error) {
@@ -2196,12 +2606,16 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return {
               ...current,
               activeTurnId: null,
-              queue: current.queue.some((message) => message.id === queuedMessage.id)
-                ? current.queue
-                : [queuedMessage, ...current.queue].slice(0, deps.config.queueLimit),
+              queue: prependQueuedMessagesForThread(current.queue, threadId, [queuedMessage], deps.config.queueLimit),
             };
           });
-          if (restoredQueuedMessage) timedOutQueuedStarts.set(threadId, queuedMessage);
+          pruneTimedOutQueuedStarts(next.queue);
+          if (
+            restoredQueuedMessage &&
+            next.queue.some((message) => message.threadId === threadId && message.id === queuedMessage.id && message.text === queuedMessage.text)
+          ) {
+            timedOutQueuedStarts.set(threadId, { id: queuedMessage.id, text: queuedMessage.text });
+          }
           broadcastHello(next);
           return;
         }
@@ -2210,11 +2624,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           return {
             ...current,
             activeTurnId: null,
-            queue: current.queue.some((message) => message.id === queuedMessage.id)
-              ? current.queue
-              : [queuedMessage, ...current.queue].slice(0, deps.config.queueLimit),
+            queue: prependQueuedMessagesForThread(current.queue, threadId, [queuedMessage], deps.config.queueLimit),
           };
         });
+        pruneTimedOutQueuedStarts(next.queue);
         broadcastHello(next);
       } finally {
         queuedStartInFlight = null;
@@ -2224,11 +2637,11 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   };
 
   const maybeStartQueuedTurnFromIdle = (threadId: string): boolean => {
-    if (queuedStartInFlight) return false;
+    if (queuedStartInFlight || runtimeOptionUpdates.has(threadId)) return false;
     let claim: QueuedTurnClaim | null = null;
     const claimed = deps.stateStore.update((current) => {
       if (current.activeThreadId !== threadId || current.activeTurnId || !current.activeThreadId) return current;
-      const shifted = shiftQueuedMessage(current.queue);
+      const shifted = shiftQueuedMessage(current.queue, threadId, { runnableOnly: true });
       if (!shifted.next) return current;
       claim = { threadId: current.activeThreadId, queuedMessage: shifted.next };
       return applyRunOptionsToRuntimeState(
@@ -2236,6 +2649,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         shifted.next.options,
       );
     });
+    pruneTimedOutQueuedStarts(claimed.queue);
 
     const claimToStart = claim as QueuedTurnClaim | null;
     if (!claimToStart) return false;
@@ -2243,6 +2657,12 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     startQueuedTurnFromIdle(claimToStart.threadId, claimToStart.queuedMessage);
     return true;
   };
+
+  if (shouldDrainQueueAfterAttachActiveTurnClear && attachActiveThreadIdAfterClear) {
+    queueMicrotask(() => {
+      maybeStartQueuedTurnFromIdle(attachActiveThreadIdAfterClear);
+    });
+  }
 
   const maybeSteerQueuedMessage = (): void => {
     if (queuedSteerInFlight || queuedStartInFlight) return;
@@ -2252,13 +2672,14 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       if (!current.activeThreadId || !current.activeTurnId) return current;
       if (isPendingTurnForThread(current.activeTurnId, current.activeThreadId)) return current;
       if (isTerminalOrCompletingTurn(current.activeThreadId, current.activeTurnId)) return current;
-      const nextQueuedMessage = current.queue[0];
+      const nextQueuedMessage = queueForThread(current.queue, current.activeThreadId, { runnableOnly: true })[0];
       if (!nextQueuedMessage || !queuedRunOptionsMatchActiveTurn(current, nextQueuedMessage)) return current;
-      const shifted = shiftQueuedMessage(current.queue);
+      const shifted = shiftQueuedMessage(current.queue, current.activeThreadId, { runnableOnly: true });
       if (!shifted.next) return current;
       claim = { threadId: current.activeThreadId, turnId: current.activeTurnId, queuedMessage: shifted.next };
       return { ...current, queue: shifted.queue };
     });
+    pruneTimedOutQueuedStarts(claimed.queue);
 
     const claimToSteer = claim as QueuedSteerClaim | null;
     if (!claimToSteer) return;
@@ -2289,11 +2710,16 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       } catch (error) {
         logWarn('Failed to steer queued message into active turn', error);
         inFlight.settled = true;
-        inFlight.timedOut = isTurnSteerTimeout(error);
+        const timedOut = isTurnSteerTimeout(error);
+        inFlight.timedOut = timedOut;
         const terminalDisposition = inFlight.terminalDisposition;
-        const restored = restoreQueuedMessageToFront(claimToSteer.threadId, claimToSteer.queuedMessage);
+        const restoredMessage: QueuedMessage =
+          terminalDisposition === 'advance-queue' && timedOut
+            ? { ...claimToSteer.queuedMessage, deliveryState: 'maybeSent' }
+            : claimToSteer.queuedMessage;
+        const restored = restoreQueuedMessageToFront(claimToSteer.threadId, restoredMessage);
         if (restored) broadcastHello(restored);
-        if (terminalDisposition === 'advance-queue' && !isTurnSteerTimeout(error)) {
+        if (terminalDisposition === 'advance-queue') {
           const current = deps.stateStore.read();
           if (current.activeThreadId !== claimToSteer.threadId || current.activeTurnId !== claimToSteer.turnId) {
             followUp = 'start-next-turn';
@@ -2310,24 +2736,111 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     })();
   };
 
+  const markQueuedMessageMaybeSent = (threadId: string, queuedMessageId: string): HostRuntimeState | null => {
+    let changed = false;
+    const next = deps.stateStore.update((state) => {
+      if (state.activeThreadId !== threadId) return state;
+      const queue = state.queue.map((message) => {
+        if (message.id !== queuedMessageId || (message.threadId && message.threadId !== threadId)) return message;
+        if (message.deliveryState === 'maybeSent') return message;
+        changed = true;
+        return { ...message, deliveryState: 'maybeSent' as const };
+      });
+      return changed ? { ...state, queue } : state;
+    });
+    return changed ? next : null;
+  };
+
   const handleTurnCompleted = async (message: { method?: unknown; params?: unknown; payload?: unknown }, disposition: TerminalDisposition) => {
     const advanceQueue = disposition === 'advance-queue';
     const allowMissingTurnId = advanceQueue;
     const completedThreadId = notificationThreadId(message);
     const completedTurnId = notificationTurnId(message);
-    const current = deps.stateStore.read();
-    const completingSteer: QueuedSteerInFlight | null =
-      queuedSteerInFlight &&
-      (!completedThreadId || completedThreadId === queuedSteerInFlight.threadId) &&
-      completionMatchesActiveTurn(queuedSteerInFlight.turnId, queuedSteerInFlight.threadId, completedTurnId, { allowMissingTurnId })
-        ? queuedSteerInFlight
+    const receiptState = deps.stateStore.read();
+    const noTurnActiveTarget: ActiveCompletionTarget | null =
+      advanceQueue &&
+      !completedTurnId &&
+      receiptState.activeThreadId &&
+      receiptState.activeTurnId &&
+      !isPendingTurnForThread(receiptState.activeTurnId, receiptState.activeThreadId) &&
+      ((completedThreadId && completedThreadId === receiptState.activeThreadId) ||
+        (!completedThreadId && hasObservedTurnStart(receiptState.activeThreadId, receiptState.activeTurnId)))
+        ? { threadId: receiptState.activeThreadId, turnId: receiptState.activeTurnId }
         : null;
+    const noTurnVerificationKey = noTurnActiveTarget ? turnKey(noTurnActiveTarget.threadId, noTurnActiveTarget.turnId) : null;
+    const steerAtReceipt = queuedSteerInFlight;
+    let resumeSteeringAfterIgnoredNoTurn = false;
+    if (noTurnVerificationKey) verifyingUnscopedTerminalKeys.add(noTurnVerificationKey);
+
+    try {
+      let verifiedNoTurnActiveTarget: ActiveCompletionTarget | null = null;
+      if (noTurnActiveTarget) {
+        const verified = await verifyUnscopedActiveCompletionTarget(noTurnActiveTarget);
+        const afterVerify = deps.stateStore.read();
+        if (
+          verified &&
+          afterVerify.activeThreadId === noTurnActiveTarget.threadId &&
+          afterVerify.activeTurnId === noTurnActiveTarget.turnId
+        ) {
+          verifiedNoTurnActiveTarget = noTurnActiveTarget;
+        } else {
+          resumeSteeringAfterIgnoredNoTurn = true;
+          return;
+        }
+      }
+
+      const current = verifiedNoTurnActiveTarget ? deps.stateStore.read() : receiptState;
+      const pendingCompactionNoTurnCompletion = Boolean(
+        message.method === 'thread/compacted' &&
+          advanceQueue &&
+          !completedTurnId &&
+          completedThreadId &&
+          completedThreadId === current.activeThreadId &&
+          isPendingCompactionTurnForThread(current.activeTurnId, current.activeThreadId),
+      );
+      const completingSteer: QueuedSteerInFlight | null =
+        verifiedNoTurnActiveTarget &&
+        steerAtReceipt &&
+        steerAtReceipt.threadId === verifiedNoTurnActiveTarget.threadId &&
+        steerAtReceipt.turnId === verifiedNoTurnActiveTarget.turnId
+          ? steerAtReceipt
+          : queuedSteerInFlight &&
+              (!completedThreadId || completedThreadId === queuedSteerInFlight.threadId) &&
+              completionMatchesActiveTurn(queuedSteerInFlight.turnId, queuedSteerInFlight.threadId, completedTurnId, {
+                allowMissingTurnId,
+                completedThreadId,
+              })
+            ? queuedSteerInFlight
+            : null;
     if (completingSteer) completingSteer.terminalDisposition = disposition;
 
-    const missingTurnIdCanMatch =
-      allowMissingTurnId && isPendingCompactionTurnForThread(current.activeTurnId, current.activeThreadId);
-    const turnIdToFinalize = completedTurnId ?? (missingTurnIdCanMatch ? current.activeTurnId : null);
+    const matchedActiveTurnAtReceipt =
+      Boolean(current.activeTurnId) &&
+      ((verifiedNoTurnActiveTarget !== null &&
+        current.activeThreadId === verifiedNoTurnActiveTarget.threadId &&
+        current.activeTurnId === verifiedNoTurnActiveTarget.turnId) ||
+        pendingCompactionNoTurnCompletion ||
+        (completedTurnId !== null &&
+          (!completedThreadId || completedThreadId === current.activeThreadId) &&
+          completionMatchesActiveTurn(current.activeTurnId, current.activeThreadId, completedTurnId, {
+            allowMissingTurnId,
+            completedThreadId,
+          })));
+    const activeCompletionTarget = matchedActiveTurnAtReceipt
+      ? { threadId: current.activeThreadId, turnId: current.activeTurnId }
+      : null;
+    const turnIdToFinalize = completedTurnId ?? (matchedActiveTurnAtReceipt ? current.activeTurnId : null);
     const threadIdToFinalize = completedThreadId ?? (turnIdToFinalize === current.activeTurnId ? current.activeThreadId : null);
+    const activeStateMatchesCompletionTarget = (state: HostRuntimeState): boolean => {
+      if (!activeCompletionTarget?.turnId || !state.activeTurnId) return false;
+      if (activeCompletionTarget.threadId && activeCompletionTarget.threadId !== state.activeThreadId) return false;
+      if (state.activeTurnId === activeCompletionTarget.turnId) return true;
+      return Boolean(
+        completedTurnId &&
+          isPendingCompactionTurnForThread(activeCompletionTarget.turnId, activeCompletionTarget.threadId) &&
+          state.activeTurnId === completedTurnId,
+      );
+    };
     const completionKey = turnIdToFinalize ? turnKey(threadIdToFinalize, turnIdToFinalize) : null;
     if (completionKey && (completingTurnKeys.has(completionKey) || completedTurnKeys.has(completionKey))) return;
     if (completionKey) {
@@ -2351,10 +2864,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
 
     const afterFinalize = deps.stateStore.read();
-    const activeCompletion =
-      Boolean(afterFinalize.activeTurnId) &&
-      (!completedThreadId || completedThreadId === afterFinalize.activeThreadId) &&
-      completionMatchesActiveTurn(afterFinalize.activeTurnId, afterFinalize.activeThreadId, completedTurnId, { allowMissingTurnId });
+    const activeCompletion = activeStateMatchesCompletionTarget(afterFinalize);
 
     if (!activeCompletion) {
       if (advanceQueue && !afterFinalize.activeThreadId && afterFinalize.activeTurnId) {
@@ -2372,10 +2882,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
     if (queuedStartInFlight || queuedSteerInFlight || completingSteer || !advanceQueue) {
       const cleared = deps.stateStore.update((current) => {
-        const stillActiveCompletion =
-          Boolean(current.activeTurnId) &&
-          (!completedThreadId || completedThreadId === current.activeThreadId) &&
-          completionMatchesActiveTurn(current.activeTurnId, current.activeThreadId, completedTurnId, { allowMissingTurnId });
+        const stillActiveCompletion = activeStateMatchesCompletionTarget(current);
         return stillActiveCompletion ? { ...current, activeTurnId: null } : current;
       });
       broadcastHello(cleared);
@@ -2385,7 +2892,11 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           rememberCompletedTurnKey(completionKey);
         }
       }
-      if (completingSteer && advanceQueue && completingSteer.settled && !completingSteer.timedOut) {
+      if (completingSteer && advanceQueue && completingSteer.settled) {
+        if (completingSteer.timedOut) {
+          const next = markQueuedMessageMaybeSent(completingSteer.threadId, completingSteer.queuedMessage.id);
+          if (next) broadcastHello(next);
+        }
         maybeStartQueuedTurnFromIdle(completingSteer.threadId);
       }
       return;
@@ -2393,14 +2904,11 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
     let claim: QueuedTurnClaim | null = null;
     const claimed = deps.stateStore.update((current) => {
-      const stillActiveCompletion =
-        Boolean(current.activeThreadId && current.activeTurnId) &&
-        (!completedThreadId || completedThreadId === current.activeThreadId) &&
-        completionMatchesActiveTurn(current.activeTurnId, current.activeThreadId, completedTurnId, { allowMissingTurnId });
+      const stillActiveCompletion = activeStateMatchesCompletionTarget(current);
       if (!stillActiveCompletion) return current;
       if (!current.activeThreadId) return { ...current, activeTurnId: null };
 
-      const shifted = shiftQueuedMessage(current.queue);
+      const shifted = shiftQueuedMessage(current.queue, current.activeThreadId, { runnableOnly: true });
       if (!shifted.next) return { ...current, activeTurnId: null };
 
       claim = { threadId: current.activeThreadId, queuedMessage: shifted.next };
@@ -2409,6 +2917,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         shifted.next.options,
       );
     });
+    pruneTimedOutQueuedStarts(claimed.queue);
     broadcastHello(claimed);
 
     const claimToStart = claim as QueuedTurnClaim | null;
@@ -2429,6 +2938,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       }
     }
     startQueuedTurnFromIdle(claimToStart.threadId, claimToStart.queuedMessage);
+    } finally {
+      if (noTurnVerificationKey) verifyingUnscopedTerminalKeys.delete(noTurnVerificationKey);
+      if (resumeSteeringAfterIgnoredNoTurn && (!steerAtReceipt || !steerAtReceipt.timedOut)) maybeSteerQueuedMessage();
+    }
   };
 
   const handleTaskStarted = (message: { params?: unknown; payload?: unknown }) => {
@@ -2436,32 +2949,60 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     if (!turnId) return;
 
     const notifiedThreadId = notificationThreadId(message);
-    const pendingContext = takePendingTurnStartContext(notifiedThreadId);
+    const pendingContextCandidate = pendingTurnStartContext(notifiedThreadId);
+    const retainedContextCandidate = pendingContextCandidate
+      ? null
+      : notifiedThreadId
+        ? retainedDirectStartContexts.get(notifiedThreadId) ?? null
+        : retainedDirectStartContexts.values().next().value ?? null;
+    const contextCandidate = pendingContextCandidate ?? retainedContextCandidate;
+    const candidateThreadId = notifiedThreadId ?? contextCandidate?.threadId ?? null;
+    const timedOutQueuedStart = candidateThreadId ? timedOutQueuedStarts.get(candidateThreadId) : undefined;
+    const ambiguousTimedOutStart = Boolean(timedOutQueuedStart && pendingContextCandidate);
+    const pendingContext = ambiguousTimedOutStart || retainedContextCandidate ? null : takePendingTurnStartContext(notifiedThreadId);
     const current = deps.stateStore.read();
-    const threadId = notifiedThreadId ?? pendingContext?.threadId ?? null;
+    const threadId = notifiedThreadId ?? pendingContext?.threadId ?? contextCandidate?.threadId ?? null;
     if (!threadId) return;
     const threadPath =
       pendingContext?.threadPath ??
+      contextCandidate?.threadPath ??
       (threadId && threadId === current.activeThreadId ? current.activeThreadPath : threadId ? knownThreadPaths.get(threadId) ?? null : null);
-    const cwd = pendingContext?.cwd ?? (threadId && threadId === current.activeThreadId ? current.activeCwd : null);
+    const cwd = pendingContext?.cwd ?? contextCandidate?.cwd ?? (threadId && threadId === current.activeThreadId ? current.activeCwd : null);
 
     rememberKnownThreadPath(threadId, threadPath);
     rememberTurnThreadPath(threadId, turnId, threadPath);
     rememberTurnCwd(threadId, turnId, cwd);
     rememberLivePatchTurn(threadId, turnId);
+    rememberObservedTurnStart(threadId, turnId);
     const alreadyCompleted = hasCompletedTurn(threadId, turnId);
 
-    const timedOutQueuedStart = threadId ? timedOutQueuedStarts.get(threadId) : null;
-    if (threadId && timedOutQueuedStart) {
+    if (retainedContextCandidate) {
+      if (timedOutQueuedStart) markTimedOutRecoveryMaybeSent(threadId, timedOutQueuedStart);
       timedOutQueuedStarts.delete(threadId);
-      deps.stateStore.update((state) =>
-        state.activeThreadId === threadId
+      retainedDirectStartContexts.delete(threadId);
+      const reconciled = deps.stateStore.update((state) => (
+        state.activeThreadId === threadId && isPendingTurnStartForThread(state.activeTurnId, threadId)
           ? {
               ...state,
-              queue: state.queue.filter((message) => message.id !== timedOutQueuedStart.id || message.text !== timedOutQueuedStart.text),
+              activeTurnId: alreadyCompleted ? null : turnId,
+              activeThreadPath: threadPath ?? state.activeThreadPath,
+              activeCwd: cwd ?? state.activeCwd,
             }
-          : state,
-      );
+          : state
+      ));
+      broadcastHello(reconciled);
+      return;
+    }
+
+    if (timedOutQueuedStart) {
+      if (ambiguousTimedOutStart) {
+        const recovered = markTimedOutRecoveryMaybeSent(threadId, timedOutQueuedStart);
+        if (pendingContextCandidate) pendingContextCandidate.ambiguousTurnId = turnId;
+        broadcastHello(recovered);
+        return;
+      }
+      timedOutQueuedStarts.delete(threadId);
+      removeTimedOutRecovery(threadId, timedOutQueuedStart);
     }
 
     if (!threadId || current.activeThreadId !== threadId || current.activeTurnId === turnId) return;
@@ -2477,10 +3018,43 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     maybeSteerQueuedMessage();
   };
 
+  const handleRuntimeSettingsNotification = (
+    message: { method?: unknown; params?: unknown },
+  ): { state: HostRuntimeState; settings: RuntimeSettingsNotification } | null => {
+    const settings = runtimeSettingsFromNotification(message);
+    if (!settings || deps.stateStore.read().activeThreadId !== settings.threadId) return null;
+    const waiter = runtimeSettingsUpdateWaiter;
+    if (
+      waiter &&
+      waiter.generation === appServerGeneration &&
+      waiter.threadId === settings.threadId &&
+      !runtimeSettingsMatchWaiter(waiter, settings)
+    ) {
+      return null;
+    }
+
+    let applied = false;
+    const state = deps.stateStore.update((current) => {
+      if (current.activeThreadId !== settings.threadId) return current;
+      applied = true;
+      return { ...current, model: settings.model, effort: settings.effort };
+    });
+    if (!applied) return null;
+    recordRuntimeSettingsConfirmation(settings.threadId, settings, 'settingsUpdated');
+    return { state, settings };
+  };
+
   const unsubscribeNotification = deps.codex.onNotification((message) => {
     const seq = rememberNotification(message);
     const isTaskStart = message.method === 'turn/started' || (message.method === 'event_msg' && isTaskStartedEvent(message));
     if (isTaskStart) handleTaskStarted(message);
+    const goalState = handleGoalNotification(message);
+    if (goalState) broadcastHello(goalState);
+    const runtimeSettings = handleRuntimeSettingsNotification(message);
+    if (runtimeSettings) {
+      broadcastHello(runtimeSettings.state);
+      resolveMatchingRuntimeSettingsUpdateWaiter(runtimeSettings.settings);
+    }
 
     for (const client of wss.clients) sendNotification(client, seq, message);
     const resolvedRequestId = extractResolvedRequestId(message);
@@ -2523,6 +3097,11 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const close = () => {
     if (closed) return;
     closed = true;
+    invalidateRetainedDirectStartContexts();
+    runtimeSettingsConfirmation = null;
+    if (runtimeSettingsUpdateWaiter) {
+      cancelRuntimeSettingsUpdateWaiter(runtimeSettingsUpdateWaiter, new Error('browser socket server closed before confirming model and effort update'));
+    }
     unsubscribeNotification();
     unsubscribeServerRequest();
     unsubscribeHealthChange();
@@ -2571,6 +3150,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
       try {
         if (request.method === 'webui/codex/restart') {
+          if (runtimeOptionUpdates.size > 0) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'model or effort update is in progress' });
+            return;
+          }
           const current = deps.stateStore.read();
           if (current.activeTurnId) {
             send(ws, { type: 'rpc/error', id: request.id, error: 'cannot restart Codex while a turn is active' });
@@ -2623,7 +3206,9 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
                 throw error;
               });
               const health = deps.codex.health();
-              if (!skippedPendingRolloutResume && generation === appServerGeneration && health.connected && !health.dead) resumedThreadIds.add(activeThreadId);
+              const authoritativeResume =
+                !skippedPendingRolloutResume && generation === appServerGeneration && health.connected && !health.dead;
+              if (authoritativeResume) resumedThreadIds.add(activeThreadId);
 
               const activeCwd = extractThreadCwd(resumeResult) ?? current.activeCwd;
               const resultThreadPath = extractThreadPath(resumeResult);
@@ -2642,6 +3227,9 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
                     }
                   : state,
               );
+              if (authoritativeResume && state.activeThreadId === activeThreadId) {
+                recordRuntimeSettingsConfirmation(activeThreadId, runtimeStatus, 'threadResume');
+              }
               broadcastHello(state);
             }
 
@@ -2667,6 +3255,26 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           return;
         }
 
+        if (request.method === 'webui/model/list') {
+          const data: unknown[] = [];
+          const seenCursors = new Set<string>();
+          let cursor: string | null = null;
+          for (let page = 0; page < 20; page += 1) {
+            const result: unknown = await requestCodex('model/list', { cursor, limit: 100, includeHidden: false });
+            const pageData = getValuePath(result, ['data']);
+            if (Array.isArray(pageData)) data.push(...pageData);
+            const nextCursor: string | null = getStringPath(result, ['nextCursor']) ?? getStringPath(result, ['next_cursor']);
+            if (!nextCursor) {
+              send(ws, { type: 'rpc/result', id: request.id, result: { data, nextCursor: null } });
+              return;
+            }
+            if (seenCursors.has(nextCursor)) throw new Error('model catalog returned a repeated cursor');
+            seenCursors.add(nextCursor);
+            cursor = nextCursor;
+          }
+          throw new Error('model catalog exceeded 20 pages');
+        }
+
         if (request.method === 'webui/session/list') {
           const result = await requestCodex('thread/list', {
             limit: 50,
@@ -2680,6 +3288,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         }
 
         if (request.method === 'webui/session/start') {
+          if (runtimeOptionUpdates.size > 0 || sessionChangeInFlight) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'session or runtime settings update is in progress' });
+            return;
+          }
           const cwd = getRequiredString(request.params, 'cwd');
           if (!cwd) {
             send(ws, { type: 'rpc/error', id: request.id, error: 'cwd is required' });
@@ -2692,7 +3304,22 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             experimentalRawEvents: true,
             persistExtendedHistory: true,
           }, options);
-          const result = await requestCodex('thread/start', params);
+          let result: unknown;
+          let generation = appServerGeneration;
+          sessionChangeInFlight = true;
+          try {
+            const starting = ensureCodexStarted();
+            if (starting) await starting;
+            generation = appServerGeneration;
+            result = await deps.codex.request('thread/start', params);
+            const health = deps.codex.health();
+            if (generation !== appServerGeneration || !health.connected || health.dead) {
+              throw new Error('Codex app-server changed while starting session');
+            }
+          } finally {
+            sessionChangeInFlight = false;
+          }
+          invalidateRetainedDirectStartContexts();
           const activeCwd = extractThreadCwd(result) ?? cwd;
           const activeThreadId = extractThreadId(result);
           const activeThreadPath = extractThreadPath(result);
@@ -2707,16 +3334,22 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             activeThreadId,
             activeThreadPath,
             activeTurnId: null,
+            activeGoal: null,
             activeCwd,
             ...runtimeStatus,
             recentCwds: rememberCwd(state.recentCwds, activeCwd),
           }));
+          recordRuntimeSettingsConfirmation(activeThreadId, runtimeStatus, 'threadStart');
           send(ws, { type: 'rpc/result', id: request.id, result });
           broadcastHello(state);
           return;
         }
 
         if (request.method === 'webui/session/resume') {
+          if (runtimeOptionUpdates.size > 0 || sessionChangeInFlight) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'session or runtime settings update is in progress' });
+            return;
+          }
           const threadId = getRequiredString(request.params, 'threadId');
           if (!threadId) {
             send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
@@ -2733,33 +3366,319 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             persistExtendedHistory: true,
             excludeTurns: true,
           }, options);
-          const starting = ensureCodexStarted();
-          if (starting) await starting;
-          const generation = appServerGeneration;
-          const result = await deps.codex.request('thread/resume', params).catch((error) => {
-            if (isMissingThreadError(error)) clearMissingActiveThread(threadId, error);
-            throw error;
-          });
+          let result: unknown;
+          let generation = appServerGeneration;
+          sessionChangeInFlight = true;
+          try {
+            const starting = ensureCodexStarted();
+            if (starting) await starting;
+            generation = appServerGeneration;
+            result = await deps.codex.request('thread/resume', params).catch((error) => {
+              if (isMissingThreadError(error)) clearMissingActiveThread(threadId, error);
+              throw error;
+            });
+          } finally {
+            sessionChangeInFlight = false;
+          }
+          invalidateRetainedDirectStartContexts();
           const health = deps.codex.health();
-          if (generation === appServerGeneration && health.connected && !health.dead) resumedThreadIds.add(threadId);
+          const authoritativeResume = generation === appServerGeneration && health.connected && !health.dead;
+          if (authoritativeResume) resumedThreadIds.add(threadId);
           const activeCwd = extractThreadCwd(result) ?? deps.stateStore.read().activeCwd;
           const resultThreadPath = extractThreadPath(result);
           const activeThreadPath =
             resultThreadPath ?? resumePath ?? (requestedThreadPath && knownThreadPaths.get(threadId) === requestedThreadPath ? requestedThreadPath : null);
           const runtimeStatus = runtimeStatusFromThreadResult(result, options);
           rememberKnownThreadPath(threadId, activeThreadPath);
-          let state = deps.stateStore.update((state) => ({
+          const state = deps.stateStore.update((state) => ({
             ...state,
             activeThreadId: threadId,
             activeThreadPath,
             activeTurnId: null,
+            activeGoal: state.activeGoal?.threadId === threadId ? state.activeGoal : null,
             activeCwd,
             ...runtimeStatus,
             recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
           }));
-          state = restoreDeferredQueuedMessagesForThread(threadId) ?? state;
+          runtimeSettingsConfirmation = null;
+          if (authoritativeResume) recordRuntimeSettingsConfirmation(threadId, runtimeStatus, 'threadResume');
           send(ws, { type: 'rpc/result', id: request.id, result: sanitizeThreadHistory(result) });
           broadcastHello(state);
+          return;
+        }
+
+        if (request.method === 'webui/thread/status') {
+          const threadId = getRequiredString(request.params, 'threadId');
+          if (!threadId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
+            return;
+          }
+
+          const statusState = deps.stateStore.read();
+          if (statusState.activeThreadId !== threadId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'thread is not the active session' });
+            return;
+          }
+          const statusThreadPath = statusState.activeThreadPath;
+          const statusGeneration = appServerGeneration;
+
+          let lastTurn: TurnRuntimeContextLookup;
+          try {
+            lastTurn = await readLatestTurnRuntimeContext(statusThreadPath);
+          } catch (error) {
+            lastTurn = {
+              status: 'unavailable',
+              context: null,
+              scannedBytes: 0,
+              detail: error instanceof Error ? error.message : String(error),
+            };
+          }
+          if (
+            startedPendingRolloutThreadIds.has(threadId) &&
+            lastTurn.status === 'unavailable' &&
+            /ENOENT|no such file/i.test(lastTurn.detail ?? '')
+          ) {
+            lastTurn = { status: 'none', context: null, scannedBytes: lastTurn.scannedBytes };
+          }
+
+          const latest = deps.stateStore.read();
+          if (latest.activeThreadId !== threadId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'thread is not the active session' });
+            return;
+          }
+          if (latest.activeThreadPath !== statusThreadPath || appServerGeneration !== statusGeneration) {
+            send(ws, {
+              type: 'rpc/error',
+              id: request.id,
+              error: 'thread status changed while reading runtime context; retry',
+            });
+            return;
+          }
+          if (runtimeSettingsConfirmation && runtimeSettingsConfirmation.threadId !== threadId) {
+            runtimeSettingsConfirmation = null;
+          }
+          const confirmation = runtimeSettingsConfirmation;
+          const confirmed = Boolean(
+            confirmation &&
+              confirmation.threadId === threadId &&
+              confirmation.model === latest.model &&
+              confirmation.effort === latest.effort,
+          );
+
+          send(ws, {
+            type: 'rpc/result',
+            id: request.id,
+            result: {
+              hostname: deps.config.hostname,
+              threadId,
+              cwd: latest.activeCwd,
+              activeTurnId: latest.activeTurnId,
+              model: latest.model,
+              effort: latest.effort,
+              mode: latest.mode,
+              sandbox: latest.sandbox,
+              confirmed,
+              confirmationSource: confirmation?.source ?? null,
+              confirmedAt: confirmation?.confirmedAt ?? null,
+              lastTurn,
+            },
+          });
+          return;
+        }
+
+        if (request.method === 'webui/thread/runtime-options/set') {
+          const threadId = getRequiredString(request.params, 'threadId');
+          if (!threadId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
+            return;
+          }
+
+          const current = deps.stateStore.read();
+          if (current.activeThreadId !== threadId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'thread is not the active session' });
+            return;
+          }
+          if (current.activeTurnId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'cannot change model or effort while Codex is working' });
+            return;
+          }
+          if (sessionChangeInFlight) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'session change is in progress' });
+            return;
+          }
+          if (goalUpdates.size > 0) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'goal update is in progress' });
+            return;
+          }
+          if (runtimeOptionUpdates.has(threadId)) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'model or effort update is already in progress' });
+            return;
+          }
+
+          const paramsRecord = isRecord(request.params) ? request.params : null;
+          const model = getOptionalString(request.params, 'model');
+          const hasEffort = Boolean(paramsRecord && hasOwn(paramsRecord, 'effort'));
+          const mode = getOptionalEnum(request.params, 'mode', COLLABORATION_MODES);
+          const sandbox = getOptionalEnum(request.params, 'sandbox', SANDBOX_MODES);
+          let effort: string | null | undefined;
+          if (hasEffort) {
+            const rawEffort = paramsRecord?.effort;
+            if (rawEffort === null) {
+              effort = null;
+            } else if (typeof rawEffort === 'string' && rawEffort.trim()) {
+              effort = rawEffort.trim();
+              if (effort.length > 64) {
+                send(ws, { type: 'rpc/error', id: request.id, error: 'effort must be at most 64 characters' });
+                return;
+              }
+            } else {
+              send(ws, { type: 'rpc/error', id: request.id, error: 'effort must be a non-empty string or null' });
+              return;
+            }
+          }
+          if (!model && !hasEffort && !mode && !sandbox) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'a runtime option is required' });
+            return;
+          }
+          const nextModel = model ?? current.model;
+          const nextEffort = hasEffort ? (effort ?? null) : current.effort;
+          if (mode && !nextModel) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'model is required before changing mode' });
+            return;
+          }
+
+          runtimeOptionUpdates.add(threadId);
+          let confirmationWaiter: RuntimeSettingsUpdateWaiter | null = null;
+          try {
+            const settingsParams = {
+              threadId,
+              ...(model ? { model } : {}),
+              ...(hasEffort ? { effort } : {}),
+              ...(mode ? { collaborationMode: collaborationMode({ model: nextModel!, effort: nextEffort ?? undefined, mode }) } : {}),
+              ...(sandbox ? { sandboxPolicy: sandboxPolicy(sandbox, current.activeCwd) } : {}),
+            };
+            let activeCwd = current.activeCwd;
+            let activeThreadPath = current.activeThreadPath;
+            let runtimeStatus: Pick<HostRuntimeState, 'model' | 'effort' | 'mode' | 'sandbox'> = {
+              model: nextModel,
+              effort: nextEffort,
+              mode: mode ?? current.mode,
+              sandbox: sandbox ?? current.sandbox,
+            };
+            let usedResumeFallback = false;
+
+            const starting = ensureCodexStarted();
+            if (starting) await starting;
+            confirmationWaiter = createRuntimeSettingsUpdateWaiter(
+              threadId,
+              model ?? undefined,
+              hasEffort ? nextEffort : undefined,
+            );
+            try {
+              await deps.codex.request('thread/settings/update', settingsParams);
+            } catch (error) {
+              if (isMissingThreadError(error)) {
+                resumedThreadIds.delete(threadId);
+                await ensureThreadResumed(threadId);
+                if (runtimeSettingsUpdateWaiter !== confirmationWaiter) {
+                  confirmationWaiter = createRuntimeSettingsUpdateWaiter(
+                    threadId,
+                    model ?? undefined,
+                    hasEffort ? nextEffort : undefined,
+                  );
+                }
+                await deps.codex.request('thread/settings/update', settingsParams);
+              } else if (isMethodNotFoundError(error)) {
+                cancelRuntimeSettingsUpdateWaiter(
+                  confirmationWaiter,
+                  new Error('thread/settings/update is unavailable; using authoritative thread/resume fallback'),
+                );
+                if (hasEffort && effort === null) {
+                  throw new Error('This Codex app-server version cannot clear reasoning effort; update Codex');
+                }
+                usedResumeFallback = true;
+                const fallbackOptions: CodexRunOptions = {};
+                if (model) fallbackOptions.model = model;
+                if (typeof effort === 'string') fallbackOptions.effort = effort;
+                if (mode && nextModel) {
+                  fallbackOptions.model = nextModel;
+                  fallbackOptions.mode = mode;
+                }
+                if (sandbox) fallbackOptions.sandbox = sandbox;
+                const resumePath = resumePathForThread(threadId, current.activeThreadPath);
+                const resumeParams = applyThreadRunOptions<SessionResumeParams & { experimentalRawEvents: boolean; persistExtendedHistory: boolean; [key: string]: unknown }>({
+                  threadId,
+                  ...(resumePath ? { path: resumePath } : {}),
+                  experimentalRawEvents: true,
+                  persistExtendedHistory: true,
+                  excludeTurns: true,
+                }, fallbackOptions);
+                const generation = appServerGeneration;
+                const result = await requestCodex('thread/resume', resumeParams, THREAD_TURNS_LIST_RPC_TIMEOUT_MS).catch((resumeError) => {
+                  if (isMissingThreadError(resumeError)) clearMissingActiveThread(threadId, resumeError);
+                  throw resumeError;
+                });
+                const health = deps.codex.health();
+                const authoritativeResume = generation === appServerGeneration && health.connected && !health.dead;
+                if (!authoritativeResume) throw new Error('Codex app-server changed before thread/resume confirmed model and effort');
+                resumedThreadIds.add(threadId);
+                activeCwd = extractThreadCwd(result) ?? current.activeCwd;
+                activeThreadPath = extractThreadPath(result) ?? resumePath ?? current.activeThreadPath;
+                runtimeStatus = runtimeStatusFromThreadResult(result, {
+                  ...runOptionsFromRuntimeState(current),
+                  ...fallbackOptions,
+                });
+                rememberKnownThreadPath(threadId, activeThreadPath);
+              } else {
+                cancelRuntimeSettingsUpdateWaiter(
+                  confirmationWaiter,
+                  error instanceof Error ? error : new Error(String(error)),
+                );
+                throw error;
+              }
+            }
+
+            if (!usedResumeFallback) {
+              const confirmationResult = await confirmationWaiter.promise;
+              if (!confirmationResult.confirmed) throw confirmationResult.error;
+            }
+
+            let applied = false;
+            const state = deps.stateStore.update((latest) => {
+              if (latest.activeThreadId !== threadId || latest.activeTurnId) return latest;
+              applied = true;
+              return {
+                ...latest,
+                activeThreadPath,
+                activeCwd,
+                model: usedResumeFallback ? runtimeStatus.model : latest.model,
+                effort: usedResumeFallback ? runtimeStatus.effort : latest.effort,
+                mode: runtimeStatus.mode,
+                sandbox: runtimeStatus.sandbox,
+                recentCwds: activeCwd ? rememberCwd(latest.recentCwds, activeCwd) : latest.recentCwds,
+              };
+            });
+            if (!applied) {
+              send(ws, { type: 'rpc/error', id: request.id, error: 'thread state changed while updating model or effort' });
+              return;
+            }
+            if (usedResumeFallback) recordRuntimeSettingsConfirmation(threadId, runtimeStatus, 'threadResume');
+            send(ws, {
+              type: 'rpc/result',
+              id: request.id,
+              result: { model: state.model, effort: state.effort },
+            });
+            broadcastHello(state);
+          } finally {
+            if (confirmationWaiter) {
+              cancelRuntimeSettingsUpdateWaiter(
+                confirmationWaiter,
+                new Error('model and effort update ended before Codex confirmation'),
+              );
+            }
+            runtimeOptionUpdates.delete(threadId);
+            maybeStartQueuedTurnFromIdle(threadId);
+          }
           return;
         }
 
@@ -2770,13 +3689,20 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
+          const requestedThreadId = getOptionalString(request.params, 'threadId');
+          const activeThreadId = deps.stateStore.read().activeThreadId;
+          const threadId = requestedThreadId ?? activeThreadId;
+          if (!threadId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
+            return;
+          }
           const state = deps.stateStore.update((current) => ({
             ...current,
-            queue: enqueueMessage(current.queue, text, deps.config.queueLimit, runOptionsFromParams(request.params)),
+            queue: enqueueMessage(current.queue, text, deps.config.queueLimit, runOptionsFromParams(request.params), threadId),
           }));
-          send(ws, { type: 'rpc/result', id: request.id, result: state.queue });
+          send(ws, { type: 'rpc/result', id: request.id, result: queueForThread(state.queue, threadId) });
           broadcastHello(state);
-          maybeSteerQueuedMessage();
+          if (state.activeThreadId === threadId) maybeSteerQueuedMessage();
           return;
         }
 
@@ -2812,6 +3738,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         }
 
         if (request.method === 'webui/thread/compact/start') {
+          if (runtimeOptionUpdates.size > 0) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'model or effort update is in progress' });
+            return;
+          }
           const state = deps.stateStore.read();
           const threadId = getRequiredString(request.params, 'threadId') ?? state.activeThreadId;
           if (!threadId) {
@@ -2838,6 +3768,105 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             broadcastHello(cleared);
             throw error;
           }
+          return;
+        }
+
+        if (request.method === 'webui/thread/goal/get') {
+          const state = deps.stateStore.read();
+          const threadId = getRequiredString(request.params, 'threadId') ?? state.activeThreadId;
+          if (!threadId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
+            return;
+          }
+
+          const result = await requestCodex('thread/goal/get', { threadId });
+          const goal = threadGoalFromResult(result);
+          const next = goal ? setActiveGoalForThread(goal) : clearActiveGoalForThread(threadId);
+          if (next) broadcastHello(next);
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/thread/goal/set') {
+          if (runtimeOptionUpdates.size > 0 || goalUpdates.size > 0) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'runtime settings or goal update is in progress' });
+            return;
+          }
+          const state = deps.stateStore.read();
+          const threadId = getRequiredString(request.params, 'threadId') ?? state.activeThreadId;
+          if (!threadId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
+            return;
+          }
+
+          const params: Record<string, unknown> = { threadId };
+          if (isRecord(request.params) && hasOwn(request.params, 'objective')) {
+            const objective = getOptionalString(request.params, 'objective');
+            if (!objective) {
+              send(ws, { type: 'rpc/error', id: request.id, error: 'objective is required' });
+              return;
+            }
+            if (objective.length > 4000) {
+              send(ws, { type: 'rpc/error', id: request.id, error: 'objective must be 4,000 characters or fewer' });
+              return;
+            }
+            params.objective = objective;
+          }
+
+          const status = getOptionalEnum(request.params, 'status', GOAL_STATUSES);
+          if (status) params.status = status;
+
+          if (isRecord(request.params) && hasOwn(request.params, 'tokenBudget')) {
+            const tokenBudget = request.params.tokenBudget;
+            if (tokenBudget !== null && (typeof tokenBudget !== 'number' || !Number.isFinite(tokenBudget))) {
+              send(ws, { type: 'rpc/error', id: request.id, error: 'tokenBudget must be a number or null' });
+              return;
+            }
+            params.tokenBudget = tokenBudget;
+          }
+
+          if (!hasOwn(params, 'objective') && !hasOwn(params, 'status') && !hasOwn(params, 'tokenBudget')) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'objective, status, or tokenBudget is required' });
+            return;
+          }
+
+          let result: unknown;
+          goalUpdates.add(threadId);
+          try {
+            const shouldInterruptGoalTurn =
+              (params.status === 'paused' || params.status === 'complete' || params.status === 'blocked') && shouldInterruptActiveGoalTurn(threadId);
+            if (shouldInterruptGoalTurn) {
+              const interrupted = await interruptActiveTurnForThread(threadId);
+              if (interrupted) broadcastHello(interrupted);
+            }
+            result = await requestCodex('thread/goal/set', params);
+          } finally {
+            goalUpdates.delete(threadId);
+          }
+          const goal = threadGoalFromResult(result);
+          const next = goal ? setActiveGoalForThread(goal) : null;
+          if (next) broadcastHello(next);
+          send(ws, { type: 'rpc/result', id: request.id, result });
+          return;
+        }
+
+        if (request.method === 'webui/thread/goal/clear') {
+          const state = deps.stateStore.read();
+          const threadId = getRequiredString(request.params, 'threadId') ?? state.activeThreadId;
+          if (!threadId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
+            return;
+          }
+
+          const shouldInterruptGoalTurn = shouldInterruptActiveGoalTurn(threadId);
+          if (shouldInterruptGoalTurn) {
+            const interrupted = await interruptActiveTurnForThread(threadId);
+            if (interrupted) broadcastHello(interrupted);
+          }
+          const result = await requestCodex('thread/goal/clear', { threadId });
+          const next = clearActiveGoalForThread(threadId);
+          if (next) broadcastHello(next);
+          send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
 
@@ -3174,13 +4203,15 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
           let removed = false;
           const state = deps.stateStore.update((current) => {
-            removed = current.queue.some((message) => message.id === id);
+            removed = queueForThread(current.queue, current.activeThreadId).some((message) => message.id === id);
             return {
               ...current,
-              queue: removed ? removeQueuedMessage(current.queue, id) : current.queue,
+              queue: removed ? removeQueuedMessage(current.queue, id, current.activeThreadId) : current.queue,
             };
           });
-          send(ws, { type: 'rpc/result', id: request.id, result: includeStatus ? { queue: state.queue, removed } : state.queue });
+          pruneTimedOutQueuedStarts(state.queue);
+          const visibleQueue = queueForThread(state.queue, state.activeThreadId);
+          send(ws, { type: 'rpc/result', id: request.id, result: includeStatus ? { queue: visibleQueue, removed } : visibleQueue });
           broadcastHello(state);
           maybeSteerQueuedMessage();
           return;
@@ -3200,9 +4231,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
           const state = deps.stateStore.update((current) => ({
             ...current,
-            queue: updateQueuedMessage(current.queue, id, text),
+            queue: updateQueuedMessage(current.queue, id, text, current.activeThreadId),
           }));
-          send(ws, { type: 'rpc/result', id: request.id, result: state.queue });
+          pruneTimedOutQueuedStarts(state.queue);
+          send(ws, { type: 'rpc/result', id: request.id, result: queueForThread(state.queue, state.activeThreadId) });
           broadcastHello(state);
           return;
         }
@@ -3216,6 +4248,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
           if (!text) {
             send(ws, { type: 'rpc/error', id: request.id, error: 'text is required' });
+            return;
+          }
+          if (runtimeOptionUpdates.size > 0) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'model or effort update is in progress; retry the message' });
             return;
           }
           const currentState = deps.stateStore.read();
@@ -3237,11 +4273,35 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             broadcastHello(pendingState);
           }
 
+          const directStartContext = { current: null as TurnContext | null };
+          const contextGeneration = directStartContextGeneration;
           let result: { turn: { id: string } };
           try {
-            result = await startTurn({ threadId, text, options });
+            result = await startTurn({ threadId, text, options }, (context) => {
+              directStartContext.current = context;
+            });
           } catch (error) {
-            if (!isTurnStartTimeout(error)) {
+            const ambiguousTurnId = directStartContext.current?.ambiguousTurnId;
+            if (ambiguousTurnId) {
+              const timedOutQueuedStart = timedOutQueuedStarts.get(threadId);
+              if (timedOutQueuedStart) markTimedOutRecoveryMaybeSent(threadId, timedOutQueuedStart);
+              timedOutQueuedStarts.delete(threadId);
+              const reconciled = deps.stateStore.update((current) => (
+                current.activeThreadId === threadId && current.activeTurnId === pendingTurnId
+                  ? { ...current, activeTurnId: ambiguousTurnId }
+                  : current
+              ));
+              broadcastHello(reconciled);
+            } else if (isTurnStartTimeout(error)) {
+              const context = directStartContext.current;
+              const timedOutQueuedStart = timedOutQueuedStarts.get(threadId);
+              if (context && timedOutQueuedStart && contextGeneration === directStartContextGeneration) {
+                retainDirectStartContext(context);
+              } else if (timedOutQueuedStart) {
+                markTimedOutRecoveryMaybeSent(threadId, timedOutQueuedStart);
+                timedOutQueuedStarts.delete(threadId);
+              }
+            } else {
               const cleared = clearActiveTurn({ threadId, turnId: pendingTurnId }, { broadcast: false });
               broadcastHello(cleared);
             }
@@ -3249,6 +4309,15 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
 
           const nextTurnId = extractTurnId(result);
+          const timedOutQueuedStart = timedOutQueuedStarts.get(threadId);
+          if (timedOutQueuedStart) {
+            if (directStartContext.current?.ambiguousTurnId && directStartContext.current.ambiguousTurnId !== nextTurnId) {
+              removeTimedOutRecovery(threadId, timedOutQueuedStart);
+            } else {
+              markTimedOutRecoveryMaybeSent(threadId, timedOutQueuedStart);
+            }
+            timedOutQueuedStarts.delete(threadId);
+          }
           const alreadyCompleted = hasCompletedTurn(threadId, nextTurnId);
           const state = deps.stateStore.update((current) => {
             if (current.activeThreadId !== threadId) return current;
@@ -3263,6 +4332,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             rememberTurnThreadPath(threadId, nextTurnId, state.activeThreadPath);
             rememberTurnCwd(threadId, nextTurnId, state.activeCwd);
             rememberLivePatchTurn(threadId, nextTurnId);
+            rememberObservedTurnStart(threadId, nextTurnId);
           }
           send(ws, { type: 'rpc/result', id: request.id, result });
           broadcastHello(state);

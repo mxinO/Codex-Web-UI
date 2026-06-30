@@ -29,6 +29,27 @@ function expectNodeWebApiOptions(env: NodeJS.ProcessEnv): void {
   expect(nodeOptions(env)).toEqual(expect.arrayContaining(expectedNodeWebApiOptions));
 }
 
+class FakeRpcSocket extends EventEmitter {
+  readyState = 1;
+
+  send(data: string): void {
+    const message = JSON.parse(data) as { id?: number; method?: string };
+    if (message.method !== 'initialize' || typeof message.id !== 'number') return;
+    queueMicrotask(() => {
+      this.emit('message', JSON.stringify({ jsonrpc: '2.0', id: message.id, result: {} }));
+    });
+  }
+
+  close(): void {
+    this.readyState = 3;
+    this.emit('close');
+  }
+
+  receive(message: unknown): void {
+    this.emit('message', JSON.stringify(message));
+  }
+}
+
 describe('Codex process tracing', () => {
   it('redacts secrets from traced process argv', () => {
     expect(
@@ -274,6 +295,47 @@ describe('CodexAppServer lifecycle', () => {
     (server as unknown as { initialized: boolean }).initialized = true;
 
     expect(server.health()).toMatchObject({ connected: true, dead: false });
+  });
+
+  it('drops notifications and server requests from a stale peer after reconnect', async () => {
+    const server = new CodexAppServer({ cwd: process.cwd(), mock: false });
+    const staleSocket = new FakeRpcSocket();
+    const currentSocket = new FakeRpcSocket();
+    const notification = vi.fn();
+    const serverRequest = vi.fn();
+    server.onNotification(notification);
+    server.onServerRequest(serverRequest);
+
+    const internals = server as unknown as {
+      openSocket: ReturnType<typeof vi.fn>;
+      connect(url: string, isCancelled: () => boolean): Promise<unknown>;
+    };
+    internals.openSocket = vi.fn()
+      .mockResolvedValueOnce(staleSocket)
+      .mockResolvedValueOnce(currentSocket);
+
+    await internals.connect('ws://stale', () => false);
+    server.stop();
+    await internals.connect('ws://current', () => false);
+
+    staleSocket.receive({ jsonrpc: '2.0', method: 'thread/stale', params: { threadId: 'stale' } });
+    staleSocket.receive({ jsonrpc: '2.0', id: 'stale-request', method: 'item/stale', params: {} });
+    currentSocket.receive({ jsonrpc: '2.0', method: 'thread/current', params: { threadId: 'current' } });
+    currentSocket.receive({ jsonrpc: '2.0', id: 'current-request', method: 'item/current', params: {} });
+
+    expect(notification).toHaveBeenCalledTimes(1);
+    expect(notification).toHaveBeenCalledWith({
+      jsonrpc: '2.0',
+      method: 'thread/current',
+      params: { threadId: 'current' },
+    });
+    expect(serverRequest).toHaveBeenCalledTimes(1);
+    expect(serverRequest).toHaveBeenCalledWith({
+      jsonrpc: '2.0',
+      id: 'current-request',
+      method: 'item/current',
+      params: {},
+    });
   });
 
   it('clears the cached startup promise and stale child when the app-server websocket closes', async () => {
