@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.9 - 2026-06-30
+
+### Fixed
+
+- Fixed `codex-web-ui --update` getting permanently stuck on npm `EISDIR`/`ENOTEMPTY` rename failures left by stale global-package retirement directories.
+
 ## 0.3.8 - 2026-05-16
 
 ### Added
@@ -24,4 +30,3 @@
 - Fixed queue rendering so queued prompts do not disappear or get appended again when a turn finishes.
 - Fixed history scroll cycling after loading older messages and scrolling back to the bottom.
 - Fixed Web UI startup on memory-limited Node 22 hosts where Node's internal undici WebAssembly allocation can reject during Codex app-server startup before the browser server begins listening.
-- Fixed `codex-web-ui --update` getting permanently stuck on npm `EISDIR`/`ENOTEMPTY` rename failures left by stale global-package retirement directories.
