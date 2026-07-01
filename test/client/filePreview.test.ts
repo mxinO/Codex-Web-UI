@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  fileBrowserUrl,
   fileDownloadUrl,
   filePreviewUrl,
   fileRawUrl,
@@ -40,6 +41,8 @@ describe('file preview helpers', () => {
     expect(fileRawUrl('/repo/reports/a b.html')).toBe('/api/file/raw?path=%2Frepo%2Freports%2Fa%20b.html');
     expect(fileTrustedHtmlUrl('/repo/reports/a b.html')).toBe('/api/file/raw?path=%2Frepo%2Freports%2Fa%20b.html&trusted=1');
     expect(fileTrustedHtmlUrl('/repo/paper.pdf')).toBe('/api/file/raw?path=%2Frepo%2Fpaper.pdf');
+    expect(fileBrowserUrl('/repo/reports/a b.html')).toBe('/api/file/raw?path=%2Frepo%2Freports%2Fa%20b.html&trusted=1');
+    expect(fileBrowserUrl('/repo/paper.pdf')).toBe('/api/file/raw?path=%2Frepo%2Fpaper.pdf');
   });
 });
 

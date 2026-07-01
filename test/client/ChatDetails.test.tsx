@@ -252,7 +252,7 @@ describe('ChatItem details', () => {
     const rawLinks = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href^="/api/file/raw"]'));
     expect(rawLinks.map((link) => [link.textContent, link.getAttribute('href'), link.getAttribute('target'), link.getAttribute('rel')])).toEqual([
       ['reports/summary.pdf', '/api/file/raw?path=reports%2Fsummary.pdf', '_blank', 'noreferrer'],
-      ['report', '/api/file/raw?path=reports%2Findex.html', '_blank', 'noreferrer'],
+      ['report', '/api/file/raw?path=reports%2Findex.html&trusted=1', '_blank', 'noreferrer'],
     ]);
 
     const viewerLinks = Array.from(document.querySelectorAll<HTMLButtonElement>('.markdown-file-link'));

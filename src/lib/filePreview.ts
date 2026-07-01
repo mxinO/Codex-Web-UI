@@ -40,6 +40,10 @@ export function fileTrustedHtmlUrl(path: string): string {
   return fileRawUrl(path, { trustedHtml: true });
 }
 
+export function fileBrowserUrl(path: string): string {
+  return isTrustedHtmlPath(path) ? fileTrustedHtmlUrl(path) : fileRawUrl(path);
+}
+
 export function fileDownloadUrl(path: string): string {
   return `/api/download?path=${encodeURIComponent(path)}`;
 }

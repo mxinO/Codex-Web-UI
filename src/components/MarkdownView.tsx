@@ -7,7 +7,7 @@ import rehypeHighlight from 'rehype-highlight';
 import katex from 'katex';
 import 'katex/dist/katex.min.css';
 import { decodeFileMentionHref, FILE_MENTION_HREF_PREFIX, markdownFileHrefPath, remarkFileMentions } from '../lib/fileMentions';
-import { fileRawUrl, isRawBrowserOpenablePath } from '../lib/filePreview';
+import { fileBrowserUrl, isRawBrowserOpenablePath } from '../lib/filePreview';
 
 interface MarkdownViewProps {
   content: string;
@@ -321,7 +321,7 @@ function MarkdownView({ content, onOpenFile, resolveFilePath }: MarkdownViewProp
           const resolvedPath = resolveFilePath ? resolveFilePath(mentionedPath) : mentionedPath;
           if (isRawBrowserOpenablePath(resolvedPath)) {
             return (
-              <a href={fileRawUrl(resolvedPath)} target="_blank" rel="noreferrer" title={`Open ${resolvedPath} in browser`}>
+              <a href={fileBrowserUrl(resolvedPath)} target="_blank" rel="noreferrer" title={`Open ${resolvedPath} in browser`}>
                 {children}
               </a>
             );

@@ -189,7 +189,7 @@ describe('FileEditorModal', () => {
     const rawLinks = Array.from(document.querySelectorAll<HTMLAnchorElement>('a[href^="/api/file/raw"]'));
     expect(rawLinks.map((link) => [link.textContent, link.getAttribute('href'), link.getAttribute('target')])).toEqual([
       ['Spec', '/api/file/raw?path=%2Frepo%2Fdocs%2Fspec.pdf', '_blank'],
-      ['Page', '/api/file/raw?path=%2Frepo%2Fsite%2Findex.html', '_blank'],
+      ['Page', '/api/file/raw?path=%2Frepo%2Fsite%2Findex.html&trusted=1', '_blank'],
     ]);
     expect(onOpenFile).not.toHaveBeenCalled();
   });
@@ -214,7 +214,7 @@ describe('FileEditorModal', () => {
     expect(document.body.textContent).toContain('Preview disabled for large Markdown files.');
   });
 
-  it('shows a raw browser link for read-only browser-openable files', async () => {
+  it('opens read-only HTML with sandboxed scripts from one browser action', async () => {
     render(<FileEditorModal path="/repo/report.html" initialContent="<h1>Report</h1>" sizeBytes={15} readOnly onClose={vi.fn()} onSave={vi.fn()} />);
 
     await act(async () => {
@@ -222,13 +222,10 @@ describe('FileEditorModal', () => {
     });
 
     const link = document.querySelector<HTMLAnchorElement>('a[aria-label="Open /repo/report.html in browser"]');
-    expect(link?.getAttribute('href')).toBe('/api/file/raw?path=%2Frepo%2Freport.html');
+    expect(link?.getAttribute('href')).toBe('/api/file/raw?path=%2Frepo%2Freport.html&trusted=1');
     expect(link?.getAttribute('target')).toBe('_blank');
     expect(link?.getAttribute('rel')).toBe('noreferrer');
 
-    const trustedLink = document.querySelector<HTMLAnchorElement>('a[aria-label="Open /repo/report.html as trusted HTML"]');
-    expect(trustedLink?.getAttribute('href')).toBe('/api/file/raw?path=%2Frepo%2Freport.html&trusted=1');
-    expect(trustedLink?.getAttribute('target')).toBe('_blank');
-    expect(trustedLink?.getAttribute('rel')).toBe('noreferrer');
+    expect(document.querySelector('a[aria-label="Open /repo/report.html as trusted HTML"]')).toBeNull();
   });
 });

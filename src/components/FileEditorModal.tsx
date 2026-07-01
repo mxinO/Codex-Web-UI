@@ -1,6 +1,6 @@
 import { lazy, Suspense, useEffect, useMemo, useState } from 'react';
-import { ExternalLink, FileCode } from 'lucide-react';
-import { fileRawUrl, fileTrustedHtmlUrl, isRawBrowserOpenablePath, isTrustedHtmlPath } from '../lib/filePreview';
+import { ExternalLink } from 'lucide-react';
+import { fileBrowserUrl, isRawBrowserOpenablePath } from '../lib/filePreview';
 
 const MonacoEditor = lazy(() => import('@monaco-editor/react'));
 const MarkdownView = lazy(() => import('./MarkdownView'));
@@ -144,7 +144,6 @@ export default function FileEditorModal({ path, initialContent, sizeBytes, readO
   const language = useMemo(() => languageForPath(path), [path]);
   const isMarkdown = language === 'markdown';
   const rawOpenable = readOnly && isRawBrowserOpenablePath(path);
-  const trustedHtmlOpenable = readOnly && isTrustedHtmlPath(path);
   const markdownPreviewAllowed = !isMarkdown || sizeBytes === null || sizeBytes === undefined || sizeBytes <= MARKDOWN_PREVIEW_MAX_BYTES;
 
   useEffect(() => {
@@ -193,13 +192,8 @@ export default function FileEditorModal({ path, initialContent, sizeBytes, readO
             )}
             {readOnly && isMarkdown && !markdownPreviewAllowed && <span className="file-editor-note">Preview disabled for large Markdown files.</span>}
             {rawOpenable && (
-              <a className="text-button file-editor-raw-link" href={fileRawUrl(path)} target="_blank" rel="noreferrer" title="Open raw file in browser" aria-label={`Open ${path} in browser`}>
+              <a className="text-button file-editor-raw-link" href={fileBrowserUrl(path)} target="_blank" rel="noreferrer" title="Open file in browser" aria-label={`Open ${path} in browser`}>
                 <ExternalLink size={14} aria-hidden="true" />
-              </a>
-            )}
-            {trustedHtmlOpenable && (
-              <a className="text-button file-editor-raw-link" href={fileTrustedHtmlUrl(path)} target="_blank" rel="noreferrer" title="Open trusted HTML with scripts" aria-label={`Open ${path} as trusted HTML`}>
-                <FileCode size={14} aria-hidden="true" />
               </a>
             )}
             {!readOnly && (
