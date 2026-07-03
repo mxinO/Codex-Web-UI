@@ -2076,9 +2076,14 @@ describe('attachBrowserSocket session RPCs', () => {
   });
 
   it('replaces pending manual compaction state with the app-server turn id', async () => {
+    const goal = {
+      threadId: 'thread-1', objective: 'Keep working', status: 'paused', tokenBudget: null,
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 100, updatedAt: 100,
+    };
     const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
       if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } };
       if (method === 'thread/compact/start') return {};
+      if (method === 'thread/goal/set') return { goal };
       throw new Error(`unexpected method ${method}`);
     });
     const { ws, stateStore, notify } = await makeHarness(request, {
@@ -2087,13 +2092,45 @@ describe('attachBrowserSocket session RPCs', () => {
 
     ws.send(JSON.stringify({ type: 'rpc', id: 43, method: 'webui/thread/compact/start', params: { threadId: 'thread-1' } }));
     await nextRpcResponse(ws, 43);
+    notify('event_msg', { payload: { type: 'task_complete', thread_id: 'thread-1' } });
+    await flushPromises();
+    const staleTerminalGoalResponse = nextRpcResponse(ws, 430);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 430, method: 'webui/thread/goal/set',
+      params: { threadId: 'thread-1', status: 'paused' },
+    }));
+    expect(await staleTerminalGoalResponse).toEqual({ type: 'rpc/error', id: 430, error: 'compaction is in progress' });
+
     notify('turn/started', { threadId: 'thread-1', turnId: 'turn-compact' });
     await flushPromises();
 
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-compact' });
+
+    const goalResponse = nextRpcResponse(ws, 431);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 431, method: 'webui/thread/goal/set',
+      params: { threadId: 'thread-1', status: 'paused' },
+    }));
+    expect(await goalResponse).toEqual({ type: 'rpc/error', id: 431, error: 'compaction is in progress' });
+    expect(request).toHaveBeenCalledTimes(2);
+
+    stateStore.write({ ...stateStore.read(), activeTurnId: null });
+    const duplicateResponse = nextRpcResponse(ws, 432);
+    ws.send(JSON.stringify({ type: 'rpc', id: 432, method: 'webui/thread/compact/start', params: { threadId: 'thread-1' } }));
+    expect(await duplicateResponse).toEqual({ type: 'rpc/error', id: 432, error: 'compaction is already in progress' });
+    expect(request).toHaveBeenCalledTimes(2);
+
+    notify('turn/failed', { threadId: 'thread-1', turnId: 'turn-compact' });
+    await flushPromises();
+    const afterFailureResponse = nextRpcResponse(ws, 433);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 433, method: 'webui/thread/goal/set',
+      params: { threadId: 'thread-1', status: 'paused' },
+    }));
+    expect(await afterFailureResponse).toEqual({ type: 'rpc/result', id: 433, result: { goal } });
   });
 
-  it('clears pending manual compaction state on completion even when completion has the final turn id', async () => {
+  it('clears manual compaction state after its final turn id is observed', async () => {
     const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({});
     const { stateStore, notify } = await makeHarness(request);
     stateStore.write({
@@ -2102,10 +2139,35 @@ describe('attachBrowserSocket session RPCs', () => {
       activeTurnId: 'compact-pending:thread-1',
     });
 
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-compact' });
     notify('thread/compacted', { threadId: 'thread-1', turnId: 'turn-compact' });
     await flushPromises();
 
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null });
+  });
+
+  it('does not release compaction tracking for an unbound scoped failure', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } };
+      if (method === 'thread/compact/start') return {};
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, notify } = await makeHarness(request, {
+      initialState: { activeThreadId: 'thread-1', activeCwd: '/work/project', activeThreadPath: '/sessions/thread-1.jsonl' },
+    });
+
+    const compactResponse = nextRpcResponse(ws, 434);
+    ws.send(JSON.stringify({ type: 'rpc', id: 434, method: 'webui/thread/compact/start', params: { threadId: 'thread-1' } }));
+    expect((await compactResponse).type).toBe('rpc/result');
+    notify('turn/failed', { threadId: 'thread-1', turnId: 'failed-compact-turn' });
+    await flushPromises();
+
+    const goalResponse = nextRpcResponse(ws, 435);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 435, method: 'webui/thread/goal/set',
+      params: { threadId: 'thread-1', status: 'paused' },
+    }));
+    expect(await goalResponse).toEqual({ type: 'rpc/error', id: 435, error: 'compaction is in progress' });
   });
 
   it('clears pending manual compaction state when compaction completion omits the final turn id', async () => {
@@ -2122,6 +2184,65 @@ describe('attachBrowserSocket session RPCs', () => {
 
     expect(request).not.toHaveBeenCalled();
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: null });
+  });
+
+  it('releases a bound compaction on an id-less compacted notification for its active turn', async () => {
+    const goal = {
+      threadId: 'thread-1', objective: 'Keep working', status: 'paused', tokenBudget: null,
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 100, updatedAt: 100,
+    };
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } };
+      if (method === 'thread/compact/start') return {};
+      if (method === 'thread/turns/list') return { data: [{ id: 'turn-compact', status: 'completed' }] };
+      if (method === 'thread/goal/set') return { goal };
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, notify } = await makeHarness(request, {
+      initialState: { activeThreadId: 'thread-1', activeCwd: '/work/project', activeThreadPath: '/sessions/thread-1.jsonl' },
+    });
+
+    const compactResponse = nextRpcResponse(ws, 436);
+    ws.send(JSON.stringify({ type: 'rpc', id: 436, method: 'webui/thread/compact/start', params: { threadId: 'thread-1' } }));
+    expect((await compactResponse).type).toBe('rpc/result');
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-compact' });
+    notify('thread/compacted', { threadId: 'thread-1' });
+    await waitForRequestCalls(request, 3);
+    await flushPromises();
+
+    const goalResponse = nextRpcResponse(ws, 437);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 437, method: 'webui/thread/goal/set',
+      params: { threadId: 'thread-1', status: 'paused' },
+    }));
+    expect(await goalResponse).toEqual({ type: 'rpc/result', id: 437, result: { goal } });
+  });
+
+  it('ignores an id-less compacted notification while the bound turn is not terminal', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } };
+      if (method === 'thread/compact/start') return {};
+      if (method === 'thread/turns/list') return { data: [{ id: 'turn-compact', status: 'inProgress' }] };
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, notify } = await makeHarness(request, {
+      initialState: { activeThreadId: 'thread-1', activeCwd: '/work/project', activeThreadPath: '/sessions/thread-1.jsonl' },
+    });
+
+    const compactResponse = nextRpcResponse(ws, 438);
+    ws.send(JSON.stringify({ type: 'rpc', id: 438, method: 'webui/thread/compact/start', params: { threadId: 'thread-1' } }));
+    expect((await compactResponse).type).toBe('rpc/result');
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-compact' });
+    notify('thread/compacted', { threadId: 'thread-1' });
+    await waitForRequestCalls(request, 3);
+    await flushPromises();
+
+    const goalResponse = nextRpcResponse(ws, 439);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 439, method: 'webui/thread/goal/set',
+      params: { threadId: 'thread-1', status: 'paused' },
+    }));
+    expect(await goalResponse).toEqual({ type: 'rpc/error', id: 439, error: 'compaction is in progress' });
   });
 
   it('does not clear pending manual compaction state on a stale thread-scoped task_complete without turn id', async () => {
@@ -2183,6 +2304,721 @@ describe('attachBrowserSocket session RPCs', () => {
     expect(stateStore.read().activeGoal).toEqual(goal);
   });
 
+  it('replaces a matching goal by clearing it before creating an active goal', async () => {
+    const currentGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'paused', tokenBudget: 1000,
+      tokensUsed: 100, timeUsedSeconds: 30, createdAt: 100, updatedAt: 200,
+    };
+    const replacementGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'New objective', status: 'active', tokenBudget: null,
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 300, updatedAt: 300,
+    };
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') return { goal: currentGoal };
+      if (method === 'thread/goal/clear') return { cleared: true };
+      if (method === 'thread/goal/set') return { goal: replacementGoal };
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request, {
+      initialState: { activeThreadId: 'thread-1', activeGoal: currentGoal },
+    });
+
+    const response = nextRpcResponse(ws, 441);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 441, method: 'webui/thread/goal/replace',
+      params: {
+        threadId: 'thread-1', objective: 'New objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100, status: 'paused' },
+      },
+    }));
+
+    expect(await response).toEqual({ type: 'rpc/result', id: 441, result: { goal: replacementGoal } });
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/goal/get', 'thread/goal/clear', 'thread/goal/set']);
+    expect(request).toHaveBeenLastCalledWith('thread/goal/set', {
+      threadId: 'thread-1', objective: 'New objective', status: 'active',
+    });
+    expect(stateStore.read().activeGoal).toEqual(replacementGoal);
+  });
+
+  it('interrupts an active goal turn before replacing its goal', async () => {
+    const currentGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'active', tokenBudget: null,
+      tokensUsed: 100, timeUsedSeconds: 30, createdAt: 100, updatedAt: 200,
+    };
+    const replacementGoal = {
+      ...currentGoal, objective: 'New objective', tokensUsed: 0, timeUsedSeconds: 0, createdAt: 300, updatedAt: 300,
+    };
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') return { goal: currentGoal };
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } };
+      if (method === 'turn/interrupt') return { ok: true };
+      if (method === 'thread/goal/clear') return { cleared: true };
+      if (method === 'thread/goal/set') return { goal: replacementGoal };
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1', activeThreadPath: '/sessions/thread-1.jsonl', activeCwd: '/work/project',
+        activeTurnId: 'goal-turn-1', activeGoal: currentGoal,
+      },
+    });
+    stateStore.write({ ...stateStore.read(), activeTurnId: 'goal-turn-1', activeGoal: currentGoal });
+
+    const response = nextRpcResponse(ws, 462);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 462, method: 'webui/thread/goal/replace',
+      params: {
+        threadId: 'thread-1', objective: 'New objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100, status: 'active' },
+      },
+    }));
+
+    expect((await response).type).toBe('rpc/result');
+    expect(request.mock.calls.map(([method]) => method)).toEqual([
+      'thread/goal/get', 'thread/resume', 'turn/interrupt', 'thread/goal/clear', 'thread/goal/set',
+    ]);
+    expect(stateStore.read()).toMatchObject({ activeTurnId: null, activeGoal: replacementGoal });
+  });
+
+  it('creates a replacement directly when the expected goal is absent', async () => {
+    const goal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'New objective', status: 'active', tokenBudget: null,
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 300, updatedAt: 300,
+    };
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') return { goal: null };
+      if (method === 'thread/goal/set') return { goal };
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1' } });
+
+    const response = nextRpcResponse(ws, 442);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 442, method: 'webui/thread/goal/replace',
+      params: { threadId: 'thread-1', objective: 'New objective', expectedGoal: null },
+    }));
+
+    expect(await response).toEqual({ type: 'rpc/result', id: 442, result: { goal } });
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/goal/get', 'thread/goal/set']);
+  });
+
+  it('rejects a replacement when the confirmed goal is stale', async () => {
+    const currentGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Changed elsewhere', status: 'active', tokenBudget: null,
+      tokensUsed: 10, timeUsedSeconds: 2, createdAt: 200, updatedAt: 201,
+    };
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ goal: currentGoal });
+    const { ws } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1', activeGoal: currentGoal } });
+
+    const response = nextRpcResponse(ws, 443);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 443, method: 'webui/thread/goal/replace',
+      params: {
+        threadId: 'thread-1', objective: 'New objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100, status: 'paused' },
+      },
+    }));
+
+    expect(await response).toEqual({ type: 'rpc/error', id: 443, error: 'goal changed; review the latest goal before replacing it' });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects an unconfirmed completed-goal replacement after the goal becomes active', async () => {
+    const resumedGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Same objective', status: 'active', tokenBudget: null,
+      tokensUsed: 10, timeUsedSeconds: 2, createdAt: 100, updatedAt: 201,
+    };
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ goal: resumedGoal });
+    const { ws } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1', activeGoal: resumedGoal } });
+
+    const response = nextRpcResponse(ws, 451);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 451, method: 'webui/thread/goal/replace',
+      params: {
+        threadId: 'thread-1', objective: 'Next objective',
+        expectedGoal: { objective: 'Same objective', createdAt: 100, status: 'complete' },
+      },
+    }));
+
+    expect(await response).toEqual({ type: 'rpc/error', id: 451, error: 'goal changed; review the latest goal before replacing it' });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not let a delayed public goal read overwrite a completed replacement', async () => {
+    const oldGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'paused', tokenBudget: null,
+      tokensUsed: 10, timeUsedSeconds: 2, createdAt: 100, updatedAt: 100,
+    };
+    const newGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'New objective', status: 'active', tokenBudget: null,
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 200, updatedAt: 200,
+    };
+    const delayedRead = deferred<unknown>();
+    let goalReads = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') return goalReads++ === 0 ? delayedRead.promise : { goal: oldGoal };
+      if (method === 'thread/goal/clear') return { cleared: true };
+      if (method === 'thread/goal/set') return { goal: newGoal };
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1', activeGoal: oldGoal } });
+
+    const readResponse = nextRpcResponse(ws, 452);
+    ws.send(JSON.stringify({ type: 'rpc', id: 452, method: 'webui/thread/goal/get', params: { threadId: 'thread-1' } }));
+    await waitForRequestCalls(request, 1);
+    const replaceResponse = nextRpcResponse(ws, 453);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 453, method: 'webui/thread/goal/replace',
+      params: {
+        threadId: 'thread-1', objective: 'New objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100, status: 'paused' },
+      },
+    }));
+    expect((await replaceResponse).type).toBe('rpc/result');
+    expect(stateStore.read().activeGoal).toEqual(newGoal);
+
+    delayedRead.resolve({ goal: oldGoal });
+    expect((await readResponse).type).toBe('rpc/result');
+    expect(stateStore.read().activeGoal).toEqual(newGoal);
+  });
+
+  it('does not cache a public goal read that starts during replacement', async () => {
+    const oldGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'paused', tokenBudget: null,
+      tokensUsed: 10, timeUsedSeconds: 2, createdAt: 100, updatedAt: 100,
+    };
+    const newGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'New objective', status: 'active', tokenBudget: null,
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 200, updatedAt: 200,
+    };
+    const clear = deferred<unknown>();
+    const delayedRead = deferred<unknown>();
+    let goalReads = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') return goalReads++ === 0 ? { goal: oldGoal } : delayedRead.promise;
+      if (method === 'thread/goal/clear') return clear.promise;
+      if (method === 'thread/goal/set') return { goal: newGoal };
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1', activeGoal: oldGoal } });
+
+    const replaceResponse = nextRpcResponse(ws, 467);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 467, method: 'webui/thread/goal/replace',
+      params: {
+        threadId: 'thread-1', objective: 'New objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100, status: 'paused' },
+      },
+    }));
+    await waitForRequestCalls(request, 2);
+
+    const readResponse = nextRpcResponse(ws, 468);
+    ws.send(JSON.stringify({ type: 'rpc', id: 468, method: 'webui/thread/goal/get', params: { threadId: 'thread-1' } }));
+    await waitForRequestCalls(request, 3);
+    clear.resolve({ cleared: true });
+    expect((await replaceResponse).type).toBe('rpc/result');
+    expect(stateStore.read().activeGoal).toEqual(newGoal);
+
+    delayedRead.resolve({ goal: oldGoal });
+    expect((await readResponse).type).toBe('rpc/result');
+    expect(stateStore.read().activeGoal).toEqual(newGoal);
+  });
+
+  it('does not let a delayed public goal read overwrite a newer goal notification', async () => {
+    const oldGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'paused', tokenBudget: null,
+      tokensUsed: 1, timeUsedSeconds: 1, createdAt: 100, updatedAt: 100,
+    };
+    const newGoal = { ...oldGoal, objective: 'New objective', updatedAt: 200 };
+    const delayedRead = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') return delayedRead.promise;
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request, {
+      initialState: { activeThreadId: 'thread-1', activeGoal: oldGoal },
+    });
+
+    const response = nextRpcResponse(ws, 469);
+    ws.send(JSON.stringify({ type: 'rpc', id: 469, method: 'webui/thread/goal/get', params: { threadId: 'thread-1' } }));
+    await waitForRequestCalls(request, 1);
+    notify('thread/goal/updated', { goal: newGoal });
+    await flushPromises();
+    expect(stateStore.read().activeGoal).toEqual(newGoal);
+
+    delayedRead.resolve({ goal: oldGoal });
+    expect((await response).type).toBe('rpc/result');
+    expect(stateStore.read().activeGoal).toEqual(newGoal);
+  });
+
+  it('edits a matching goal objective without resetting its lifecycle', async () => {
+    const currentGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'paused', tokenBudget: 1000,
+      tokensUsed: 100, timeUsedSeconds: 30, createdAt: 100, updatedAt: 200,
+    };
+    const updatedGoal = { ...currentGoal, objective: 'Edited objective', updatedAt: 300 };
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') return { goal: currentGoal };
+      if (method === 'thread/goal/set') return { goal: updatedGoal };
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request, {
+      initialState: { activeThreadId: 'thread-1', activeGoal: currentGoal },
+    });
+
+    const response = nextRpcResponse(ws, 444);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 444, method: 'webui/thread/goal/edit',
+      params: {
+        threadId: 'thread-1', objective: 'Edited objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100 },
+      },
+    }));
+
+    expect(await response).toEqual({ type: 'rpc/result', id: 444, result: { goal: updatedGoal } });
+    expect(request).toHaveBeenLastCalledWith('thread/goal/set', { threadId: 'thread-1', objective: 'Edited objective' });
+    expect(stateStore.read().activeGoal).toEqual(updatedGoal);
+  });
+
+  it('rejects an edit when its goal identity is stale', async () => {
+    const currentGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Different goal', status: 'paused', tokenBudget: null,
+      tokensUsed: 1, timeUsedSeconds: 1, createdAt: 200, updatedAt: 200,
+    };
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ goal: currentGoal });
+    const { ws } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1', activeGoal: currentGoal } });
+
+    const response = nextRpcResponse(ws, 454);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 454, method: 'webui/thread/goal/edit',
+      params: {
+        threadId: 'thread-1', objective: 'Edited objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100 },
+      },
+    }));
+
+    expect(await response).toEqual({ type: 'rpc/error', id: 454, error: 'goal changed; review the latest goal before editing it' });
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+
+  it('accepts a failed edit set when reconciliation finds the edited goal', async () => {
+    const currentGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'paused', tokenBudget: 500,
+      tokensUsed: 10, timeUsedSeconds: 2, createdAt: 100, updatedAt: 100,
+    };
+    const editedGoal = { ...currentGoal, objective: 'Edited objective', updatedAt: 200 };
+    let goalReads = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') return { goal: goalReads++ === 0 ? currentGoal : editedGoal };
+      if (method === 'thread/goal/set') throw new Error('set timed out');
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1', activeGoal: currentGoal } });
+
+    const response = nextRpcResponse(ws, 455);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 455, method: 'webui/thread/goal/edit',
+      params: {
+        threadId: 'thread-1', objective: 'Edited objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100 },
+      },
+    }));
+
+    expect(await response).toEqual({ type: 'rpc/result', id: 455, result: { goal: editedGoal } });
+    expect(stateStore.read().activeGoal).toEqual(editedGoal);
+  });
+
+  it('serializes goal mutations while an edit is in progress', async () => {
+    const currentGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'paused', tokenBudget: null,
+      tokensUsed: 1, timeUsedSeconds: 1, createdAt: 100, updatedAt: 100,
+    };
+    const edit = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') return { goal: currentGoal };
+      if (method === 'thread/goal/set') return edit.promise;
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1', activeGoal: currentGoal } });
+
+    const editResponse = nextRpcResponse(ws, 445);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 445, method: 'webui/thread/goal/edit',
+      params: {
+        threadId: 'thread-1', objective: 'Edited objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100 },
+      },
+    }));
+    await waitForRequestCalls(request, 2);
+    const clearResponse = nextRpcResponse(ws, 446);
+    ws.send(JSON.stringify({ type: 'rpc', id: 446, method: 'webui/thread/goal/clear', params: { threadId: 'thread-1' } }));
+
+    expect(await clearResponse).toEqual({ type: 'rpc/error', id: 446, error: 'runtime settings or goal update is in progress' });
+    edit.resolve({ goal: { ...currentGoal, objective: 'Edited objective' } });
+    expect((await editResponse).type).toBe('rpc/result');
+  });
+
+  it('wakes queued steering after a goal mutation releases its lock', async () => {
+    const currentGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'paused', tokenBudget: null,
+      tokensUsed: 1, timeUsedSeconds: 1, createdAt: 100, updatedAt: 100,
+    };
+    const edit = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') return { goal: currentGoal };
+      if (method === 'thread/goal/set') return edit.promise;
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } };
+      if (method === 'turn/steer') return { turnId: 'turn-1' };
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1', activeGoal: currentGoal } });
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1', activeThreadPath: '/sessions/thread-1.jsonl', activeCwd: '/work/project',
+      activeTurnId: 'turn-1', activeGoal: currentGoal,
+    });
+
+    const editResponse = nextRpcResponse(ws, 470);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 470, method: 'webui/thread/goal/edit',
+      params: {
+        threadId: 'thread-1', objective: 'Edited objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100 },
+      },
+    }));
+    await waitForRequestCalls(request, 2);
+
+    const queueResponse = nextRpcResponse(ws, 471);
+    ws.send(JSON.stringify({ type: 'rpc', id: 471, method: 'webui/queue/enqueue', params: { threadId: 'thread-1', text: 'queued work' } }));
+    expect((await queueResponse).type).toBe('rpc/result');
+    expect(request).toHaveBeenCalledTimes(2);
+
+    edit.resolve({ goal: { ...currentGoal, objective: 'Edited objective', updatedAt: 200 } });
+    expect((await editResponse).type).toBe('rpc/result');
+    await waitForRequestCalls(request, 4);
+    expect(request).toHaveBeenCalledWith('turn/steer', {
+      threadId: 'thread-1', expectedTurnId: 'turn-1',
+      input: [{ type: 'text', text: 'queued work', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read().queue).toEqual([]);
+  });
+
+  it('blocks turn starts and session changes while a replacement is in progress', async () => {
+    const currentGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'paused', tokenBudget: null,
+      tokensUsed: 1, timeUsedSeconds: 1, createdAt: 100, updatedAt: 100,
+    };
+    const replacementGoal = {
+      ...currentGoal, objective: 'New objective', status: 'active' as const, createdAt: 200, updatedAt: 200,
+    };
+    const clear = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') return { goal: currentGoal };
+      if (method === 'thread/goal/clear') return clear.promise;
+      if (method === 'thread/goal/set') return { goal: replacementGoal };
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1', activeGoal: currentGoal } });
+
+    const replacementResponse = nextRpcResponse(ws, 456);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 456, method: 'webui/thread/goal/replace',
+      params: {
+        threadId: 'thread-1', objective: 'New objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100, status: 'paused' },
+      },
+    }));
+    await waitForRequestCalls(request, 2);
+
+    const turnResponse = nextRpcResponse(ws, 457);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 457, method: 'webui/turn/start',
+      params: { threadId: 'thread-1', text: 'Do something' },
+    }));
+    expect(await turnResponse).toEqual({ type: 'rpc/error', id: 457, error: 'goal update is in progress; retry the message' });
+
+    const sessionResponse = nextRpcResponse(ws, 458);
+    ws.send(JSON.stringify({ type: 'rpc', id: 458, method: 'webui/session/start', params: { cwd: '/other' } }));
+    expect(await sessionResponse).toEqual({ type: 'rpc/error', id: 458, error: 'session, runtime settings, or goal update is in progress' });
+    expect(request).toHaveBeenCalledTimes(2);
+
+    clear.resolve({ cleared: true });
+    expect((await replacementResponse).type).toBe('rpc/result');
+  });
+
+  it('blocks goal replacement while a turn start is in progress', async () => {
+    const goal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'active', tokenBudget: null,
+      tokensUsed: 1, timeUsedSeconds: 1, createdAt: 100, updatedAt: 100,
+    };
+    const turnStart = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } };
+      if (method === 'turn/start') return turnStart.promise;
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1', activeThreadPath: '/sessions/thread-1.jsonl', activeCwd: '/work/project', activeGoal: goal,
+      },
+    });
+
+    const turnResponse = nextRpcResponse(ws, 463);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 463, method: 'webui/turn/start',
+      params: { threadId: 'thread-1', text: 'Do something' },
+    }));
+    await waitForRequestCalls(request, 1);
+
+    const goalResponse = nextRpcResponse(ws, 464);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 464, method: 'webui/thread/goal/replace',
+      params: {
+        threadId: 'thread-1', objective: 'New objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100, status: 'active' },
+      },
+    }));
+    expect(await goalResponse).toEqual({ type: 'rpc/error', id: 464, error: 'turn start is in progress' });
+
+    await waitForRequestCalls(request, 2);
+    turnStart.resolve({ turn: { id: 'turn-1' } });
+    expect((await turnResponse).type).toBe('rpc/result');
+  });
+
+  it('blocks goal mutations while a session change is in progress', async () => {
+    const sessionStart = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/start') return sessionStart.promise;
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1' } });
+
+    const sessionResponse = nextRpcResponse(ws, 465);
+    ws.send(JSON.stringify({ type: 'rpc', id: 465, method: 'webui/session/start', params: { cwd: '/other' } }));
+    await waitForRequestCalls(request, 1);
+
+    const goalResponse = nextRpcResponse(ws, 466);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 466, method: 'webui/thread/goal/set',
+      params: { threadId: 'thread-1', status: 'paused' },
+    }));
+    expect(await goalResponse).toEqual({ type: 'rpc/error', id: 466, error: 'session change is in progress' });
+    expect(request).toHaveBeenCalledTimes(1);
+
+    sessionStart.resolve({ thread: { id: 'thread-2', cwd: '/other' } });
+    expect((await sessionResponse).type).toBe('rpc/result');
+  });
+
+  it('continues replacement when a failed clear is reconciled as committed', async () => {
+    const currentGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'paused', tokenBudget: null,
+      tokensUsed: 1, timeUsedSeconds: 1, createdAt: 100, updatedAt: 100,
+    };
+    const replacementGoal = {
+      ...currentGoal, objective: 'New objective', status: 'active' as const,
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 200, updatedAt: 200,
+    };
+    let goalReads = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') return { goal: goalReads++ === 0 ? currentGoal : null };
+      if (method === 'thread/goal/clear') throw new Error('clear timed out');
+      if (method === 'thread/goal/set') return { goal: replacementGoal };
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1', activeGoal: currentGoal } });
+
+    const response = nextRpcResponse(ws, 447);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 447, method: 'webui/thread/goal/replace',
+      params: {
+        threadId: 'thread-1', objective: 'New objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100, status: 'paused' },
+      },
+    }));
+
+    expect(await response).toEqual({ type: 'rpc/result', id: 447, result: { goal: replacementGoal } });
+    expect(request.mock.calls.map(([method]) => method)).toEqual([
+      'thread/goal/get', 'thread/goal/clear', 'thread/goal/get', 'thread/goal/set',
+    ]);
+  });
+
+  it('waits briefly for a timed-out clear to become authoritative', async () => {
+    const currentGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'paused', tokenBudget: null,
+      tokensUsed: 1, timeUsedSeconds: 1, createdAt: 100, updatedAt: 100,
+    };
+    const replacementGoal = {
+      ...currentGoal, objective: 'New objective', status: 'active' as const,
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 200, updatedAt: 200,
+    };
+    let goalReads = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') {
+        goalReads += 1;
+        return { goal: goalReads < 3 ? currentGoal : null };
+      }
+      if (method === 'thread/goal/clear') throw new Error('clear timed out');
+      if (method === 'thread/goal/set') return { goal: replacementGoal };
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1', activeGoal: currentGoal } });
+
+    const response = nextRpcResponse(ws, 460);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 460, method: 'webui/thread/goal/replace',
+      params: {
+        threadId: 'thread-1', objective: 'New objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100, status: 'paused' },
+      },
+    }));
+
+    expect((await response).type).toBe('rpc/result');
+    expect(request.mock.calls.map(([method]) => method)).toEqual([
+      'thread/goal/get', 'thread/goal/clear', 'thread/goal/get', 'thread/goal/get', 'thread/goal/set',
+    ]);
+  });
+
+  it('reports when a failed replacement clear left the existing goal in place', async () => {
+    const currentGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'paused', tokenBudget: null,
+      tokensUsed: 1, timeUsedSeconds: 1, createdAt: 100, updatedAt: 100,
+    };
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') return { goal: currentGoal };
+      if (method === 'thread/goal/clear') throw new Error('clear timed out');
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1' } });
+
+    const response = nextRpcResponse(ws, 448);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 448, method: 'webui/thread/goal/replace',
+      params: {
+        threadId: 'thread-1', objective: 'New objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100, status: 'paused' },
+      },
+    }));
+
+    expect(await response).toEqual({
+      type: 'rpc/error', id: 448,
+      error: 'goal replacement was not applied; the existing goal remains',
+    });
+    expect(request.mock.calls.map(([method]) => method)).toEqual([
+      'thread/goal/get', 'thread/goal/clear', 'thread/goal/get', 'thread/goal/get', 'thread/goal/get',
+    ]);
+    expect(stateStore.read().activeGoal).toEqual(currentGoal);
+  });
+
+  it('reports an incomplete replacement when set fails and no goal exists', async () => {
+    const currentGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'paused', tokenBudget: null,
+      tokensUsed: 1, timeUsedSeconds: 1, createdAt: 100, updatedAt: 100,
+    };
+    let goalReads = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') return { goal: goalReads++ === 0 ? currentGoal : null };
+      if (method === 'thread/goal/clear') return { cleared: true };
+      if (method === 'thread/goal/set') throw new Error('set timed out');
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1', activeGoal: currentGoal } });
+
+    const response = nextRpcResponse(ws, 449);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 449, method: 'webui/thread/goal/replace',
+      params: {
+        threadId: 'thread-1', objective: 'New objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100, status: 'paused' },
+      },
+    }));
+
+    expect(await response).toEqual({
+      type: 'rpc/error', id: 449,
+      error: 'goal replacement is incomplete; no goal is currently set',
+    });
+    expect(stateStore.read().activeGoal).toBeNull();
+  });
+
+  it('accepts a failed replacement set when reconciliation finds the desired active goal', async () => {
+    const desiredGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'New objective', status: 'active', tokenBudget: null,
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 200, updatedAt: 200,
+    };
+    let goalReads = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') return { goal: goalReads++ === 0 ? null : desiredGoal };
+      if (method === 'thread/goal/set') throw new Error('set timed out');
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1' } });
+
+    const response = nextRpcResponse(ws, 450);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 450, method: 'webui/thread/goal/replace',
+      params: { threadId: 'thread-1', objective: 'New objective', expectedGoal: null },
+    }));
+
+    expect(await response).toEqual({ type: 'rpc/result', id: 450, result: { goal: desiredGoal } });
+    expect(stateStore.read().activeGoal).toEqual(desiredGoal);
+  });
+
+  it('waits briefly for a timed-out set to expose the desired active goal', async () => {
+    const desiredGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'New objective', status: 'active', tokenBudget: null,
+      tokensUsed: 0, timeUsedSeconds: 0, createdAt: 200, updatedAt: 200,
+    };
+    let goalReads = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') {
+        goalReads += 1;
+        return { goal: goalReads < 3 ? null : desiredGoal };
+      }
+      if (method === 'thread/goal/set') throw new Error('set timed out');
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1' } });
+
+    const response = nextRpcResponse(ws, 461);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 461, method: 'webui/thread/goal/replace',
+      params: { threadId: 'thread-1', objective: 'New objective', expectedGoal: null },
+    }));
+
+    expect(await response).toEqual({ type: 'rpc/result', id: 461, result: { goal: desiredGoal } });
+    expect(goalReads).toBe(3);
+  });
+
+  it('rejects a failed replacement set when the desired objective kept the old identity', async () => {
+    const currentGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'paused', tokenBudget: null,
+      tokensUsed: 7, timeUsedSeconds: 3, createdAt: 100, updatedAt: 100,
+    };
+    const mutatedOldGoal = { ...currentGoal, objective: 'New objective', status: 'active' as const, updatedAt: 200 };
+    let goalReads = 0;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/goal/get') return { goal: goalReads++ === 0 ? currentGoal : mutatedOldGoal };
+      if (method === 'thread/goal/clear') return { cleared: true };
+      if (method === 'thread/goal/set') throw new Error('set timed out');
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request, { initialState: { activeThreadId: 'thread-1', activeGoal: currentGoal } });
+
+    const response = nextRpcResponse(ws, 459);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 459, method: 'webui/thread/goal/replace',
+      params: {
+        threadId: 'thread-1', objective: 'New objective',
+        expectedGoal: { objective: 'Old objective', createdAt: 100, status: 'paused' },
+      },
+    }));
+
+    expect(await response).toEqual({
+      type: 'rpc/error', id: 459,
+      error: 'goal replacement did not reset the existing goal',
+    });
+    expect(stateStore.read().activeGoal).toEqual(mutatedOldGoal);
+  });
+
   it('does not interrupt a normal active turn when saving a paused goal objective', async () => {
     const goal: NonNullable<HostRuntimeState['activeGoal']> = {
       threadId: 'thread-1',
@@ -2225,6 +3061,38 @@ describe('attachBrowserSocket session RPCs', () => {
     });
     expect(response).toEqual({ type: 'rpc/result', id: 440, result: { goal } });
     expect(stateStore.read()).toMatchObject({ activeGoal: goal, activeTurnId: 'normal-turn-1' });
+  });
+
+  it('keeps queued work behind the barrier when pausing interrupts a goal turn', async () => {
+    const pausedGoal: NonNullable<HostRuntimeState['activeGoal']> = {
+      threadId: 'thread-1', objective: 'Keep working', status: 'paused', tokenBudget: null,
+      tokensUsed: 5, timeUsedSeconds: 2, createdAt: 100, updatedAt: 200,
+    };
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/work/project', path: '/sessions/thread-1.jsonl' } };
+      if (method === 'turn/interrupt') return { ok: true };
+      if (method === 'thread/goal/set') return { goal: pausedGoal };
+      throw new Error(`unexpected method ${method}`);
+    });
+    const { ws, stateStore } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1', activeThreadPath: '/sessions/thread-1.jsonl', activeCwd: '/work/project',
+      activeTurnId: 'goal-turn-1',
+      activeGoal: { ...pausedGoal, status: 'active' },
+      queue: [{ id: 'queued-1', threadId: 'thread-1', text: 'wait here', createdAt: 1 }],
+    });
+
+    const response = nextRpcResponse(ws, 472);
+    ws.send(JSON.stringify({
+      type: 'rpc', id: 472, method: 'webui/thread/goal/set',
+      params: { threadId: 'thread-1', status: 'paused' },
+    }));
+    expect((await response).type).toBe('rpc/result');
+    await flushPromises();
+
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'turn/interrupt', 'thread/goal/set']);
+    expect(stateStore.read().queue).toEqual([{ id: 'queued-1', threadId: 'thread-1', text: 'wait here', createdAt: 1 }]);
   });
 
   it('updates active goal state before forwarding goal notifications', async () => {

@@ -9,6 +9,7 @@ import WorkspaceSidebar from './components/WorkspaceSidebar';
 import Header from './components/Header';
 import ImageViewerModal from './components/ImageViewerModal';
 import InputBox from './components/InputBox';
+import GoalObjectiveDialog from './components/GoalObjectiveDialog';
 import GoalProgressRow from './components/GoalProgressRow';
 import QueueTray from './components/QueueTray';
 import SessionPicker from './components/SessionPicker';
@@ -20,6 +21,7 @@ import { appendEphemeralBangItem, bangOutputEventToTimelineItem, getBangCommandO
 import { FileContentTooLargeError, readTextFileStream } from './lib/fileContent';
 import { isImagePath, normalizeMentionedFilePath } from './lib/filePreview';
 import { parseGoalCommandValue } from './lib/goalCommands';
+import { goalNeedsReplaceConfirmation } from './lib/goalLifecycle';
 import { effortOptionsForModel, modelOptionsFromResult, reconcileEffortForModel } from './lib/modelOptions';
 import { parseRuntimeStatusResult } from './lib/runtimeStatus';
 import {
@@ -83,6 +85,13 @@ interface RuntimeStatusScope {
   reconnectEpoch: number;
   generation: number;
 }
+
+type GoalDialogState =
+  | { mode: 'replace'; threadId: string; currentObjective: string; currentCreatedAt: number; currentStatus: ThreadGoalStatus; proposedObjective: string }
+  | { mode: 'edit'; threadId: string; currentObjective: string; currentCreatedAt: number }
+  | null;
+
+type GoalDialogError = { message: string; submitDisabled: boolean } | null;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
@@ -279,6 +288,10 @@ export default function App() {
   const [retainedFileSummaryItems, setRetainedFileSummaryItems] = useState<FileChangeSummaryTimelineItem[]>([]);
   const [pendingCompactionThreadId, setPendingCompactionThreadId] = useState<string | null>(null);
   const [goalBusy, setGoalBusy] = useState(false);
+  const [goalDialog, setGoalDialog] = useState<GoalDialogState>(null);
+  const [goalDialogError, setGoalDialogError] = useState<GoalDialogError>(null);
+  const [readyIdleGoalKey, setReadyIdleGoalKey] = useState<string | null>(null);
+  const [idleGoalGraceGeneration, setIdleGoalGraceGeneration] = useState(0);
   const [answeredApprovals, setAnsweredApprovals] = useState<Set<string>>(() => new Set());
   const [model, setModelState] = useState<string | null>(() => sanitizeStoredModel(localStorageValue('codex-web-ui:model')));
   const [mode, setModeState] = useState<string | null>(initialMode);
@@ -326,6 +339,9 @@ export default function App() {
     generation: 0,
   });
   const runtimeStatusRequestSequenceRef = useRef(0);
+  const activeGoalThreadRef = useRef(activeThreadId);
+  const goalOperationGenerationRef = useRef(0);
+  const goalBusyRef = useRef(false);
   const pendingTurnStartCount = pendingTurnWindow?.threadId === activeThreadId ? pendingTurnWindow.startCount : null;
   notificationCountRef.current = socket.notificationCount;
   const localSortOrder = useCallback((key?: string) => {
@@ -360,6 +376,15 @@ export default function App() {
       generation: current.generation + 1,
     };
   }, [activeThreadId, activeThreadPath, socket.reconnectEpoch]);
+
+  useLayoutEffect(() => {
+    activeGoalThreadRef.current = activeThreadId;
+    goalOperationGenerationRef.current += 1;
+    goalBusyRef.current = false;
+    setGoalDialog(null);
+    setGoalDialogError(null);
+    setGoalBusy(false);
+  }, [activeThreadId]);
 
   useEffect(() => {
     return () => {
@@ -506,12 +531,25 @@ export default function App() {
   );
   const isRunning = Boolean(state?.activeTurnId || (pendingCompactionThreadId && pendingCompactionThreadId === activeThreadId));
   const activeGoal = state?.activeGoal ?? null;
-  const visibleGoal = activeGoal && activeGoal.threadId === activeThreadId && activeGoal.status !== 'complete' ? activeGoal : null;
+  const threadGoal = activeGoal && activeGoal.threadId === activeThreadId ? activeGoal : null;
+  const visibleGoal = threadGoal?.status !== 'complete' ? threadGoal : null;
+  const activeIdleGoalKey =
+    visibleGoal?.status === 'active' && !isRunning
+      ? `${activeThreadId ?? ''}\0${visibleGoal.createdAt}\0${visibleGoal.updatedAt}\0${visibleGoal.objective}`
+      : null;
+  const goalIdleRecoveryReady = activeIdleGoalKey !== null && readyIdleGoalKey === activeIdleGoalKey;
   const hasActiveStreamingText = useMemo(
     () => visibleLiveTurnItems.some((item) => item.kind === 'streaming' && item.active && item.text.trim().length > 0),
     [visibleLiveTurnItems],
   );
   const showActivityRunning = isRunning && !hasActiveStreamingText;
+
+  useEffect(() => {
+    setReadyIdleGoalKey(null);
+    if (!activeIdleGoalKey) return;
+    const timer = window.setTimeout(() => setReadyIdleGoalKey(activeIdleGoalKey), 1500);
+    return () => window.clearTimeout(timer);
+  }, [activeIdleGoalKey, idleGoalGraceGeneration]);
 
   const restartCodex = useCallback(async () => {
     if (isRunning) {
@@ -542,23 +580,50 @@ export default function App() {
     }
   }, [activeThreadId, socket.connectionState, socket.reconnectEpoch, socket.rpc]);
 
+  const goalOperationIsCurrent = useCallback(
+    (threadId: string, generation: number) =>
+      activeGoalThreadRef.current === threadId && goalOperationGenerationRef.current === generation,
+    [],
+  );
+
+  const beginGoalOperation = useCallback((threadId: string): number | null => {
+    if (goalBusyRef.current || activeGoalThreadRef.current !== threadId) return null;
+    goalBusyRef.current = true;
+    const generation = (goalOperationGenerationRef.current += 1);
+    setGoalBusy(true);
+    return generation;
+  }, []);
+
+  const finishGoalOperation = useCallback((threadId: string, generation: number) => {
+    if (!goalOperationIsCurrent(threadId, generation)) return;
+    goalBusyRef.current = false;
+    setGoalBusy(false);
+  }, [goalOperationIsCurrent]);
+
   const setGoalStatus = useCallback(
     async (status: ThreadGoalStatus) => {
       if (!activeThreadId) {
         setSessionError('Start or resume a session before managing a goal');
         return;
       }
-      setGoalBusy(true);
+      const threadId = activeThreadId;
+      const generation = beginGoalOperation(threadId);
+      if (generation === null) {
+        setSessionError('A goal update is already in progress');
+        return;
+      }
       try {
-        await socket.rpc('webui/thread/goal/set', { threadId: activeThreadId, status });
+        await socket.rpc('webui/thread/goal/set', { threadId, status });
+        if (!goalOperationIsCurrent(threadId, generation)) return;
         showTransientSessionMessage(`Goal ${goalStatusLabel(status)}`);
       } catch (error) {
+        if (!goalOperationIsCurrent(threadId, generation)) return;
         setSessionError(error instanceof Error ? error.message : String(error));
       } finally {
-        setGoalBusy(false);
+        finishGoalOperation(threadId, generation);
       }
     },
-    [activeThreadId, showTransientSessionMessage, socket.rpc],
+    [activeThreadId, beginGoalOperation, finishGoalOperation, goalOperationIsCurrent, showTransientSessionMessage, socket.rpc],
   );
 
   const clearGoal = useCallback(async () => {
@@ -566,21 +631,130 @@ export default function App() {
       setSessionError('Start or resume a session before clearing a goal');
       return;
     }
-    setGoalBusy(true);
+    const threadId = activeThreadId;
+    const generation = beginGoalOperation(threadId);
+    if (generation === null) {
+      setSessionError('A goal update is already in progress');
+      return;
+    }
     try {
-      await socket.rpc('webui/thread/goal/clear', { threadId: activeThreadId });
+      await socket.rpc('webui/thread/goal/clear', { threadId });
+      if (!goalOperationIsCurrent(threadId, generation)) return;
       showTransientSessionMessage('Goal cleared');
     } catch (error) {
+      if (!goalOperationIsCurrent(threadId, generation)) return;
       setSessionError(error instanceof Error ? error.message : String(error));
     } finally {
-      setGoalBusy(false);
+      finishGoalOperation(threadId, generation);
     }
-  }, [activeThreadId, showTransientSessionMessage, socket.rpc]);
+  }, [activeThreadId, beginGoalOperation, finishGoalOperation, goalOperationIsCurrent, showTransientSessionMessage, socket.rpc]);
 
   const editGoal = useCallback(() => {
-    if (!activeGoal) return;
-    setComposerDraft(`/goal ${activeGoal.objective}`);
-  }, [activeGoal]);
+    if (!threadGoal || !activeThreadId) return;
+    setGoalDialogError(null);
+    setGoalDialog({
+      mode: 'edit',
+      threadId: activeThreadId,
+      currentObjective: threadGoal.objective,
+      currentCreatedAt: threadGoal.createdAt,
+    });
+  }, [activeThreadId, threadGoal]);
+
+  const proposeGoal = useCallback(async (objective: string) => {
+    if (!activeThreadId) return;
+    const threadId = activeThreadId;
+    const generation = beginGoalOperation(threadId);
+    if (generation === null) {
+      setComposerDraft(`/goal ${objective}`);
+      setSessionError('A goal update is already in progress');
+      return;
+    }
+    try {
+      const result = await socket.rpc('webui/thread/goal/get', { threadId });
+      if (!goalOperationIsCurrent(threadId, generation)) return;
+      const currentGoal = goalFromRpcResult(result);
+      if (currentGoal && goalNeedsReplaceConfirmation(currentGoal)) {
+        setGoalDialogError(null);
+        setGoalDialog({
+          mode: 'replace',
+          threadId,
+          currentObjective: currentGoal.objective,
+          currentCreatedAt: currentGoal.createdAt,
+          currentStatus: currentGoal.status,
+          proposedObjective: objective,
+        });
+        return;
+      }
+      const expectedGoal = currentGoal
+        ? { objective: currentGoal.objective, createdAt: currentGoal.createdAt, status: currentGoal.status }
+        : null;
+      await socket.rpc('webui/thread/goal/replace', { threadId, objective, expectedGoal });
+      if (!goalOperationIsCurrent(threadId, generation)) return;
+      showTransientSessionMessage('Goal set');
+    } catch (error) {
+      if (!goalOperationIsCurrent(threadId, generation)) return;
+      setComposerDraft(`/goal ${objective}`);
+      setSessionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      finishGoalOperation(threadId, generation);
+    }
+  }, [activeThreadId, beginGoalOperation, finishGoalOperation, goalOperationIsCurrent, showTransientSessionMessage, socket.rpc]);
+
+  const confirmGoalReplacement = useCallback(async () => {
+    if (!goalDialog || goalDialog.mode !== 'replace' || goalDialog.threadId !== activeThreadId) return;
+    const dialog = goalDialog;
+    const generation = beginGoalOperation(dialog.threadId);
+    if (generation === null) return;
+    try {
+      await socket.rpc('webui/thread/goal/replace', {
+        threadId: dialog.threadId,
+        objective: dialog.proposedObjective,
+        expectedGoal: { objective: dialog.currentObjective, createdAt: dialog.currentCreatedAt, status: dialog.currentStatus },
+      });
+      if (!goalOperationIsCurrent(dialog.threadId, generation)) return;
+      setGoalDialog(null);
+      setGoalDialogError(null);
+      showTransientSessionMessage('Goal set');
+    } catch (error) {
+      if (!goalOperationIsCurrent(dialog.threadId, generation)) return;
+      setGoalDialog(null);
+      setGoalDialogError(null);
+      setComposerDraft(`/goal ${dialog.proposedObjective}`);
+      setSessionError(error instanceof Error ? error.message : String(error));
+    } finally {
+      finishGoalOperation(dialog.threadId, generation);
+    }
+  }, [activeThreadId, beginGoalOperation, finishGoalOperation, goalDialog, goalOperationIsCurrent, showTransientSessionMessage, socket.rpc]);
+
+  const saveGoalEdit = useCallback(async (objective: string) => {
+    if (!goalDialog || goalDialog.mode !== 'edit' || goalDialog.threadId !== activeThreadId) return;
+    const dialog = goalDialog;
+    const generation = beginGoalOperation(dialog.threadId);
+    if (generation === null) return;
+    setGoalDialogError(null);
+    try {
+      await socket.rpc('webui/thread/goal/edit', {
+        threadId: dialog.threadId,
+        objective,
+        expectedGoal: { objective: dialog.currentObjective, createdAt: dialog.currentCreatedAt },
+      });
+      if (!goalOperationIsCurrent(dialog.threadId, generation)) return;
+      setGoalDialog(null);
+      setGoalDialogError(null);
+      showTransientSessionMessage('Goal updated');
+    } catch (error) {
+      if (!goalOperationIsCurrent(dialog.threadId, generation)) return;
+      const message = error instanceof Error ? error.message : String(error);
+      const stale = /goal (?:changed|edit conflicted|edit failed because the goal no longer exists)/i.test(message);
+      setGoalDialogError({
+        message: stale ? `${message}. Cancel and reopen Edit before retrying.` : message,
+        submitDisabled: stale,
+      });
+      setSessionError(message);
+    } finally {
+      finishGoalOperation(dialog.threadId, generation);
+    }
+  }, [activeThreadId, beginGoalOperation, finishGoalOperation, goalDialog, goalOperationIsCurrent, showTransientSessionMessage, socket.rpc]);
 
   const updateRetainedLiveTurnItems = useCallback((historyItems: TimelineItem[], additions: TimelineItem[] = []) => {
     setRetainedLiveTurnItems((current) => {
@@ -1194,32 +1368,35 @@ export default function App() {
           setSessionError(goalCommand.message);
           return;
         }
+        if (goalCommand.type === 'clear') {
+          void clearGoal();
+          return;
+        }
+        if (goalCommand.type === 'pause' || goalCommand.type === 'resume') {
+          void setGoalStatus(goalCommand.type === 'pause' ? 'paused' : 'active');
+          return;
+        }
+        if (goalCommand.type === 'set') {
+          void proposeGoal(goalCommand.objective);
+          return;
+        }
         void (async () => {
-          setGoalBusy(true);
+          const threadId = activeThreadId;
+          const generation = beginGoalOperation(threadId);
+          if (generation === null) {
+            setSessionError('A goal update is already in progress');
+            return;
+          }
           try {
-            if (goalCommand.type === 'view') {
-              const result = await socket.rpc('webui/thread/goal/get', { threadId: activeThreadId });
-              const goal = goalFromRpcResult(result);
-              setSessionError(goal ? `Goal ${goalStatusLabel(goal.status)}: ${goal.objective}` : 'No active goal');
-              return;
-            }
-            if (goalCommand.type === 'clear') {
-              await socket.rpc('webui/thread/goal/clear', { threadId: activeThreadId });
-              showTransientSessionMessage('Goal cleared');
-              return;
-            }
-            if (goalCommand.type === 'pause' || goalCommand.type === 'resume') {
-              const status = goalCommand.type === 'pause' ? 'paused' : 'active';
-              await socket.rpc('webui/thread/goal/set', { threadId: activeThreadId, status });
-              showTransientSessionMessage(`Goal ${goalStatusLabel(status)}`);
-              return;
-            }
-            await socket.rpc('webui/thread/goal/set', { threadId: activeThreadId, objective: goalCommand.objective, status: 'paused' });
-            showTransientSessionMessage('Goal set');
+            const result = await socket.rpc('webui/thread/goal/get', { threadId });
+            if (!goalOperationIsCurrent(threadId, generation)) return;
+            const goal = goalFromRpcResult(result);
+            setSessionError(goal ? `Goal ${goalStatusLabel(goal.status)}: ${goal.objective}` : 'No active goal');
           } catch (error) {
+            if (!goalOperationIsCurrent(threadId, generation)) return;
             setSessionError(error instanceof Error ? error.message : String(error));
           } finally {
-            setGoalBusy(false);
+            finishGoalOperation(threadId, generation);
           }
         })();
         return;
@@ -1294,7 +1471,7 @@ export default function App() {
 
     window.addEventListener('webui-slash-command', handleSlashCommand);
     return () => window.removeEventListener('webui-slash-command', handleSlashCommand);
-  }, [activeThreadId, activeThreadPath, appendRuntimeStatus, appendRuntimeStatusError, displayEffort, displayMode, displayModel, displaySandbox, loadSessions, resumeSession, runModel, selectEffort, selectMode, selectModel, selectSandbox, showTransientSessionMessage, socket.hello?.hostname, socket.reconnectEpoch, socket.rpc, state?.activeCwd, state?.activeTurnId, timeline.isViewingLatest, timeline.jumpToLatest]);
+  }, [activeThreadId, activeThreadPath, appendRuntimeStatus, appendRuntimeStatusError, beginGoalOperation, clearGoal, displayEffort, displayMode, displayModel, displaySandbox, finishGoalOperation, goalOperationIsCurrent, loadSessions, proposeGoal, resumeSession, runModel, selectEffort, selectMode, selectModel, selectSandbox, setGoalStatus, socket.hello?.hostname, socket.reconnectEpoch, socket.rpc, state?.activeCwd, state?.activeTurnId, timeline.isViewingLatest, timeline.jumpToLatest]);
 
   const editQueued = useCallback(async (message: ClientQueuedMessage) => {
     setSessionError(null);
@@ -1504,8 +1681,15 @@ export default function App() {
               <GoalProgressRow
                 goal={visibleGoal}
                 busy={goalBusy || runtimeOptionsBusy}
+                running={isRunning}
+                idleRecoveryReady={goalIdleRecoveryReady}
                 onPause={() => void setGoalStatus('paused')}
                 onResume={() => void setGoalStatus('active')}
+                onContinue={() => {
+                  setReadyIdleGoalKey(null);
+                  setIdleGoalGraceGeneration((current) => current + 1);
+                  void setGoalStatus('active');
+                }}
                 onEdit={editGoal}
                 onClear={() => void clearGoal()}
               />
@@ -1517,7 +1701,7 @@ export default function App() {
               activeCwd={state?.activeCwd ?? null}
               runOptions={runOptions}
               draftOverride={composerDraft}
-              disabled={socket.connectionState !== 'connected' || codexRestarting || runtimeOptionsBusy}
+              disabled={socket.connectionState !== 'connected' || codexRestarting || runtimeOptionsBusy || goalBusy}
               onDraftConsumed={() => setComposerDraft(null)}
               onEnqueue={enqueue}
               onDirectSubmit={addPendingUserMessage}
@@ -1551,6 +1735,36 @@ export default function App() {
           busy={sessionLoading}
           onCancel={() => setCwdPickerOpen(false)}
           onConfirm={(cwd) => void startSession(cwd)}
+        />
+      )}
+      {goalDialog?.mode === 'replace' && (
+        <GoalObjectiveDialog
+          mode="replace"
+          currentObjective={goalDialog.currentObjective}
+          proposedObjective={goalDialog.proposedObjective}
+          busy={goalBusy}
+          error={goalDialogError?.message}
+          submitDisabled={goalDialogError?.submitDisabled}
+          onCancel={() => {
+            setComposerDraft(`/goal ${goalDialog.proposedObjective}`);
+            setGoalDialog(null);
+            setGoalDialogError(null);
+          }}
+          onReplace={() => void confirmGoalReplacement()}
+        />
+      )}
+      {goalDialog?.mode === 'edit' && (
+        <GoalObjectiveDialog
+          mode="edit"
+          currentObjective={goalDialog.currentObjective}
+          busy={goalBusy}
+          error={goalDialogError?.message}
+          submitDisabled={goalDialogError?.submitDisabled}
+          onCancel={() => {
+            setGoalDialog(null);
+            setGoalDialogError(null);
+          }}
+          onSave={(objective) => void saveGoalEdit(objective)}
         />
       )}
       <AuthOverlay visible={socket.connectionState === 'auth-error'} onSubmitToken={socket.submitToken} />

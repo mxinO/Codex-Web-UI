@@ -1,11 +1,15 @@
 import { Pause, Pencil, Play, X } from 'lucide-react';
+import { goalExecutionActions } from '../lib/goalLifecycle';
 import type { ThreadGoal } from '../types/ui';
 
 interface GoalProgressRowProps {
   goal: ThreadGoal;
   busy: boolean;
+  running: boolean;
+  idleRecoveryReady: boolean;
   onPause: () => void;
   onResume: () => void;
+  onContinue: () => void;
   onEdit: () => void;
   onClear: () => void;
 }
@@ -29,13 +33,14 @@ function formatTokens(goal: ThreadGoal): string {
   return goal.tokenBudget === null ? `${used} tokens` : `${used} / ${goal.tokenBudget.toLocaleString()} tokens`;
 }
 
-export default function GoalProgressRow({ goal, busy, onPause, onResume, onEdit, onClear }: GoalProgressRowProps) {
-  const paused = goal.status === 'paused';
+export default function GoalProgressRow({ goal, busy, running, idleRecoveryReady, onPause, onResume, onContinue, onEdit, onClear }: GoalProgressRowProps) {
+  const actions = goalExecutionActions(goal.status, running, idleRecoveryReady);
+  const displayedStatus = goal.status === 'active' && !running && !idleRecoveryReady ? 'Starting' : statusLabel(goal.status);
   return (
     <div className="goal-progress" aria-label="Active goal">
       <div className="goal-progress__main">
         <div className="goal-progress__eyebrow">
-          <span className="goal-progress__status">{statusLabel(goal.status)}</span>
+          <span className="goal-progress__status">{displayedStatus}</span>
           <span className="goal-progress__metric">{formatTokens(goal)}</span>
           <span className="goal-progress__metric">{formatDuration(goal.timeUsedSeconds)}</span>
         </div>
@@ -44,12 +49,19 @@ export default function GoalProgressRow({ goal, busy, onPause, onResume, onEdit,
         </div>
       </div>
       <div className="goal-progress__actions">
-        {paused ? (
+        {actions.includes('continue') && (
+          <button className="text-button" type="button" onClick={onContinue} disabled={busy} title="Continue idle goal">
+            <Play size={14} aria-hidden="true" />
+            Continue
+          </button>
+        )}
+        {actions.includes('resume') && (
           <button className="text-button" type="button" onClick={onResume} disabled={busy} title="Resume goal">
             <Play size={14} aria-hidden="true" />
             Resume
           </button>
-        ) : (
+        )}
+        {actions.includes('pause') && (
           <button className="text-button" type="button" onClick={onPause} disabled={busy} title="Pause goal">
             <Pause size={14} aria-hidden="true" />
             Pause

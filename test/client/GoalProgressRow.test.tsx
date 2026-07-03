@@ -32,8 +32,11 @@ function renderGoalRow(overrides: Partial<React.ComponentProps<typeof GoalProgre
       <GoalProgressRow
         goal={activeGoal}
         busy={false}
+        running
+        idleRecoveryReady={false}
         onPause={vi.fn()}
         onResume={vi.fn()}
+        onContinue={vi.fn()}
         onEdit={vi.fn()}
         onClear={vi.fn()}
         {...overrides}
@@ -61,7 +64,7 @@ describe('GoalProgressRow', () => {
     expect(document.querySelectorAll('.goal-progress__metric')[1]?.textContent).toBe('2m 5s');
   });
 
-  it('shows pause for active goals and resume for paused goals', () => {
+  it('shows pause for running active goals and resume for paused goals', () => {
     const onPause = vi.fn();
     const onResume = vi.fn();
     renderGoalRow({ onPause, onResume });
@@ -77,8 +80,11 @@ describe('GoalProgressRow', () => {
         <GoalProgressRow
           goal={{ ...activeGoal, status: 'paused' }}
           busy={false}
+          running={false}
+          idleRecoveryReady
           onPause={onPause}
           onResume={onResume}
+          onContinue={vi.fn()}
           onEdit={vi.fn()}
           onClear={vi.fn()}
         />,
@@ -91,4 +97,74 @@ describe('GoalProgressRow', () => {
 
     expect(onResume).toHaveBeenCalledTimes(1);
   });
+
+  it('offers continue and pause when an active goal remains idle', () => {
+    const onContinue = vi.fn();
+    const onPause = vi.fn();
+    renderGoalRow({ running: false, idleRecoveryReady: false });
+    expect(document.querySelector('.goal-progress__status')?.textContent).toBe('Starting');
+    act(() => root?.unmount());
+    container?.remove();
+    root = null;
+    container = null;
+
+    renderGoalRow({ running: false, idleRecoveryReady: true, onContinue, onPause });
+
+    act(() => {
+      buttonByText('Continue')?.click();
+      buttonByText('Pause')?.click();
+    });
+
+    expect(onContinue).toHaveBeenCalledTimes(1);
+    expect(onPause).toHaveBeenCalledTimes(1);
+  });
+
+  it('resumes blocked and usage-limited goals but not budget-limited goals', () => {
+    const onResume = vi.fn();
+    renderGoalRow({ goal: { ...activeGoal, status: 'blocked' }, running: false, idleRecoveryReady: true, onResume });
+    act(() => buttonByText('Resume')?.click());
+
+    for (const status of ['usageLimited'] as const) {
+      act(() => {
+        root?.render(
+          <GoalProgressRow
+            goal={{ ...activeGoal, status }}
+            busy={false}
+            running={false}
+            idleRecoveryReady
+            onPause={vi.fn()}
+            onResume={onResume}
+            onContinue={vi.fn()}
+            onEdit={vi.fn()}
+            onClear={vi.fn()}
+          />,
+        );
+      });
+      act(() => buttonByText('Resume')?.click());
+    }
+    expect(onResume).toHaveBeenCalledTimes(2);
+
+    act(() => {
+      root?.render(
+        <GoalProgressRow
+          goal={{ ...activeGoal, status: 'budgetLimited' }}
+          busy={false}
+          running={false}
+          idleRecoveryReady
+          onPause={vi.fn()}
+          onResume={onResume}
+          onContinue={vi.fn()}
+          onEdit={vi.fn()}
+          onClear={vi.fn()}
+        />,
+      );
+    });
+
+    expect(buttonByText('Resume')).toBeUndefined();
+    expect(buttonByText('Pause')).toBeUndefined();
+  });
 });
+
+function buttonByText(text: string): HTMLButtonElement | undefined {
+  return Array.from(document.querySelectorAll<HTMLButtonElement>('button')).find((button) => button.textContent === text);
+}

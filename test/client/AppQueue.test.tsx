@@ -4,6 +4,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../../src/App';
+import type { ThreadGoal } from '../../src/types/ui';
 
 const mocks = vi.hoisted(() => ({
   rpc: vi.fn(),
@@ -23,6 +24,7 @@ const mocks = vi.hoisted(() => ({
   activeThreadId: 'thread-1' as string | null,
   activeThreadPath: '/rollouts/thread-1.jsonl' as string | null,
   activeTurnId: 'turn-1' as string | null,
+  activeGoal: null as ThreadGoal | null,
   reconnectEpoch: 0,
   timelineIsViewingLatest: true,
   runtimeModel: 'gpt-5.4' as string | null,
@@ -84,6 +86,7 @@ vi.mock('../../src/hooks/useCodexSocket', () => ({
         effort: mocks.runtimeEffort,
         mode: mocks.runtimeMode,
         sandbox: mocks.runtimeSandbox,
+        activeGoal: mocks.activeGoal,
         queue: mocks.stateQueue,
       },
     },
@@ -176,6 +179,7 @@ describe('App queued message tray', () => {
     mocks.activeThreadId = 'thread-1';
     mocks.activeThreadPath = '/rollouts/thread-1.jsonl';
     mocks.activeTurnId = 'turn-1';
+    mocks.activeGoal = null;
     mocks.reconnectEpoch = 0;
     mocks.timelineIsViewingLatest = true;
     mocks.runtimeModel = 'gpt-5.4';
@@ -230,7 +234,12 @@ describe('App queued message tray', () => {
     expect(document.querySelector('[data-testid="input-draft"]')?.textContent).toBe('queued text');
   });
 
-  it('saves a new goal as paused instead of immediately starting autonomous goal work', async () => {
+  it('creates a new goal as active after checking authoritative state', async () => {
+    mocks.rpc.mockImplementation(async (method: string) => {
+      if (method === 'webui/thread/goal/get') return { goal: null };
+      if (method === 'webui/thread/goal/replace') return { goal: null };
+      return {};
+    });
     renderApp();
     await flushReact();
     mocks.rpc.mockClear();
@@ -240,11 +249,230 @@ describe('App queued message tray', () => {
     });
     await flushReact();
 
-    expect(mocks.rpc).toHaveBeenCalledWith('webui/thread/goal/set', {
+    const goalCalls = mocks.rpc.mock.calls.filter(([method]) => String(method).startsWith('webui/thread/goal/'));
+    expect(goalCalls).toEqual([
+      ['webui/thread/goal/get', { threadId: 'thread-1' }],
+      ['webui/thread/goal/replace', {
+        threadId: 'thread-1',
+        objective: 'Finish the migration',
+        expectedGoal: null,
+      }],
+    ]);
+  });
+
+  it('confirms replacement of an unfinished goal and restores the proposed command on cancel', async () => {
+    const goal: ThreadGoal = {
       threadId: 'thread-1',
-      objective: 'Finish the migration',
+      objective: 'Old objective',
       status: 'paused',
+      tokenBudget: null,
+      tokensUsed: 9,
+      timeUsedSeconds: 4,
+      createdAt: 100,
+      updatedAt: 101,
+    };
+    mocks.activeGoal = goal;
+    mocks.rpc.mockImplementation(async (method: string) => {
+      if (method === 'webui/thread/goal/get') return { goal };
+      return {};
     });
+    renderApp();
+    await flushReact();
+    mocks.rpc.mockClear();
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('webui-slash-command', { detail: { input: '/goal New objective' } }));
+    });
+    await flushReact();
+
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain('Old objective');
+    expect(document.querySelector('[role="dialog"]')?.textContent).toContain('New objective');
+    expect(mocks.rpc).toHaveBeenCalledTimes(1);
+    act(() => buttonByText('Cancel').click());
+    expect(document.querySelector('[data-testid="input-draft"]')?.textContent).toBe('/goal New objective');
+  });
+
+  it('replaces a confirmed unfinished goal with its original fingerprint', async () => {
+    const goal: ThreadGoal = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'active', tokenBudget: null,
+      tokensUsed: 9, timeUsedSeconds: 4, createdAt: 100, updatedAt: 101,
+    };
+    mocks.activeGoal = goal;
+    mocks.rpc.mockImplementation(async (method: string) => {
+      if (method === 'webui/thread/goal/get') return { goal };
+      return {};
+    });
+    renderApp();
+    await flushReact();
+    mocks.rpc.mockClear();
+
+    act(() => window.dispatchEvent(new CustomEvent('webui-slash-command', { detail: { input: '/goal New objective' } })));
+    await flushReact();
+    act(() => buttonByText('Replace').click());
+    await flushReact();
+
+    expect(mocks.rpc).toHaveBeenCalledWith('webui/thread/goal/replace', {
+      threadId: 'thread-1',
+      objective: 'New objective',
+      expectedGoal: { objective: 'Old objective', createdAt: 100, status: 'active' },
+    });
+  });
+
+  it('replaces a completed goal without confirmation', async () => {
+    const goal: ThreadGoal = {
+      threadId: 'thread-1', objective: 'Done objective', status: 'complete', tokenBudget: null,
+      tokensUsed: 9, timeUsedSeconds: 4, createdAt: 100, updatedAt: 101,
+    };
+    mocks.activeGoal = goal;
+    mocks.rpc.mockImplementation(async (method: string) => {
+      if (method === 'webui/thread/goal/get') return { goal };
+      return {};
+    });
+    renderApp();
+    await flushReact();
+    mocks.rpc.mockClear();
+
+    act(() => window.dispatchEvent(new CustomEvent('webui-slash-command', { detail: { input: '/goal Next objective' } })));
+    await flushReact();
+
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(mocks.rpc).toHaveBeenCalledWith('webui/thread/goal/replace', {
+      threadId: 'thread-1', objective: 'Next objective',
+      expectedGoal: { objective: 'Done objective', createdAt: 100, status: 'complete' },
+    });
+  });
+
+  it('edits a goal objective without sending status or budget fields', async () => {
+    const goal: ThreadGoal = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'paused', tokenBudget: 500,
+      tokensUsed: 9, timeUsedSeconds: 4, createdAt: 100, updatedAt: 101,
+    };
+    mocks.activeGoal = goal;
+    renderApp();
+    await flushReact();
+    mocks.rpc.mockClear();
+
+    act(() => buttonByText('Edit').click());
+    const textarea = document.querySelector('textarea');
+    if (!(textarea instanceof HTMLTextAreaElement)) throw new Error('goal textarea not found');
+    act(() => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')?.set;
+      setter?.call(textarea, 'Updated objective');
+      textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    act(() => buttonByText('Save').click());
+    await flushReact();
+
+    expect(mocks.rpc).toHaveBeenCalledWith('webui/thread/goal/edit', {
+      threadId: 'thread-1', objective: 'Updated objective',
+      expectedGoal: { objective: 'Old objective', createdAt: 100 },
+    });
+  });
+
+  it('keeps edit failures visible in the dialog and disables a stale retry', async () => {
+    mocks.activeGoal = {
+      threadId: 'thread-1', objective: 'Old objective', status: 'paused', tokenBudget: null,
+      tokensUsed: 9, timeUsedSeconds: 4, createdAt: 100, updatedAt: 101,
+    };
+    mocks.rpc.mockImplementation(async (method: string) => {
+      if (method === 'webui/thread/goal/edit') throw new Error('goal edit conflicted with a different goal');
+      return {};
+    });
+    renderApp();
+    await flushReact();
+    act(() => buttonByText('Edit').click());
+    act(() => buttonByText('Save').click());
+    await flushReact();
+
+    expect(document.querySelector('[role="alert"]')?.textContent).toContain('Cancel and reopen Edit');
+    expect(buttonByText('Save').disabled).toBe(true);
+  });
+
+  it('offers Continue only after an active goal remains idle for the grace period', async () => {
+    vi.useFakeTimers();
+    mocks.activeTurnId = null;
+    mocks.activeGoal = {
+      threadId: 'thread-1', objective: 'Keep working', status: 'active', tokenBudget: null,
+      tokensUsed: 9, timeUsedSeconds: 4, createdAt: 100, updatedAt: 101,
+    };
+    mocks.rpc.mockResolvedValue({});
+    try {
+      renderApp();
+      await flushReact();
+      expect(Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Continue')).toBe(false);
+
+      act(() => vi.advanceTimersByTime(1499));
+      expect(Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Continue')).toBe(false);
+      act(() => vi.advanceTimersByTime(1));
+      expect(buttonByText('Continue')).toBeTruthy();
+
+      mocks.activeGoal = { ...mocks.activeGoal, objective: 'Replacement goal', createdAt: 200, updatedAt: 200 } as ThreadGoal;
+      rerenderApp();
+      expect(Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Continue')).toBe(false);
+      act(() => vi.advanceTimersByTime(1500));
+      act(() => buttonByText('Continue').click());
+      expect(Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Continue')).toBe(false);
+      act(() => vi.advanceTimersByTime(1499));
+      expect(Array.from(document.querySelectorAll('button')).some((button) => button.textContent === 'Continue')).toBe(false);
+      act(() => vi.advanceTimersByTime(1));
+      expect(buttonByText('Continue')).toBeTruthy();
+      await flushReact();
+
+      expect(mocks.rpc).toHaveBeenCalledWith('webui/thread/goal/set', { threadId: 'thread-1', status: 'active' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores a deferred goal proposal after switching sessions', async () => {
+    const pendingReads = new Map<string, (value: unknown) => void>();
+    mocks.rpc.mockResolvedValue({ goal: null });
+    renderApp();
+    await flushReact();
+    mocks.rpc.mockReset();
+    mocks.rpc.mockImplementation(async (method: string, params?: { threadId?: string }) => {
+      if (method !== 'webui/thread/goal/get' || !params?.threadId) return {};
+      return new Promise((resolve) => pendingReads.set(params.threadId as string, resolve));
+    });
+
+    act(() => window.dispatchEvent(new CustomEvent('webui-slash-command', { detail: { input: '/goal Old session work' } })));
+    await flushReact();
+    mocks.activeThreadId = 'thread-2';
+    mocks.activeThreadPath = '/rollouts/thread-2.jsonl';
+    rerenderApp();
+    await flushReact();
+    await act(async () => pendingReads.get('thread-1')?.({ goal: null }));
+    await flushReact();
+
+    expect(mocks.rpc).not.toHaveBeenCalledWith('webui/thread/goal/replace', expect.anything());
+    expect(document.querySelector('[role="dialog"]')).toBeNull();
+    expect(document.querySelector('[data-testid="input-draft"]')?.textContent).toBe('');
+    await act(async () => pendingReads.get('thread-2')?.({ goal: null }));
+  });
+
+  it('rejects a second goal command while the first command is pending', async () => {
+    let resolveFirst!: (value: unknown) => void;
+    mocks.rpc.mockResolvedValue({ goal: null });
+    renderApp();
+    await flushReact();
+    mocks.rpc.mockReset();
+    mocks.rpc.mockImplementation(async (method: string) => {
+      if (method !== 'webui/thread/goal/get') return {};
+      return new Promise((resolve) => {
+        resolveFirst = resolve;
+      });
+    });
+
+    act(() => {
+      window.dispatchEvent(new CustomEvent('webui-slash-command', { detail: { input: '/goal First objective' } }));
+      window.dispatchEvent(new CustomEvent('webui-slash-command', { detail: { input: '/goal Second objective' } }));
+    });
+    await flushReact();
+
+    expect(mocks.rpc).toHaveBeenCalledTimes(1);
+    expect(document.querySelector('[data-testid="input-draft"]')?.textContent).toBe('/goal Second objective');
+    await act(async () => resolveFirst({ goal: null }));
+    await flushReact();
   });
 
   it('shows a goal returned with snake_case fields', async () => {

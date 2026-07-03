@@ -491,6 +491,30 @@ function threadGoalFromNotification(message: { params?: unknown; payload?: unkno
   return threadGoalFromValue(getValuePath(message.params, ['goal'])) ?? threadGoalFromValue(getValuePath(payload, ['goal']));
 }
 
+type GoalFingerprint = Pick<ThreadGoal, 'objective' | 'createdAt'> & { status?: ThreadGoal['status'] };
+
+function expectedGoalFromParams(params: unknown, requireStatus: boolean): { value: GoalFingerprint | null } | { error: string } {
+  if (!isRecord(params) || !hasOwn(params, 'expectedGoal')) return { error: 'expectedGoal is required' };
+  if (params.expectedGoal === null) return { value: null };
+  if (!isRecord(params.expectedGoal)) return { error: 'expectedGoal must be a goal fingerprint or null' };
+  const objective = getRequiredString(params.expectedGoal, 'objective');
+  const createdAt = finiteNumber(params.expectedGoal.createdAt);
+  if (!objective || createdAt === null) return { error: 'expectedGoal must include objective and createdAt' };
+  if (!requireStatus) return { value: { objective, createdAt } };
+  const status = enumValue(params.expectedGoal.status, GOAL_STATUSES);
+  if (!status) return { error: 'expectedGoal must include status for replacement' };
+  return { value: { objective, createdAt, status } };
+}
+
+function goalMatchesFingerprint(goal: ThreadGoal | null, expected: GoalFingerprint | null): boolean {
+  if (!goal || !expected) return goal === null && expected === null;
+  return (
+    goal.objective === expected.objective &&
+    goal.createdAt === expected.createdAt &&
+    (expected.status === undefined || goal.status === expected.status)
+  );
+}
+
 type TerminalDisposition = 'advance-queue' | 'barrier';
 type ActiveCompletionTarget = { threadId: string; turnId: string };
 
@@ -703,7 +727,7 @@ function completionMatchesActiveTurn(
     );
   }
   if (completedTurnId === activeTurnId) return true;
-  return isPendingCompactionTurnForThread(activeTurnId, activeThreadId);
+  return false;
 }
 
 function isTurnStartTimeout(error: unknown): boolean {
@@ -1358,6 +1382,11 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const observedTurnStartKeys = new Set<string>();
   const runtimeOptionUpdates = new Set<string>();
   const goalUpdates = new Set<string>();
+  let goalMutationGeneration = 0;
+  const suppressedGoalQueueStarts = new Set<string>();
+  const suppressedGoalQueueSteers = new Set<string>();
+  let compactionGeneration = 0;
+  const compactionsInFlight = new Map<string, { generation: number; turnId: string | null }>();
   const turnThreadPaths = new Map<string, string>();
   const turnCwds = new Map<string, string>();
   const livePatchTurnKeys = new Set<string>();
@@ -1476,6 +1505,9 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
     resumedThreadIds.clear();
     resumeThreadPromises.clear();
+    compactionsInFlight.clear();
+    suppressedGoalQueueStarts.clear();
+    suppressedGoalQueueSteers.clear();
   };
 
   const validatedThreadPath = (
@@ -2178,9 +2210,12 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const handleGoalNotification = (message: { method?: unknown; params?: unknown; payload?: unknown }): HostRuntimeState | null => {
     if (message.method === 'thread/goal/updated') {
       const goal = threadGoalFromNotification(message);
-      return goal ? setActiveGoalForThread(goal) : null;
+      if (!goal) return null;
+      goalMutationGeneration += 1;
+      return setActiveGoalForThread(goal);
     }
     if (message.method === 'thread/goal/cleared') {
+      goalMutationGeneration += 1;
       return clearActiveGoalForThread(notificationThreadId(message));
     }
     return null;
@@ -2521,6 +2556,16 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     return state.activeThreadId === threadId && state.activeGoal?.threadId === threadId && state.activeGoal.status === 'active' && Boolean(state.activeTurnId);
   };
 
+  const turnStartInFlightForThread = (threadId: string): boolean => {
+    if (pendingTurnStartContexts.some((context) => context.threadId === threadId)) return true;
+    const state = deps.stateStore.read();
+    return state.activeThreadId === threadId && isPendingTurnStartForThread(state.activeTurnId, threadId);
+  };
+
+  const compactionInFlightForThread = (threadId: string): boolean => {
+    return compactionsInFlight.has(threadId);
+  };
+
   const pruneTimedOutQueuedStarts = (queue: QueuedMessage[]): void => {
     for (const [threadId, recovery] of timedOutQueuedStarts) {
       const stillQueued = queue.some((message) => (
@@ -2638,6 +2683,17 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
   const maybeStartQueuedTurnFromIdle = (threadId: string): boolean => {
     if (queuedStartInFlight || runtimeOptionUpdates.has(threadId)) return false;
+    if (goalUpdates.has(threadId)) {
+      const current = deps.stateStore.read();
+      if (
+        current.activeThreadId === threadId &&
+        !current.activeTurnId &&
+        queueForThread(current.queue, threadId, { runnableOnly: true }).length > 0
+      ) {
+        suppressedGoalQueueStarts.add(threadId);
+      }
+      return false;
+    }
     let claim: QueuedTurnClaim | null = null;
     const claimed = deps.stateStore.update((current) => {
       if (current.activeThreadId !== threadId || current.activeTurnId || !current.activeThreadId) return current;
@@ -2670,6 +2726,19 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     let claim: QueuedSteerClaim | null = null;
     const claimed = deps.stateStore.update((current) => {
       if (!current.activeThreadId || !current.activeTurnId) return current;
+      if (goalUpdates.has(current.activeThreadId)) {
+        const nextQueuedMessage = queueForThread(current.queue, current.activeThreadId, { runnableOnly: true })[0];
+        if (
+          current.activeTurnId &&
+          !isPendingTurnForThread(current.activeTurnId, current.activeThreadId) &&
+          !isTerminalOrCompletingTurn(current.activeThreadId, current.activeTurnId) &&
+          nextQueuedMessage &&
+          queuedRunOptionsMatchActiveTurn(current, nextQueuedMessage)
+        ) {
+          suppressedGoalQueueSteers.add(current.activeThreadId);
+        }
+        return current;
+      }
       if (isPendingTurnForThread(current.activeTurnId, current.activeThreadId)) return current;
       if (isTerminalOrCompletingTurn(current.activeThreadId, current.activeTurnId)) return current;
       const nextQueuedMessage = queueForThread(current.queue, current.activeThreadId, { runnableOnly: true })[0];
@@ -2734,6 +2803,19 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         maybeSteerQueuedMessage();
       }
     })();
+  };
+
+  const wakeQueuedWorkAfterGoalUpdate = (
+    threadId: string,
+    options: { allowStart: boolean; allowSteer: boolean },
+  ): void => {
+    queueMicrotask(() => {
+      if (goalUpdates.has(threadId)) return;
+      const startWasSuppressed = suppressedGoalQueueStarts.delete(threadId);
+      const steerWasSuppressed = suppressedGoalQueueSteers.delete(threadId);
+      if (options.allowSteer && steerWasSuppressed) maybeSteerQueuedMessage();
+      if (options.allowStart && startWasSuppressed) maybeStartQueuedTurnFromIdle(threadId);
+    });
   };
 
   const markQueuedMessageMaybeSent = (threadId: string, queuedMessageId: string): HostRuntimeState | null => {
@@ -2941,6 +3023,29 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     } finally {
       if (noTurnVerificationKey) verifyingUnscopedTerminalKeys.delete(noTurnVerificationKey);
       if (resumeSteeringAfterIgnoredNoTurn && (!steerAtReceipt || !steerAtReceipt.timedOut)) maybeSteerQueuedMessage();
+      const compactedThreadId = completedThreadId ?? receiptState.activeThreadId;
+      const compaction = compactedThreadId ? compactionsInFlight.get(compactedThreadId) : null;
+      if (compactedThreadId && compaction) {
+        const matchingTurn = Boolean(completedTurnId && compaction.turnId === completedTurnId);
+        const boundNoIdCompactedNotification =
+          message.method === 'thread/compacted' &&
+          !completedTurnId &&
+          !resumeSteeringAfterIgnoredNoTurn &&
+          compaction.turnId !== null &&
+          receiptState.activeThreadId === compactedThreadId &&
+          receiptState.activeTurnId === compaction.turnId;
+        const unboundNoIdCompactedNotification =
+          message.method === 'thread/compacted' &&
+          !completedTurnId &&
+          compaction.turnId === null &&
+          receiptState.activeThreadId === compactedThreadId &&
+          isPendingCompactionTurnForThread(receiptState.activeTurnId, compactedThreadId);
+        if (matchingTurn || boundNoIdCompactedNotification || unboundNoIdCompactedNotification) {
+          if (compactionsInFlight.get(compactedThreadId)?.generation === compaction.generation) {
+            compactionsInFlight.delete(compactedThreadId);
+          }
+        }
+      }
     }
   };
 
@@ -2963,6 +3068,8 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     const current = deps.stateStore.read();
     const threadId = notifiedThreadId ?? pendingContext?.threadId ?? contextCandidate?.threadId ?? null;
     if (!threadId) return;
+    const compaction = compactionsInFlight.get(threadId);
+    if (compaction && isPendingCompactionTurnForThread(current.activeTurnId, threadId)) compaction.turnId = turnId;
     const threadPath =
       pendingContext?.threadPath ??
       contextCandidate?.threadPath ??
@@ -3098,6 +3205,9 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     if (closed) return;
     closed = true;
     invalidateRetainedDirectStartContexts();
+    compactionsInFlight.clear();
+    suppressedGoalQueueStarts.clear();
+    suppressedGoalQueueSteers.clear();
     runtimeSettingsConfirmation = null;
     if (runtimeSettingsUpdateWaiter) {
       cancelRuntimeSettingsUpdateWaiter(runtimeSettingsUpdateWaiter, new Error('browser socket server closed before confirming model and effort update'));
@@ -3288,8 +3398,8 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         }
 
         if (request.method === 'webui/session/start') {
-          if (runtimeOptionUpdates.size > 0 || sessionChangeInFlight) {
-            send(ws, { type: 'rpc/error', id: request.id, error: 'session or runtime settings update is in progress' });
+          if (runtimeOptionUpdates.size > 0 || goalUpdates.size > 0 || sessionChangeInFlight) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'session, runtime settings, or goal update is in progress' });
             return;
           }
           const cwd = getRequiredString(request.params, 'cwd');
@@ -3346,8 +3456,8 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         }
 
         if (request.method === 'webui/session/resume') {
-          if (runtimeOptionUpdates.size > 0 || sessionChangeInFlight) {
-            send(ws, { type: 'rpc/error', id: request.id, error: 'session or runtime settings update is in progress' });
+          if (runtimeOptionUpdates.size > 0 || goalUpdates.size > 0 || sessionChangeInFlight) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'session, runtime settings, or goal update is in progress' });
             return;
           }
           const threadId = getRequiredString(request.params, 'threadId');
@@ -3742,10 +3852,18 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             send(ws, { type: 'rpc/error', id: request.id, error: 'model or effort update is in progress' });
             return;
           }
+          if (goalUpdates.size > 0) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'goal update is in progress' });
+            return;
+          }
           const state = deps.stateStore.read();
           const threadId = getRequiredString(request.params, 'threadId') ?? state.activeThreadId;
           if (!threadId) {
             send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
+            return;
+          }
+          if (compactionsInFlight.has(threadId)) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'compaction is already in progress' });
             return;
           }
           if (state.activeTurnId && state.activeThreadId === threadId) {
@@ -3754,6 +3872,8 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
 
           const pendingTurnId = pendingCompactionTurnId(threadId);
+          const compaction = { generation: (compactionGeneration += 1), turnId: null as string | null };
+          compactionsInFlight.set(threadId, compaction);
           const markedState = deps.stateStore.update((current) =>
             current.activeThreadId === threadId && !current.activeTurnId ? { ...current, activeTurnId: pendingTurnId } : current,
           );
@@ -3764,6 +3884,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             const result = await requestCodex('thread/compact/start', { threadId });
             send(ws, { type: 'rpc/result', id: request.id, result });
           } catch (error) {
+            if (compactionsInFlight.get(threadId)?.generation === compaction.generation) compactionsInFlight.delete(threadId);
             const cleared = clearActiveTurn({ threadId, turnId: pendingTurnId }, { broadcast: false });
             broadcastHello(cleared);
             throw error;
@@ -3779,15 +3900,23 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
+          const readGeneration = goalMutationGeneration;
+          const cacheEligibleAtStart = goalUpdates.size === 0;
           const result = await requestCodex('thread/goal/get', { threadId });
           const goal = threadGoalFromResult(result);
-          const next = goal ? setActiveGoalForThread(goal) : clearActiveGoalForThread(threadId);
-          if (next) broadcastHello(next);
+          if (cacheEligibleAtStart && readGeneration === goalMutationGeneration && goalUpdates.size === 0) {
+            const next = goal ? setActiveGoalForThread(goal) : clearActiveGoalForThread(threadId);
+            if (next) broadcastHello(next);
+          }
           send(ws, { type: 'rpc/result', id: request.id, result });
           return;
         }
 
         if (request.method === 'webui/thread/goal/set') {
+          if (sessionChangeInFlight) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'session change is in progress' });
+            return;
+          }
           if (runtimeOptionUpdates.size > 0 || goalUpdates.size > 0) {
             send(ws, { type: 'rpc/error', id: request.id, error: 'runtime settings or goal update is in progress' });
             return;
@@ -3796,6 +3925,14 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           const threadId = getRequiredString(request.params, 'threadId') ?? state.activeThreadId;
           if (!threadId) {
             send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
+            return;
+          }
+          if (turnStartInFlightForThread(threadId)) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'turn start is in progress' });
+            return;
+          }
+          if (compactionInFlightForThread(threadId)) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'compaction is in progress' });
             return;
           }
 
@@ -3832,9 +3969,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
           let result: unknown;
           goalUpdates.add(threadId);
+          goalMutationGeneration += 1;
+          const lifecycleBarrier = params.status === 'paused' || params.status === 'complete' || params.status === 'blocked';
+          const shouldInterruptGoalTurn = lifecycleBarrier && shouldInterruptActiveGoalTurn(threadId);
           try {
-            const shouldInterruptGoalTurn =
-              (params.status === 'paused' || params.status === 'complete' || params.status === 'blocked') && shouldInterruptActiveGoalTurn(threadId);
             if (shouldInterruptGoalTurn) {
               const interrupted = await interruptActiveTurnForThread(threadId);
               if (interrupted) broadcastHello(interrupted);
@@ -3842,6 +3980,15 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             result = await requestCodex('thread/goal/set', params);
           } finally {
             goalUpdates.delete(threadId);
+            wakeQueuedWorkAfterGoalUpdate(threadId, {
+              allowSteer: !shouldInterruptGoalTurn,
+              allowStart:
+                !shouldInterruptGoalTurn &&
+                !lifecycleBarrier &&
+                params.status !== 'active' &&
+                !hasOwn(params, 'objective') &&
+                state.activeGoal?.status !== 'active',
+            });
           }
           const goal = threadGoalFromResult(result);
           const next = goal ? setActiveGoalForThread(goal) : null;
@@ -3850,23 +3997,185 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           return;
         }
 
-        if (request.method === 'webui/thread/goal/clear') {
+        if (request.method === 'webui/thread/goal/replace' || request.method === 'webui/thread/goal/edit') {
+          if (sessionChangeInFlight) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'session change is in progress' });
+            return;
+          }
+          if (runtimeOptionUpdates.size > 0 || goalUpdates.size > 0) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'runtime settings or goal update is in progress' });
+            return;
+          }
           const state = deps.stateStore.read();
           const threadId = getRequiredString(request.params, 'threadId') ?? state.activeThreadId;
           if (!threadId) {
             send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
             return;
           }
-
-          const shouldInterruptGoalTurn = shouldInterruptActiveGoalTurn(threadId);
-          if (shouldInterruptGoalTurn) {
-            const interrupted = await interruptActiveTurnForThread(threadId);
-            if (interrupted) broadcastHello(interrupted);
+          if (turnStartInFlightForThread(threadId)) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'turn start is in progress' });
+            return;
           }
-          const result = await requestCodex('thread/goal/clear', { threadId });
-          const next = clearActiveGoalForThread(threadId);
-          if (next) broadcastHello(next);
-          send(ws, { type: 'rpc/result', id: request.id, result });
+          if (compactionInFlightForThread(threadId)) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'compaction is in progress' });
+            return;
+          }
+          const objective = getRequiredString(request.params, 'objective');
+          if (!objective) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'objective is required' });
+            return;
+          }
+          if (objective.length > 4000) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'objective must be 4,000 characters or fewer' });
+            return;
+          }
+          const expected = expectedGoalFromParams(request.params, request.method === 'webui/thread/goal/replace');
+          if ('error' in expected) {
+            send(ws, { type: 'rpc/error', id: request.id, error: expected.error });
+            return;
+          }
+          if (request.method === 'webui/thread/goal/edit' && expected.value === null) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'an existing goal is required to edit' });
+            return;
+          }
+
+          goalUpdates.add(threadId);
+          goalMutationGeneration += 1;
+          let wakeIdleAfterEdit = false;
+          try {
+            const readGoal = async (): Promise<ThreadGoal | null> => {
+              const currentResult = await requestCodex('thread/goal/get', { threadId });
+              const currentGoal = threadGoalFromResult(currentResult);
+              const next = currentGoal ? setActiveGoalForThread(currentGoal) : clearActiveGoalForThread(threadId);
+              if (next) broadcastHello(next);
+              return currentGoal;
+            };
+            const reconcileGoal = async (shouldRetry: (goal: ThreadGoal | null) => boolean): Promise<ThreadGoal | null> => {
+              let reconciled: ThreadGoal | null = null;
+              for (let attempt = 0; attempt < 3; attempt += 1) {
+                if (attempt > 0) await new Promise<void>((resolve) => setTimeout(resolve, attempt * 25));
+                reconciled = await readGoal();
+                if (!shouldRetry(reconciled)) break;
+              }
+              return reconciled;
+            };
+            const currentGoal = await readGoal();
+            wakeIdleAfterEdit = request.method === 'webui/thread/goal/edit' && currentGoal?.status !== 'active';
+            if (!goalMatchesFingerprint(currentGoal, expected.value)) {
+              const action = request.method === 'webui/thread/goal/edit' ? 'editing it' : 'replacing it';
+              throw new Error(`goal changed; review the latest goal before ${action}`);
+            }
+            const validateReplacementGoal = (candidate: ThreadGoal | null, requireNewIdentity: boolean): ThreadGoal => {
+              if (!candidate) throw new Error('goal replacement is incomplete; no goal is currently set');
+              if (requireNewIdentity && currentGoal && candidate.createdAt === currentGoal.createdAt) {
+                throw new Error('goal replacement did not reset the existing goal');
+              }
+              if (candidate.objective !== objective || candidate.status !== 'active') {
+                throw new Error('goal replacement conflicted with a different goal');
+              }
+              return candidate;
+            };
+
+            let result: unknown;
+            if (request.method === 'webui/thread/goal/edit') {
+              try {
+                result = await requestCodex('thread/goal/set', { threadId, objective });
+              } catch {
+                const reconciled = await reconcileGoal((goal) =>
+                  goal === null || (goal.createdAt === expected.value?.createdAt && goal.objective !== objective),
+                );
+                if (!reconciled) throw new Error('goal edit failed because the goal no longer exists');
+                if (reconciled.createdAt !== expected.value?.createdAt) throw new Error('goal edit conflicted with a different goal');
+                if (reconciled.objective !== objective) throw new Error('goal edit was not applied; the existing goal remains');
+                result = { goal: reconciled };
+              }
+            } else {
+              if (currentGoal) {
+                if (shouldInterruptActiveGoalTurn(threadId)) {
+                  const interrupted = await interruptActiveTurnForThread(threadId);
+                  if (interrupted) broadcastHello(interrupted);
+                }
+                try {
+                  await requestCodex('thread/goal/clear', { threadId });
+                  const next = clearActiveGoalForThread(threadId);
+                  if (next) broadcastHello(next);
+                } catch {
+                  const reconciled = await reconcileGoal((goal) => Boolean(goal && goalMatchesFingerprint(goal, expected.value)));
+                  if (reconciled && goalMatchesFingerprint(reconciled, expected.value)) {
+                    throw new Error('goal replacement was not applied; the existing goal remains');
+                  }
+                  if (reconciled) throw new Error('goal replacement conflicted with a different goal');
+                }
+              }
+              try {
+                result = await requestCodex('thread/goal/set', { threadId, objective, status: 'active' });
+              } catch {
+                const reconciled = await reconcileGoal((goal) =>
+                  goal === null || Boolean(currentGoal && goal.createdAt === currentGoal.createdAt),
+                );
+                result = { goal: validateReplacementGoal(reconciled, true) };
+              }
+            }
+
+            let goal = threadGoalFromResult(result);
+            if (request.method === 'webui/thread/goal/replace' && !goal) {
+              goal = await readGoal();
+              result = { goal };
+            }
+            const next = goal ? setActiveGoalForThread(goal) : null;
+            if (next) broadcastHello(next);
+            if (request.method === 'webui/thread/goal/replace') validateReplacementGoal(goal, false);
+            send(ws, { type: 'rpc/result', id: request.id, result });
+          } finally {
+            goalUpdates.delete(threadId);
+            wakeQueuedWorkAfterGoalUpdate(threadId, {
+              allowSteer: request.method === 'webui/thread/goal/edit' || request.method === 'webui/thread/goal/replace',
+              allowStart: wakeIdleAfterEdit,
+            });
+          }
+          return;
+        }
+
+        if (request.method === 'webui/thread/goal/clear') {
+          if (sessionChangeInFlight) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'session change is in progress' });
+            return;
+          }
+          if (runtimeOptionUpdates.size > 0 || goalUpdates.size > 0) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'runtime settings or goal update is in progress' });
+            return;
+          }
+          const state = deps.stateStore.read();
+          const threadId = getRequiredString(request.params, 'threadId') ?? state.activeThreadId;
+          if (!threadId) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
+            return;
+          }
+          if (turnStartInFlightForThread(threadId)) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'turn start is in progress' });
+            return;
+          }
+          if (compactionInFlightForThread(threadId)) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'compaction is in progress' });
+            return;
+          }
+
+          goalUpdates.add(threadId);
+          goalMutationGeneration += 1;
+          try {
+            const shouldInterruptGoalTurn = shouldInterruptActiveGoalTurn(threadId);
+            if (shouldInterruptGoalTurn) {
+              const interrupted = await interruptActiveTurnForThread(threadId);
+              if (interrupted) broadcastHello(interrupted);
+            }
+            const result = await requestCodex('thread/goal/clear', { threadId });
+            const next = clearActiveGoalForThread(threadId);
+            if (next) broadcastHello(next);
+            send(ws, { type: 'rpc/result', id: request.id, result });
+          } finally {
+            goalUpdates.delete(threadId);
+            wakeQueuedWorkAfterGoalUpdate(threadId, { allowSteer: false, allowStart: false });
+          }
           return;
         }
 
@@ -4252,6 +4561,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
           if (runtimeOptionUpdates.size > 0) {
             send(ws, { type: 'rpc/error', id: request.id, error: 'model or effort update is in progress; retry the message' });
+            return;
+          }
+          if (goalUpdates.size > 0) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'goal update is in progress; retry the message' });
             return;
           }
           const currentState = deps.stateStore.read();

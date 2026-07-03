@@ -2573,6 +2573,94 @@ button.activity-card:focus-visible {
   padding: 12px;
 }
 
+.goal-objective-dialog {
+  width: min(620px, 92vw);
+}
+
+.goal-objective-dialog__body {
+  display: grid;
+  gap: 12px;
+}
+
+.goal-objective-dialog__field {
+  display: grid;
+  gap: 7px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.goal-objective-dialog__field textarea {
+  width: 100%;
+  min-height: 112px;
+  padding: 9px 10px;
+  resize: vertical;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  outline: none;
+  background: var(--surface-sunken);
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.goal-objective-dialog__field textarea:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+.goal-objective-dialog__comparison {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.goal-objective-dialog__comparison > div {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--surface-sunken);
+}
+
+.goal-objective-dialog__comparison span {
+  color: var(--text-secondary);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.goal-objective-dialog__comparison p {
+  margin: 7px 0 0;
+  color: var(--text-primary);
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.goal-objective-dialog__error {
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--red) 45%, var(--border));
+  border-radius: 5px;
+  background: color-mix(in srgb, var(--red) 8%, var(--surface-raised));
+  color: var(--red);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.goal-objective-dialog .modal-actions {
+  margin-top: 0;
+  padding: 0 12px 12px;
+}
+
+@media (max-width: 560px) {
+  .goal-objective-dialog__comparison {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
 .git-diff-modal {
   width: min(1120px, 94vw);
   height: min(780px, 88vh);
