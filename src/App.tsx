@@ -828,6 +828,7 @@ export default function App() {
       { activeThreadId: previous.activeThreadId, activeTurnId: previous.activeTurnId },
       currentScope,
       localSortOrder,
+      Date.now(),
       { ignoredRemovedMessageIds: manuallyRemovedQueuedIdsRef.current },
     );
     const nextQueueIds = new Set(nextQueue.map((message) => message.id));

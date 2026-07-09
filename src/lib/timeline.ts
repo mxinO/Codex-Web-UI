@@ -1361,6 +1361,7 @@ export function claimedQueuedUserItemsFromQueueTransition(
   previousScope: TimelineNotificationScope,
   currentScope: TimelineNotificationScope,
   sortOrderForId: (id: string) => number,
+  claimedAt: number,
   options: { ignoredRemovedMessageIds?: ReadonlySet<string> } = {},
 ): Extract<TimelineItem, { kind: 'user' }>[] {
   const previousTurnId = previousScope.activeTurnId;
@@ -1393,7 +1394,7 @@ export function claimedQueuedUserItemsFromQueueTransition(
     return {
       id,
       kind: 'user',
-      timestamp: message.createdAt,
+      timestamp: claimedAt,
       sortOrder: sortOrderForId(id),
       text: message.text,
       turnId: currentTurnId,

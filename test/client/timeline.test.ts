@@ -1988,6 +1988,7 @@ describe('timeline', () => {
       { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
       { activeThreadId: 'thread-1', activeTurnId: 'turn-start-pending:thread-1' },
       () => 10,
+      1000,
     );
 
     expect(claimed).toEqual([
@@ -2085,6 +2086,7 @@ describe('timeline', () => {
       { activeThreadId: 'thread-1', activeTurnId: null },
       { activeThreadId: 'thread-1', activeTurnId: 'turn-late' },
       () => 10,
+      1000,
     );
 
     expect(claimed).toEqual([
@@ -2099,6 +2101,7 @@ describe('timeline', () => {
       { activeThreadId: 'thread-1', activeTurnId: null },
       { activeThreadId: 'thread-1', activeTurnId: 'turn-late' },
       () => 10,
+      1000,
     );
 
     expect(claimedQueuedUserItemsWithoutHistory([{ id: 'turn-old:u1', kind: 'user', timestamp: 900, text: 'same' }], claimed)).toEqual(
@@ -2119,6 +2122,7 @@ describe('timeline', () => {
       { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
       { activeThreadId: 'thread-1', activeTurnId: 'turn-start-pending:thread-1' },
       () => 10,
+      1000,
     );
 
     expect(claimed).toEqual([
@@ -2143,6 +2147,7 @@ describe('timeline', () => {
       { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
       { activeThreadId: 'thread-1', activeTurnId: 'turn-2' },
       () => 10,
+      1001,
       { ignoredRemovedMessageIds: new Set(['queued-1']) },
     );
 
@@ -2161,10 +2166,35 @@ describe('timeline', () => {
       { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
       { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
       () => 10,
+      1000,
     );
 
     expect(claimed).toEqual([
       { id: 'claimed-queued:user:queued-1', kind: 'user', timestamp: 1000, sortOrder: 10, text: 'steered', turnId: 'turn-1' },
+    ]);
+  });
+
+  it('uses claim-time ordering when a mid-turn queued prompt becomes visible', () => {
+    const claimed = claimedQueuedUserItemsFromQueueTransition(
+      [{ id: 'q1', text: 'sent during turn', createdAt: 1000 }],
+      [],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      () => 10,
+      2000,
+    );
+    const existing: TimelineItem = {
+      id: 'already-visible',
+      kind: 'assistant',
+      timestamp: 1500,
+      text: 'Already visible',
+      phase: 'commentary',
+      turnId: 'turn-1',
+    };
+
+    expect(mergeTimelineItemsByTimestamp([existing, ...claimed]).map((item) => item.id)).toEqual([
+      'already-visible',
+      'claimed-queued:user:q1',
     ]);
   });
 
@@ -2179,13 +2209,14 @@ describe('timeline', () => {
       { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
       { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
       (id) => id.length,
+      2000,
     );
 
     expect(claimed).toEqual([
       {
         id: 'claimed-queued:user:queued-1',
         kind: 'user',
-        timestamp: 1000,
+        timestamp: 2000,
         sortOrder: 'claimed-queued:user:queued-1'.length,
         text: 'first steered',
         turnId: 'turn-1',
@@ -2193,7 +2224,7 @@ describe('timeline', () => {
       {
         id: 'claimed-queued:user:queued-2',
         kind: 'user',
-        timestamp: 1001,
+        timestamp: 2000,
         sortOrder: 'claimed-queued:user:queued-2'.length,
         text: 'second steered',
         turnId: 'turn-1',
@@ -2211,6 +2242,7 @@ describe('timeline', () => {
       { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
       { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
       () => 10,
+      1001,
       { ignoredRemovedMessageIds: new Set(['queued-1']) },
     );
 
@@ -2230,6 +2262,7 @@ describe('timeline', () => {
         { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
         { activeThreadId: 'thread-1', activeTurnId: 'turn-start-pending:thread-1' },
         () => 10,
+        2000,
       ),
     ).toEqual([]);
   });
@@ -2244,6 +2277,7 @@ describe('timeline', () => {
       { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
       { activeThreadId: 'thread-1', activeTurnId: 'turn-start-pending:thread-1' },
       () => 10,
+      1001,
     );
 
     expect(claimed).toEqual([
@@ -2282,6 +2316,7 @@ describe('timeline', () => {
         { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
         { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
         () => 10,
+        1000,
         { ignoredRemovedMessageIds: new Set(['queued-1']) },
       ),
     ).toEqual([]);

@@ -351,6 +351,27 @@ describe('App queued message tray', () => {
     expect(document.querySelector('[data-chat-kind="queued"]')).toBeNull();
   });
 
+  it('appends a claimed mid-turn prompt to the visible message flow', async () => {
+    const queued = { id: 'q1', text: 'sent during turn', createdAt: 1000 };
+    mocks.queue = [queued];
+    mocks.stateQueue = [queued];
+    mocks.timelineItems = [
+      { id: 'already-visible', kind: 'assistant', timestamp: 2000, text: 'Already visible' },
+    ];
+    renderApp();
+    await flushReact();
+
+    mocks.queue = [];
+    mocks.stateQueue = [];
+    rerenderApp();
+    await flushReact();
+
+    expect(mocks.chatTimelineItems.map((item) => item.id)).toEqual([
+      'already-visible',
+      'claimed-queued:user:q1',
+    ]);
+  });
+
   it('returns canceled queued message text to the composer', async () => {
     const queued = { id: 'q1', text: 'queued text', createdAt: 1000 };
     mocks.queue = [queued];
