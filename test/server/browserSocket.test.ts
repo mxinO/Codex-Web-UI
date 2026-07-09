@@ -3402,6 +3402,55 @@ describe('attachBrowserSocket app-server requests', () => {
     ]);
   });
 
+  it('does not forward command output deltas into the browser notification stream', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, notify } = await makeHarness(request);
+
+    const next = nextMessage(ws);
+    notify('item/commandExecution/outputDelta', {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      itemId: 'cmd-1',
+      delta: 'large output\n',
+    });
+    notify('item/started', {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+      item: {
+        type: 'commandExecution',
+        id: 'cmd-1',
+        command: 'yes',
+        cwd: '/repo',
+        status: 'inProgress',
+        aggregatedOutput: null,
+        exitCode: null,
+      },
+    });
+
+    expect(await next).toEqual({
+      type: 'codex/notification',
+      streamId: expect.any(String),
+      seq: 1,
+      message: {
+        jsonrpc: '2.0',
+        method: 'item/started',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'commandExecution',
+            id: 'cmd-1',
+            command: 'yes',
+            cwd: '/repo',
+            status: 'inProgress',
+            aggregatedOutput: null,
+            exitCode: null,
+          },
+        },
+      },
+    });
+  });
+
   it('replays current-process notifications when the browser has an old stream id', async () => {
     const request = vi.fn<CodexAppServer['request']>();
     const { port, notify } = await makeHarness(request);
@@ -3415,11 +3464,18 @@ describe('attachBrowserSocket app-server requests', () => {
     await initialHello;
     cleanups.push(() => ws.close());
 
-    const replay = nextMessages(ws, 3);
+    const replay = nextMessages(ws, 4);
     ws.send(JSON.stringify({ type: 'client/hello', params: { lastNotificationStreamId: 'old-stream', lastNotificationSeq: 100 } }));
 
     expect(await replay).toEqual([
       expect.objectContaining({ type: 'server/hello' }),
+      {
+        type: 'codex/replayGap',
+        streamId: expect.any(String),
+        requestedAfterSeq: 100,
+        firstAvailableSeq: 1,
+        latestSeq: 2,
+      },
       {
         type: 'codex/notification',
         streamId: expect.any(String),
@@ -3432,6 +3488,119 @@ describe('attachBrowserSocket app-server requests', () => {
         seq: 2,
         message: { jsonrpc: '2.0', method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'second-after-restart' } },
       },
+    ]);
+  });
+
+  it('reports a replay gap before replaying a cursor older than the retained notification ring', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { port, notify } = await makeHarness(request);
+
+    for (let index = 0; index < 502; index += 1) {
+      notify('item/agentMessage/delta', { threadId: 'thread-1', turnId: 'turn-1', delta: String(index) });
+    }
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const initialHello = nextMessage(ws);
+    await new Promise<void>((resolve) => ws.once('open', resolve));
+    const helloMessage = await initialHello;
+    cleanups.push(() => ws.close());
+
+    const replayStart = nextMessages(ws, 2);
+    const streamId = (helloMessage as { notificationStreamId?: string }).notificationStreamId;
+    ws.send(JSON.stringify({ type: 'client/hello', params: { lastNotificationStreamId: streamId, lastNotificationSeq: 1 } }));
+
+    expect(await replayStart).toEqual([
+      expect.objectContaining({ type: 'server/hello' }),
+      {
+        type: 'codex/replayGap',
+        streamId,
+        requestedAfterSeq: 1,
+        firstAvailableSeq: 3,
+        latestSeq: 502,
+      },
+    ]);
+  });
+
+  it('reports a replay gap when an oversized notification was omitted from the replay ring', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { port, notify } = await makeHarness(request);
+
+    notify('item/agentMessage/delta', { threadId: 'thread-1', turnId: 'turn-1', delta: 'first' });
+    notify('item/agentMessage/delta', { threadId: 'thread-1', turnId: 'turn-1', delta: 'x'.repeat(300 * 1024) });
+    notify('item/agentMessage/delta', { threadId: 'thread-1', turnId: 'turn-1', delta: 'third' });
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const initialHello = nextMessage(ws);
+    await new Promise<void>((resolve) => ws.once('open', resolve));
+    const helloMessage = await initialHello;
+    cleanups.push(() => ws.close());
+
+    const replay = nextMessages(ws, 3);
+    const streamId = (helloMessage as { notificationStreamId?: string }).notificationStreamId;
+    ws.send(JSON.stringify({ type: 'client/hello', params: { lastNotificationStreamId: streamId, lastNotificationSeq: 1 } }));
+
+    expect(await replay).toEqual([
+      expect.objectContaining({ type: 'server/hello' }),
+      {
+        type: 'codex/replayGap',
+        streamId,
+        requestedAfterSeq: 1,
+        firstAvailableSeq: 3,
+        latestSeq: 3,
+      },
+      {
+        type: 'codex/notification',
+        streamId,
+        seq: 3,
+        message: { jsonrpc: '2.0', method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', delta: 'third' } },
+      },
+    ]);
+  });
+
+  it('reports a replay gap for a same-stream null cursor when the retained prefix is missing', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { port, notify } = await makeHarness(request);
+
+    for (let index = 0; index < 502; index += 1) {
+      notify('item/agentMessage/delta', { threadId: 'thread-1', turnId: 'turn-1', delta: String(index) });
+    }
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const initialHello = nextMessage(ws);
+    await new Promise<void>((resolve) => ws.once('open', resolve));
+    const helloMessage = await initialHello;
+    cleanups.push(() => ws.close());
+
+    const replayStart = nextMessages(ws, 2);
+    const streamId = (helloMessage as { notificationStreamId?: string }).notificationStreamId;
+    ws.send(JSON.stringify({ type: 'client/hello', params: { lastNotificationStreamId: streamId, lastNotificationSeq: null } }));
+
+    expect(await replayStart).toEqual([
+      expect.objectContaining({ type: 'server/hello' }),
+      { type: 'codex/replayGap', streamId, requestedAfterSeq: null, firstAvailableSeq: 3, latestSeq: 502 },
+    ]);
+  });
+
+  it('reports a terminal replay gap when the missing sequence has no retained successor', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { port, notify } = await makeHarness(request);
+
+    notify('item/agentMessage/delta', { threadId: 'thread-1', turnId: 'turn-1', delta: 'first' });
+    notify('item/agentMessage/delta', { threadId: 'thread-1', turnId: 'turn-1', delta: 'x'.repeat(300 * 1024) });
+
+    const ws = new WebSocket(`ws://127.0.0.1:${port}/ws`);
+    const initialHello = nextMessage(ws);
+    await new Promise<void>((resolve) => ws.once('open', resolve));
+    const helloMessage = await initialHello;
+    cleanups.push(() => ws.close());
+
+    const replayStart = nextMessages(ws, 2);
+    const streamId = (helloMessage as { notificationStreamId?: string }).notificationStreamId;
+    ws.send(JSON.stringify({ type: 'client/hello', params: { lastNotificationStreamId: streamId, lastNotificationSeq: 1 } }));
+
+    expect(await replayStart).toEqual([
+      expect.objectContaining({ type: 'server/hello' }),
+      { type: 'codex/replayGap', streamId, requestedAfterSeq: 1, firstAvailableSeq: null, latestSeq: 2 },
     ]);
   });
 
@@ -6408,6 +6577,51 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
     });
   });
 
+  it('advances queued work for current turn/completed notifications with completed status', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ turn: { id: 'turn-next' } });
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeTurnId: 'turn-1',
+      activeCwd: '/work/project',
+      queue: [{ id: 'queued-1', threadId: 'thread-1', text: 'queued prompt', createdAt: 1 }],
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } });
+    await waitForRequestCalls(request, 2);
+
+    expect(request).toHaveBeenNthCalledWith(2, 'turn/start', {
+      threadId: 'thread-1',
+      input: [{ type: 'text', text: 'queued prompt', text_elements: [] }],
+    }, TURN_START_RPC_TIMEOUT_MS);
+    expect(stateStore.read()).toMatchObject({ activeTurnId: 'turn-next', queue: [] });
+  });
+
+  it.each(['failed', 'interrupted', 'inProgress', 'futureStatus'] as const)(
+    'treats current turn/completed status %s as a queued-message barrier',
+    async (status) => {
+      const queued = { id: 'queued-1', threadId: 'thread-1', text: 'queued prompt', createdAt: 1 };
+      const request = vi.fn<CodexAppServer['request']>();
+      const { stateStore, notify } = await makeHarness(request);
+      stateStore.write({
+        ...stateStore.read(),
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+        activeTurnId: 'turn-1',
+        activeCwd: '/work/project',
+        queue: [queued],
+      });
+
+      notify('turn/completed', { threadId: 'thread-1', turn: { id: 'turn-1', status } });
+      await waitForActiveTurnCleared(stateStore);
+
+      expect(request.mock.calls.map(([method]) => method)).not.toContain('turn/start');
+      expect(stateStore.read().queue).toEqual([queued]);
+    },
+  );
+
   it.each([
     ['turn/failed notification', { jsonrpc: '2.0', method: 'turn/failed', params: { threadId: 'thread-1', turnId: 'turn-1' } }],
     [
@@ -7389,6 +7603,71 @@ describe('attachBrowserSocket queue and turn RPCs', () => {
       input: [{ type: 'text', text: 'second', text_elements: [] }],
     }, TURN_START_RPC_TIMEOUT_MS);
     expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-2', queue: [] });
+  });
+
+  it('adopts an autonomous next turn while the previous turn is still finalizing', async () => {
+    const sessionDir = mkdtempSync(join(tmpdir(), 'codex-webui-session-dir-'));
+    const root = mkdtempSync(join(tmpdir(), 'codex-webui-diff-root-'));
+    cleanups.push(() => rmSync(sessionDir, { recursive: true, force: true }));
+    cleanups.push(() => rmSync(root, { recursive: true, force: true }));
+    const threadPath = join(sessionDir, 'rollout-2026-05-05T00-00-00-thread-autonomous-handoff.jsonl');
+    const filePath = join(root, 'autonomous-handoff.txt');
+    writeFileSync(threadPath, '');
+    writeFileSync(filePath, 'after\n');
+    const store = new FileEditStore(sessionFileEditDbPath(threadPath));
+    store.recordSnapshot({ turnId: 'turn-1', itemId: 'edit-1', path: filePath, before: 'before\n' });
+    store.close();
+
+    const statGate = deferred<ReturnType<typeof statSync>>();
+    const finalizeObserved = deferred<void>();
+    const originalFinalizeFile = FileEditStore.prototype.finalizeFile;
+    const finalizeSpy = vi.spyOn(FileEditStore.prototype, 'finalizeFile').mockImplementation(function (
+      this: FileEditStore,
+      input: Parameters<FileEditStore['finalizeFile']>[0],
+    ) {
+      const result = originalFinalizeFile.call(this, input);
+      if (input.turnId === 'turn-1' && input.path === filePath) finalizeObserved.resolve(undefined);
+      return result;
+    });
+    cleanups.push(() => finalizeSpy.mockRestore());
+    const originalStat = fs.stat.bind(fs);
+    const statSpy = vi.spyOn(fs, 'stat').mockImplementation(((target: unknown, ...args: unknown[]) => {
+      if (String(target) === filePath) return statGate.promise;
+      return (originalStat as (...innerArgs: unknown[]) => Promise<unknown>)(target, ...args);
+    }) as never);
+    cleanups.push(() => statSpy.mockRestore());
+
+    const request = vi.fn<CodexAppServer['request']>();
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: threadPath,
+      activeTurnId: 'turn-1',
+      activeCwd: root,
+    });
+
+    notify('turn/completed', { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } });
+    for (let attempt = 0; attempt < 20 && statSpy.mock.calls.length === 0; attempt += 1) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    }
+    expect(statSpy).toHaveBeenCalled();
+
+    notify('turn/started', { threadId: 'thread-1', turn: { id: 'turn-2', status: 'inProgress' } });
+    notify('item/agentMessage/delta', {
+      threadId: 'thread-1',
+      turnId: 'turn-2',
+      itemId: 'message-2',
+      delta: 'Still working',
+    });
+    await flushPromises();
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-2' });
+
+    statGate.resolve(statSync(filePath));
+    await finalizeObserved.promise;
+    await flushPromises();
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-1', activeTurnId: 'turn-2' });
+    expect(request).not.toHaveBeenCalled();
   });
 
   it('does not steer newly queued input into a turn whose completion is still finalizing', async () => {

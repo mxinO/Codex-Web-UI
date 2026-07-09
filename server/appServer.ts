@@ -50,6 +50,7 @@ const NODE_WEBSOCKET_MEMORY_OPTION = '--no-experimental-websocket';
 const NODE_EVENTSOURCE_MEMORY_OPTION = '--no-experimental-eventsource';
 const NODE_WEB_API_MEMORY_OPTIONS = [NODE_FETCH_MEMORY_OPTION, NODE_WEBSOCKET_MEMORY_OPTION, NODE_EVENTSOURCE_MEMORY_OPTION];
 const ACTIVE_NODE_WEB_API_MEMORY_OPTIONS = NODE_WEB_API_MEMORY_OPTIONS.filter((option) => process.allowedNodeEnvironmentFlags.has(option));
+export const CODEX_APP_SERVER_STARTUP_TIMEOUT_MS = 60_000;
 
 function truthyEnv(value: string | undefined): boolean {
   return /^(1|true|yes)$/i.test(value ?? '');
@@ -675,7 +676,7 @@ export class CodexAppServer {
       const stderrBuffer = new StartupOutputBuffer((line) => handleOutputLine('stderr', line));
       const startupTimeout = setTimeout(() => {
         fail(new Error('Timed out waiting for Codex app-server startup'));
-      }, 15000);
+      }, CODEX_APP_SERVER_STARTUP_TIMEOUT_MS);
 
       const cleanupStartup = () => {
         clearTimeout(startupTimeout);
@@ -805,10 +806,15 @@ export class CodexAppServer {
       }
     });
 
-    return peer.request<CodexInitializeResponse>('initialize', {
+    const response = await peer.request<CodexInitializeResponse>('initialize', {
       clientInfo: { name: 'codex-web-ui', version: '0.1.0' },
       capabilities: { experimentalApi: true },
     });
+    if (isCancelled() || !isCurrentPeer()) {
+      throw new Error('Codex app-server startup was cancelled');
+    }
+    peer.notify('initialized');
+    return response;
   }
 
   private openSocket(url: string, isCancelled: () => boolean): Promise<WebSocket> {

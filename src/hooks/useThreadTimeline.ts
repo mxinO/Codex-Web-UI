@@ -449,7 +449,7 @@ export function useThreadTimeline(
   );
 
   const fetchLatest = useCallback(async (mode: 'merge' | 'replace') => {
-    if (!activeThreadId) return;
+    if (!activeThreadId) return false;
     const threadId = activeThreadId;
     const generation = ++requestGenerationRef.current;
 
@@ -460,17 +460,19 @@ export function useThreadTimeline(
     if (mode === 'replace') setIsViewingLatest(true);
     try {
       const result = await fetchLatestPage(threadId);
-      if (!isCurrentRequest(threadId, generation)) return;
+      if (!isCurrentRequest(threadId, generation)) return false;
       const latest = [...resultTurns(result)].reverse();
       setTurns((current) => (mode === 'replace' ? latest : mergeLatestTurns(current, latest, WINDOW_TURN_LIMIT)));
       setLoadedThreadId(threadId);
       const nextCursor = getNextCursor(result);
       setCursor((currentCursor) => (mode === 'replace' || isViewingLatestRef.current ? nextCursor : currentCursor));
       setLoadError(null);
+      return true;
     } catch (error) {
-      if (!isCurrentRequest(threadId, generation)) return;
+      if (!isCurrentRequest(threadId, generation)) return false;
       setLoadError(errorMessage(error));
       // Keep the last successfully rendered timeline during transient transport or app-server failures.
+      return false;
     } finally {
       if (isCurrentRequest(threadId, generation)) setLoading(false);
     }

@@ -4,7 +4,13 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, sy
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { CodexAppServer, prepareCodexChildRuntimeEnv, resolveCodexSpawnConfig, sanitizeProcessArgvForTrace } from '../../server/appServer.js';
+import {
+  CODEX_APP_SERVER_STARTUP_TIMEOUT_MS,
+  CodexAppServer,
+  prepareCodexChildRuntimeEnv,
+  resolveCodexSpawnConfig,
+  sanitizeProcessArgvForTrace,
+} from '../../server/appServer.js';
 
 const tempDirs: string[] = [];
 const expectedNodeWebApiOptions = ['--no-experimental-fetch', '--no-experimental-websocket', '--no-experimental-eventsource'].filter((option) =>
@@ -31,10 +37,16 @@ function expectNodeWebApiOptions(env: NodeJS.ProcessEnv): void {
 
 class FakeRpcSocket extends EventEmitter {
   readyState = 1;
+  readonly sent: Array<{ jsonrpc?: string; id?: number; method?: string; params?: unknown }> = [];
+
+  constructor(private readonly autoResolveInitialize = true) {
+    super();
+  }
 
   send(data: string): void {
-    const message = JSON.parse(data) as { id?: number; method?: string };
-    if (message.method !== 'initialize' || typeof message.id !== 'number') return;
+    const message = JSON.parse(data) as { jsonrpc?: string; id?: number; method?: string; params?: unknown };
+    this.sent.push(message);
+    if (!this.autoResolveInitialize || message.method !== 'initialize' || typeof message.id !== 'number') return;
     queueMicrotask(() => {
       this.emit('message', JSON.stringify({ jsonrpc: '2.0', id: message.id, result: {} }));
     });
@@ -81,6 +93,10 @@ describe('Codex process tracing', () => {
 });
 
 describe('CodexAppServer lifecycle', () => {
+  it('allows Codex state backfill to finish before startup times out', () => {
+    expect(CODEX_APP_SERVER_STARTUP_TIMEOUT_MS).toBeGreaterThan(30_000);
+  });
+
   afterEach(() => {
     for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
   });
@@ -295,6 +311,66 @@ describe('CodexAppServer lifecycle', () => {
     (server as unknown as { initialized: boolean }).initialized = true;
 
     expect(server.health()).toMatchObject({ connected: true, dead: false });
+  });
+
+  it('sends initialized only after the initialize request resolves', async () => {
+    const server = new CodexAppServer({ cwd: process.cwd(), mock: false });
+    const socket = new FakeRpcSocket(false);
+    const internals = server as unknown as {
+      openSocket: ReturnType<typeof vi.fn>;
+      connect(url: string, isCancelled: () => boolean): Promise<unknown>;
+    };
+    internals.openSocket = vi.fn().mockResolvedValue(socket);
+
+    const connecting = internals.connect('ws://app-server', () => false);
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+
+    expect(socket.sent[0]).toMatchObject({ jsonrpc: '2.0', id: 1, method: 'initialize' });
+    expect(socket.sent.map(({ method }) => method)).toEqual(['initialize']);
+
+    socket.receive({ jsonrpc: '2.0', id: 1, result: { userAgent: 'codex-test' } });
+
+    await expect(connecting).resolves.toEqual({ userAgent: 'codex-test' });
+    expect(socket.sent).toEqual([
+      expect.objectContaining({ jsonrpc: '2.0', id: 1, method: 'initialize' }),
+      { jsonrpc: '2.0', method: 'initialized' },
+    ]);
+  });
+
+  it('does not acknowledge an initialize response after its lifecycle is cancelled', async () => {
+    const server = new CodexAppServer({ cwd: process.cwd(), mock: false });
+    const socket = new FakeRpcSocket(false);
+    const internals = server as unknown as {
+      openSocket: ReturnType<typeof vi.fn>;
+      connect(url: string, isCancelled: () => boolean): Promise<unknown>;
+    };
+    internals.openSocket = vi.fn().mockResolvedValue(socket);
+    let cancelled = false;
+
+    const connecting = internals.connect('ws://app-server', () => cancelled);
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+    cancelled = true;
+    socket.receive({ jsonrpc: '2.0', id: 1, result: { userAgent: 'stale-codex-test' } });
+
+    await expect(connecting).rejects.toThrow('startup was cancelled');
+    expect(socket.sent.map(({ method }) => method)).toEqual(['initialize']);
+  });
+
+  it('does not send initialized when the initialize request rejects', async () => {
+    const server = new CodexAppServer({ cwd: process.cwd(), mock: false });
+    const socket = new FakeRpcSocket(false);
+    const internals = server as unknown as {
+      openSocket: ReturnType<typeof vi.fn>;
+      connect(url: string, isCancelled: () => boolean): Promise<unknown>;
+    };
+    internals.openSocket = vi.fn().mockResolvedValue(socket);
+
+    const connecting = internals.connect('ws://app-server', () => false);
+    await vi.waitFor(() => expect(socket.sent).toHaveLength(1));
+    socket.receive({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'initialize failed' } });
+
+    await expect(connecting).rejects.toThrow('initialize failed');
+    expect(socket.sent.map(({ method }) => method)).toEqual(['initialize']);
   });
 
   it('drops notifications and server requests from a stale peer after reconnect', async () => {

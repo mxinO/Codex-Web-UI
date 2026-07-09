@@ -294,6 +294,160 @@ describe('useCodexSocket', () => {
     expect(currentSocket?.notifications).toHaveLength(1);
   });
 
+  it('increments replay gap epoch when the server cannot replay a contiguous notification range', async () => {
+    await renderHook();
+    const ws = MockWebSocket.instances[0];
+    act(() => {
+      ws.open();
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'codex/replayGap',
+            streamId: 'stream-1',
+            requestedAfterSeq: 3,
+            firstAvailableSeq: 7,
+            latestSeq: 9,
+          }),
+        }),
+      );
+    });
+
+    expect(currentSocket?.replayGapEpoch).toBe(1);
+  });
+
+  it('advances the replay cursor after a recovered terminal gap is acknowledged', async () => {
+    window.localStorage.setItem(
+      `codex-web-ui:notificationReplay:${window.location.host}`,
+      JSON.stringify({ streamId: 'stream-1', seq: 100 }),
+    );
+    await renderHook();
+    const first = MockWebSocket.instances[0];
+    act(() => {
+      first.open();
+      first.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'codex/replayGap',
+            streamId: 'stream-1',
+            requestedAfterSeq: 1,
+            firstAvailableSeq: null,
+            latestSeq: 2,
+          }),
+        }),
+      );
+      currentSocket?.acknowledgeReplayGap(1);
+      first.close();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+      await Promise.resolve();
+    });
+
+    const second = MockWebSocket.instances[1];
+    act(() => {
+      second.open();
+    });
+
+    expect(second.sent[0]).toBe(
+      JSON.stringify({ type: 'client/hello', params: { lastNotificationStreamId: 'stream-1', lastNotificationSeq: 2 } }),
+    );
+  });
+
+  it('does not move the replay cursor behind notifications received during gap recovery', async () => {
+    await renderHook();
+    const first = MockWebSocket.instances[0];
+    act(() => {
+      first.open();
+      first.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'codex/replayGap',
+            streamId: 'stream-1',
+            requestedAfterSeq: 1,
+            firstAvailableSeq: null,
+            latestSeq: 2,
+          }),
+        }),
+      );
+      first.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'codex/notification',
+            streamId: 'stream-1',
+            seq: 3,
+            message: { method: 'item/started', params: { threadId: 'thread-1', turnId: 'turn-1', item: { type: 'mcpToolCall', id: 'tool-1' } } },
+          }),
+        }),
+      );
+      currentSocket?.acknowledgeReplayGap(1);
+      first.close();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+      await Promise.resolve();
+    });
+
+    const second = MockWebSocket.instances[1];
+    act(() => {
+      second.open();
+    });
+
+    expect(second.sent[0]).toBe(
+      JSON.stringify({ type: 'client/hello', params: { lastNotificationStreamId: 'stream-1', lastNotificationSeq: 3 } }),
+    );
+  });
+
+  it('ignores stale messages and close callbacks from a replaced websocket', async () => {
+    await renderHook();
+    const first = MockWebSocket.instances[0];
+    act(() => {
+      first.open();
+      first.close();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+      await Promise.resolve();
+    });
+
+    const second = MockWebSocket.instances[1];
+    act(() => {
+      second.open();
+      second.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'server/hello',
+            hostname: 'current-host',
+            state: { activeThreadId: null, activeThreadPath: null, activeTurnId: null, activeCwd: null, theme: 'dark', queue: [] },
+          }),
+        }),
+      );
+    });
+
+    const rpc = currentSocket?.rpc<string>('current/request');
+    const request = JSON.parse(second.sent.at(-1) ?? '{}') as { id?: number };
+    act(() => {
+      first.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'server/hello',
+            hostname: 'stale-host',
+            state: { activeThreadId: 'stale', activeThreadPath: null, activeTurnId: null, activeCwd: null, theme: 'dark', queue: [] },
+          }),
+        }),
+      );
+      first.onclose?.();
+      second.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'rpc/result', id: request.id, result: 'ok' }),
+        }),
+      );
+    });
+
+    await expect(rpc).resolves.toBe('ok');
+    expect(currentSocket?.hello?.hostname).toBe('current-host');
+    expect(currentSocket?.connectionState).toBe('connected');
+  });
+
   it('flushes buffered notifications before a socket close reconnects', async () => {
     await renderHook();
     const first = MockWebSocket.instances[0];
@@ -380,6 +534,39 @@ describe('useCodexSocket', () => {
 
     expect(currentSocket?.notificationCount).toBe(2);
     expect(currentSocket?.notifications.map((item) => (item as { params?: { delta?: string } }).params?.delta)).toEqual(['first', 'second']);
+  });
+
+  it('advances replay state without retaining high-volume command output deltas', async () => {
+    await renderHook();
+    const ws = MockWebSocket.instances[0];
+    act(() => {
+      ws.open();
+      for (let seq = 1; seq <= 1_000; seq += 1) {
+        ws.onmessage?.(
+          new MessageEvent('message', {
+            data: JSON.stringify({
+              type: 'codex/notification',
+              streamId: 'stream-1',
+              seq,
+              message: {
+                method: 'item/commandExecution/outputDelta',
+                params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'cmd-1', delta: 'output\n' },
+              },
+            }),
+          }),
+        );
+      }
+    });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(125);
+    });
+
+    expect(currentSocket?.notificationCount).toBe(0);
+    expect(currentSocket?.notifications).toEqual([]);
+    expect(window.localStorage.getItem(`codex-web-ui:notificationReplay:${window.location.host}`)).toBe(
+      JSON.stringify({ streamId: 'stream-1', seq: 1_000 }),
+    );
   });
 
   it('does not persist a replay cursor for notifications buffered but never rendered', async () => {

@@ -15,10 +15,12 @@ const mocks = vi.hoisted(() => ({
   loadOlder: vi.fn(),
   jumpToLatest: vi.fn(),
   reloadTimeline: vi.fn(),
+  acknowledgeReplayGap: vi.fn(),
   submitToken: vi.fn(),
   queue: [] as Array<{ id: string; text: string; createdAt: number }>,
   timelineItems: [] as Array<{ id: string; kind: string; timestamp: number; text?: string }>,
   notifications: [] as unknown[],
+  notificationCount: 0,
   requests: [] as unknown[],
   stateQueue: [] as Array<{ id: string; text: string; createdAt: number }>,
   activeThreadId: 'thread-1' as string | null,
@@ -26,6 +28,7 @@ const mocks = vi.hoisted(() => ({
   activeTurnId: 'turn-1' as string | null,
   activeGoal: null as ThreadGoal | null,
   reconnectEpoch: 0,
+  replayGapEpoch: 0,
   timelineIsViewingLatest: true,
   runtimeModel: 'gpt-5.4' as string | null,
   runtimeEffort: 'high' as string | null,
@@ -91,11 +94,13 @@ vi.mock('../../src/hooks/useCodexSocket', () => ({
       },
     },
     notifications: mocks.notifications,
-    notificationCount: 0,
+    notificationCount: mocks.notificationCount,
     requests: mocks.requests,
     rpc: mocks.rpc,
     submitToken: mocks.submitToken,
     reconnectEpoch: mocks.reconnectEpoch,
+    replayGapEpoch: mocks.replayGapEpoch,
+    acknowledgeReplayGap: mocks.acknowledgeReplayGap,
   }),
 }));
 vi.mock('../../src/components/AuthOverlay', () => ({ default: () => null }));
@@ -175,12 +180,16 @@ describe('App queued message tray', () => {
     mocks.stateQueue = [];
     mocks.timelineItems = [];
     mocks.notifications = [];
+    mocks.notificationCount = 0;
     mocks.requests = [];
     mocks.activeThreadId = 'thread-1';
     mocks.activeThreadPath = '/rollouts/thread-1.jsonl';
     mocks.activeTurnId = 'turn-1';
     mocks.activeGoal = null;
     mocks.reconnectEpoch = 0;
+    mocks.replayGapEpoch = 0;
+    mocks.reloadTimeline.mockReset().mockResolvedValue(true);
+    mocks.acknowledgeReplayGap.mockReset();
     mocks.timelineIsViewingLatest = true;
     mocks.runtimeModel = 'gpt-5.4';
     mocks.runtimeEffort = 'high';
@@ -190,6 +199,102 @@ describe('App queued message tray', () => {
     mocks.headerProps = null;
     mocks.inputProps = null;
     window.localStorage.clear();
+  });
+
+  it('reloads persisted history when notification replay has a gap after reconnect', async () => {
+    renderApp();
+    await flushReact();
+    mocks.reloadTimeline.mockClear();
+
+    mocks.reconnectEpoch += 1;
+    mocks.replayGapEpoch += 1;
+    rerenderApp();
+    await flushReact();
+
+    expect(mocks.reloadTimeline).toHaveBeenCalledTimes(1);
+    expect(mocks.acknowledgeReplayGap).toHaveBeenCalledWith(1);
+  });
+
+  it('does not re-handle an old replay gap when later connection state changes', async () => {
+    renderApp();
+    await flushReact();
+
+    mocks.replayGapEpoch = 1;
+    rerenderApp();
+    await flushReact();
+    mocks.reloadTimeline.mockClear();
+    mocks.acknowledgeReplayGap.mockClear();
+
+    mocks.reconnectEpoch += 1;
+    rerenderApp();
+    await flushReact();
+
+    expect(mocks.reloadTimeline).not.toHaveBeenCalled();
+    expect(mocks.acknowledgeReplayGap).not.toHaveBeenCalled();
+  });
+
+  it('does not acknowledge a replay gap when history recovery fails', async () => {
+    mocks.reloadTimeline.mockResolvedValue(false);
+    renderApp();
+    await flushReact();
+
+    mocks.replayGapEpoch = 1;
+    rerenderApp();
+    await flushReact();
+
+    expect(mocks.reloadTimeline).toHaveBeenCalledTimes(1);
+    expect(mocks.acknowledgeReplayGap).not.toHaveBeenCalled();
+  });
+
+  it('retries an unacknowledged replay gap until history recovery succeeds', async () => {
+    vi.useFakeTimers();
+    mocks.reloadTimeline.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+    try {
+      renderApp();
+      await flushReact();
+
+      mocks.replayGapEpoch = 1;
+      rerenderApp();
+      await flushReact();
+      expect(mocks.reloadTimeline).toHaveBeenCalledTimes(1);
+      expect(mocks.acknowledgeReplayGap).not.toHaveBeenCalled();
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(250);
+        await Promise.resolve();
+      });
+
+      expect(mocks.reloadTimeline).toHaveBeenCalledTimes(2);
+      expect(mocks.acknowledgeReplayGap).toHaveBeenCalledWith(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not reload persisted history for a contiguous reconnect', async () => {
+    renderApp();
+    await flushReact();
+    mocks.reloadTimeline.mockClear();
+
+    mocks.reconnectEpoch += 1;
+    rerenderApp();
+    await flushReact();
+
+    expect(mocks.reloadTimeline).not.toHaveBeenCalled();
+  });
+
+  it('recovers a previous turn completion immediately before an autonomous turn starts', async () => {
+    mocks.activeTurnId = 'turn-2';
+    mocks.notifications = [
+      { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } },
+      { method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-2', status: 'inProgress' } } },
+    ];
+    mocks.notificationCount = 2;
+
+    renderApp();
+    await flushReact();
+
+    expect(mocks.reloadTimeline).toHaveBeenCalled();
   });
 
   afterEach(() => {

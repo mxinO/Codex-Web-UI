@@ -97,6 +97,7 @@ async function connect(url: string): Promise<Client> {
     clientInfo: { name: 'codex-web-ui-continuity-probe', version: '0.1.0' },
     capabilities: { experimentalApi: true },
   });
+  peer.notify('initialized');
   return { socket, peer };
 }
 
@@ -290,6 +291,13 @@ class ProbeRpcPeer {
 
   respond(id: number | string, result: unknown): void {
     if (!this.closed) this.socket.send(JSON.stringify({ jsonrpc: '2.0', id, result }));
+  }
+
+  notify(method: string, params?: unknown): void {
+    if (this.closed) return;
+    const payload: Record<string, unknown> = { jsonrpc: '2.0', method };
+    if (params !== undefined) payload.params = params;
+    this.socket.send(JSON.stringify(payload));
   }
 
   respondError(id: number | string, code: number, message: string): void {

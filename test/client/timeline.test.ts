@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import {
   approvalItemsFromRequests,
+  appendLiveTurnNotifications,
   claimedQueuedUserItemsWithoutHistory,
   claimedQueuedUserItemsFromQueueTransition,
+  createLiveTurnAccumulator,
   liveStreamingItemFromNotifications,
   mergeRetainedLiveTurnItems,
   mergeTimelineItemsByTimestamp,
   nextLiveNotificationWindow,
+  notificationCountBeforeTurnStart,
   notificationsSinceCount,
   notificationIsTurnComplete,
   notificationMatchesActiveTurn,
@@ -14,6 +17,7 @@ import {
   fileChangeHasInlineDiff,
   liveStreamingItemForTimeline,
   liveTimelineItemsFromNotifications,
+  liveTurnItemsFromAccumulator,
   liveTurnItemsFromNotifications,
   requestKey,
   retargetSyntheticUserItemsToTurn,
@@ -523,6 +527,42 @@ describe('timeline', () => {
       activeTurnId: null,
       startCount: 30,
     });
+  });
+
+  it('anchors an autonomous turn window before its already received start event', () => {
+    const notifications = [
+      withTimelineNotificationMeta(
+        { method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-2', status: 'inProgress' } } },
+        { order: 24, receivedAt: 100, streamId: 'stream-1', seq: 44 },
+      ),
+      withTimelineNotificationMeta(
+        { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-2', itemId: 'message-2', delta: 'Still working' } },
+        { order: 25, receivedAt: 101, streamId: 'stream-1', seq: 45 },
+      ),
+    ];
+    const scope = { activeThreadId: 'thread-1', activeTurnId: 'turn-2' };
+    const turnStartCount = notificationCountBeforeTurnStart(notifications, 25, scope);
+
+    expect(turnStartCount).toBe(23);
+    const window = nextLiveNotificationWindow(
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1', startCount: 10 },
+      scope,
+      25,
+      { turnStartCount },
+    );
+    expect(window).toEqual({ ...scope, startCount: 23 });
+    expect(notificationsSinceCount(notifications, 25, window.startCount)).toEqual(notifications);
+  });
+
+  it('moves a provisional autonomous window forward when its delayed start anchor arrives', () => {
+    expect(
+      nextLiveNotificationWindow(
+        { activeThreadId: 'thread-1', activeTurnId: 'turn-2', startCount: 20 },
+        { activeThreadId: 'thread-1', activeTurnId: 'turn-2' },
+        24,
+        { turnStartCount: 22 },
+      ),
+    ).toEqual({ activeThreadId: 'thread-1', activeTurnId: 'turn-2', startCount: 22 });
   });
 
   it('does not create an empty waiting chat item for an active turn with no assistant text', () => {
@@ -2528,6 +2568,240 @@ describe('timeline', () => {
       'turn-1:cmd-1',
       'Now I will patch it.',
       'turn-1:edit-1',
+    ]);
+  });
+
+  it('incrementally reduces native live notifications without changing their ordered timeline', () => {
+    const scope = { activeThreadId: 'thread-1', activeTurnId: 'turn-1' };
+    const notifications = [
+      { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'a1', delta: 'I will inspect ' } },
+      { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'a1', delta: 'the file.' } },
+      {
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'commandExecution',
+            id: 'cmd-1',
+            command: 'pwd',
+            cwd: '/repo',
+            status: 'completed',
+            aggregatedOutput: '/repo\n',
+            exitCode: 0,
+          },
+        },
+      },
+      { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'a2', delta: 'Done.' } },
+      {
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: { type: 'agentMessage', id: 'a2', text: 'Done.', phase: 'final_answer' },
+        },
+      },
+    ];
+
+    let accumulator = createLiveTurnAccumulator();
+    accumulator = appendLiveTurnNotifications(accumulator, notifications.slice(0, 2), scope, 100);
+    accumulator = appendLiveTurnNotifications(accumulator, notifications.slice(2, 4), scope, 100);
+    accumulator = appendLiveTurnNotifications(accumulator, notifications.slice(4), scope, 100);
+
+    expect(liveTurnItemsFromAccumulator(accumulator, true)).toEqual(
+      liveTurnItemsFromNotifications(notifications, scope, true, 100),
+    );
+  });
+
+  it('keeps compact live state while reducing a long assistant stream', () => {
+    const scope = { activeThreadId: 'thread-1', activeTurnId: 'turn-1' };
+    const notifications = Array.from({ length: 10_000 }, () => ({
+      method: 'item/agentMessage/delta',
+      params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'a1', delta: 'x' },
+    }));
+
+    const accumulator = appendLiveTurnNotifications(createLiveTurnAccumulator(), notifications, scope, 100);
+    const items = liveTurnItemsFromAccumulator(accumulator, true);
+
+    expect(accumulator.items).toHaveLength(1);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: 'streaming', text: 'x'.repeat(10_000), active: true });
+  });
+
+  it('replaces a native in-progress activity in place when the item completes', () => {
+    const scope = { activeThreadId: 'thread-1', activeTurnId: 'turn-1' };
+    const started = withTimelineNotificationMeta(
+      {
+        method: 'item/started',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'commandExecution',
+            id: 'cmd-1',
+            command: 'npm test',
+            cwd: '/repo',
+            status: 'inProgress',
+            aggregatedOutput: null,
+            exitCode: null,
+          },
+        },
+      },
+      { order: 10, receivedAt: 1000, streamId: 'stream-1', seq: 10 },
+    );
+    const completed = withTimelineNotificationMeta(
+      {
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'commandExecution',
+            id: 'cmd-1',
+            command: 'npm test',
+            cwd: '/repo',
+            status: 'completed',
+            aggregatedOutput: 'passed\n',
+            exitCode: 0,
+          },
+        },
+      },
+      { order: 30, receivedAt: 3000, streamId: 'stream-1', seq: 30 },
+    );
+
+    let accumulator = appendLiveTurnNotifications(createLiveTurnAccumulator(), [started], scope, 100);
+    expect(liveTurnItemsFromAccumulator(accumulator, true)).toEqual([
+      expect.objectContaining({ kind: 'command', id: 'turn-1:cmd-1', status: 'inProgress', sortOrder: 10, timestamp: 1000 }),
+    ]);
+
+    accumulator = appendLiveTurnNotifications(accumulator, [completed], scope, 100);
+    expect(liveTurnItemsFromAccumulator(accumulator, true)).toEqual([
+      expect.objectContaining({ kind: 'command', id: 'turn-1:cmd-1', status: 'completed', output: 'passed\n', sortOrder: 10, timestamp: 1000 }),
+    ]);
+  });
+
+  it('keeps a finalized native message at its first-delta position across later activity', () => {
+    const scope = { activeThreadId: 'thread-1', activeTurnId: 'turn-1' };
+    const notifications = [
+      withTimelineNotificationMeta(
+        { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'a1', delta: 'I will inspect.' } },
+        { order: 10, receivedAt: 1000, streamId: 'stream-1', seq: 10 },
+      ),
+      withTimelineNotificationMeta(
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: {
+              type: 'commandExecution',
+              id: 'cmd-1',
+              command: 'pwd',
+              cwd: '/repo',
+              status: 'completed',
+              aggregatedOutput: '/repo\n',
+              exitCode: 0,
+            },
+          },
+        },
+        { order: 20, receivedAt: 2000, streamId: 'stream-1', seq: 20 },
+      ),
+      withTimelineNotificationMeta(
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'a1', text: 'I will inspect.', phase: 'commentary' },
+          },
+        },
+        { order: 30, receivedAt: 3000, streamId: 'stream-1', seq: 30 },
+      ),
+    ];
+
+    const items = liveTurnItemsFromNotifications(notifications, scope, true, 100);
+
+    expect(items.map((item) => item.kind)).toEqual(['assistant', 'command']);
+    expect(items.map((item) => item.sortOrder)).toEqual([10, 20]);
+    expect(mergeTimelineItemsByTimestamp(items).map((item) => item.kind)).toEqual(['assistant', 'command']);
+  });
+
+  it('does not leave an empty file-change start card when completion expands into edit cards', () => {
+    const items = liveTurnItemsFromNotifications(
+      [
+        {
+          method: 'item/started',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'fileChange', id: 'edit-1', changes: [], status: 'inProgress' },
+          },
+        },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: {
+              type: 'fileChange',
+              id: 'edit-1',
+              changes: [{ path: '/repo/a.txt' }, { path: '/repo/b.txt' }],
+              status: 'completed',
+            },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      100,
+    );
+
+    expect(items.map((item) => item.id)).toEqual(['turn-1:edit-1:edit:0', 'turn-1:edit-1:edit:1']);
+  });
+
+  it('does not retain high-volume native command output deltas', () => {
+    const scope = { activeThreadId: 'thread-1', activeTurnId: 'turn-1' };
+    const started = {
+      method: 'item/started',
+      params: {
+        threadId: 'thread-1',
+        turnId: 'turn-1',
+        item: {
+          type: 'commandExecution',
+          id: 'cmd-1',
+          command: 'yes',
+          cwd: '/repo',
+          status: 'inProgress',
+          aggregatedOutput: null,
+          exitCode: null,
+        },
+      },
+    };
+    const output = Array.from({ length: 10_000 }, () => ({
+      method: 'item/commandExecution/outputDelta',
+      params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'cmd-1', delta: 'y\n' },
+    }));
+
+    const accumulator = appendLiveTurnNotifications(createLiveTurnAccumulator(), [started, ...output], scope, 100);
+
+    expect(accumulator.items).toHaveLength(1);
+    expect(liveTurnItemsFromAccumulator(accumulator, true)[0]).toMatchObject({ kind: 'command', id: 'turn-1:cmd-1', status: 'inProgress' });
+  });
+
+  it('retains scoped native warnings in live event order', () => {
+    const notification = withTimelineNotificationMeta(
+      { method: 'warning', params: { threadId: 'thread-1', message: 'Retrying the request.' } },
+      { order: 12, receivedAt: 1200, streamId: 'stream-1', seq: 12 },
+    );
+    const accumulator = appendLiveTurnNotifications(
+      createLiveTurnAccumulator(),
+      [notification],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      100,
+    );
+
+    expect(liveTurnItemsFromAccumulator(accumulator, true)).toEqual([
+      expect.objectContaining({ kind: 'warning', text: 'Retrying the request.', sortOrder: 12, timestamp: 1200 }),
     ]);
   });
 

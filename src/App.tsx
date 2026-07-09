@@ -39,16 +39,19 @@ import { newSessionInitialCwd } from './lib/sessionDefaults';
 import { parseSlashCommand } from './lib/slashCommands';
 import {
   approvalItemsFromRequests,
+  appendLiveTurnNotifications,
   claimedQueuedMessageIdFromPendingUserItem,
   claimedQueuedUserItemsWithoutHistory,
   claimedQueuedUserItemsFromQueueTransition,
+  createLiveTurnAccumulator,
   fileChangeHasInlineDiff,
   latestCompletionNotificationCount,
   isSyntheticPendingTurnId,
-  liveTurnItemsFromNotifications,
+  liveTurnItemsFromAccumulator,
   mergeRetainedLiveTurnItems,
   mergeTimelineItemsByTimestamp,
   nextLiveNotificationWindow,
+  notificationCountBeforeTurnStart,
   notificationsSinceCount,
   notificationMatchesActiveTurn,
   pendingUserItemsWithoutHistory,
@@ -343,6 +346,11 @@ export default function App() {
   const goalOperationGenerationRef = useRef(0);
   const goalBusyRef = useRef(false);
   const pendingTurnStartCount = pendingTurnWindow?.threadId === activeThreadId ? pendingTurnWindow.startCount : null;
+  const observedTurnStartCount = notificationCountBeforeTurnStart(
+    socket.notifications,
+    socket.notificationCount,
+    { activeThreadId, activeTurnId: state?.activeTurnId ?? null },
+  );
   notificationCountRef.current = socket.notificationCount;
   const localSortOrder = useCallback((key?: string) => {
     if (key) {
@@ -357,7 +365,7 @@ export default function App() {
     liveNotificationWindowRef.current,
     { activeThreadId, activeTurnId: state?.activeTurnId ?? null },
     socket.notificationCount,
-    { pendingStartCount: pendingTurnStartCount },
+    { pendingStartCount: pendingTurnStartCount, turnStartCount: observedTurnStartCount },
   );
 
   useLayoutEffect(() => {
@@ -412,36 +420,52 @@ export default function App() {
   const liveNotificationStartCount = liveNotificationWindowRef.current.startCount;
   const lastNotification = socket.notifications.at(-1);
   const liveNotificationWindowKey = `${activeThreadId ?? ''}\0${liveNotificationActiveTurnId ?? ''}\0${liveNotificationStartCount}`;
-  const liveNotificationAccumulatorRef = useRef({ key: liveNotificationWindowKey, processedCount: liveNotificationStartCount });
-  const [liveNotifications, setLiveNotifications] = useState<unknown[]>([]);
+  const [liveNotificationSnapshot, setLiveNotificationSnapshot] = useState(() => ({
+    key: liveNotificationWindowKey,
+    accumulator: createLiveTurnAccumulator(),
+  }));
+  const liveNotificationAccumulatorRef = useRef({
+    key: liveNotificationWindowKey,
+    processedCount: liveNotificationStartCount,
+    accumulator: liveNotificationSnapshot.accumulator,
+  });
+  const acknowledgedReplayGapEpochRef = useRef(0);
   useEffect(() => {
-    const accumulator = liveNotificationAccumulatorRef.current;
+    const current = liveNotificationAccumulatorRef.current;
+    const scope = { activeThreadId, activeTurnId: liveNotificationActiveTurnId };
+    const acceptUnscoped = Boolean(liveNotificationActiveTurnId);
     if (
-      accumulator.key !== liveNotificationWindowKey ||
-      accumulator.processedCount < liveNotificationStartCount ||
-      accumulator.processedCount > socket.notificationCount
+      current.key !== liveNotificationWindowKey ||
+      current.processedCount < liveNotificationStartCount ||
+      current.processedCount > socket.notificationCount
     ) {
       const retained = notificationsSinceCount(socket.notifications, socket.notificationCount, liveNotificationStartCount);
-      liveNotificationAccumulatorRef.current = { key: liveNotificationWindowKey, processedCount: socket.notificationCount };
-      setLiveNotifications(retained);
+      const accumulator = appendLiveTurnNotifications(createLiveTurnAccumulator(), retained, scope, Date.now(), { acceptUnscoped });
+      liveNotificationAccumulatorRef.current = {
+        key: liveNotificationWindowKey,
+        processedCount: socket.notificationCount,
+        accumulator,
+      };
+      setLiveNotificationSnapshot({ key: liveNotificationWindowKey, accumulator });
       return;
     }
 
-    const additions = notificationsSinceCount(socket.notifications, socket.notificationCount, accumulator.processedCount);
+    const additions = notificationsSinceCount(socket.notifications, socket.notificationCount, current.processedCount);
     if (additions.length === 0) return;
-    accumulator.processedCount = socket.notificationCount;
-    setLiveNotifications((current) => [...current, ...additions]);
-  }, [liveNotificationStartCount, liveNotificationWindowKey, socket.notificationCount, socket.notifications]);
+    const accumulator = appendLiveTurnNotifications(current.accumulator, additions, scope, Date.now(), { acceptUnscoped });
+    liveNotificationAccumulatorRef.current = {
+      key: liveNotificationWindowKey,
+      processedCount: socket.notificationCount,
+      accumulator,
+    };
+    setLiveNotificationSnapshot({ key: liveNotificationWindowKey, accumulator });
+  }, [activeThreadId, liveNotificationActiveTurnId, liveNotificationStartCount, liveNotificationWindowKey, socket.notificationCount, socket.notifications]);
   const liveTurnItems = useMemo(
     () =>
-      liveTurnItemsFromNotifications(
-        liveNotifications,
-        { activeThreadId, activeTurnId: liveNotificationActiveTurnId },
-        Boolean(state?.activeTurnId),
-        Date.now(),
-        { acceptUnscoped: Boolean(liveNotificationActiveTurnId) },
-      ),
-    [activeThreadId, liveNotificationActiveTurnId, liveNotifications, state?.activeTurnId],
+      liveNotificationSnapshot.key === liveNotificationWindowKey
+        ? liveTurnItemsFromAccumulator(liveNotificationSnapshot.accumulator, Boolean(state?.activeTurnId))
+        : [],
+    [liveNotificationSnapshot, liveNotificationWindowKey, state?.activeTurnId],
   );
   const timelineItemsForChat = useMemo(
     () => timelineItemsWithLiveTurnOverlay(timeline.items, liveTurnItems, state?.activeTurnId ? liveNotificationActiveTurnId : null),
@@ -461,11 +485,11 @@ export default function App() {
   );
   const latestCompletionCount = useMemo(
     () =>
-      latestCompletionNotificationCount(liveNotifications, socket.notificationCount, {
+      latestCompletionNotificationCount(socket.notifications, socket.notificationCount, {
         activeThreadId,
-        activeTurnId: liveNotificationActiveTurnId,
+        activeTurnId: null,
       }),
-    [activeThreadId, liveNotificationActiveTurnId, liveNotifications, socket.notificationCount],
+    [activeThreadId, socket.notificationCount, socket.notifications],
   );
   const visibleLiveTurnItems = useMemo(
     () => visibleLiveTurnItemsForTimeline(timelineItemsForChatWithRetainedOverlay, liveTurnItems, { allowAssistantTextMatchAcrossSources: !state?.activeTurnId }),
@@ -970,9 +994,36 @@ export default function App() {
   }, [activeThreadId, latestCompletionCount, timeline.isViewingLatest, timeline.reload]);
 
   useEffect(() => {
-    if (!activeThreadId || socket.connectionState !== 'connected' || socket.reconnectEpoch === 0) return;
-    void timeline.reload();
-  }, [activeThreadId, socket.connectionState, socket.reconnectEpoch, timeline.reload]);
+    const epoch = socket.replayGapEpoch;
+    if (epoch === 0 || epoch <= acknowledgedReplayGapEpochRef.current || socket.connectionState !== 'connected') return;
+    if (!activeThreadId) {
+      socket.acknowledgeReplayGap(epoch);
+      acknowledgedReplayGapEpochRef.current = epoch;
+      return;
+    }
+
+    let cancelled = false;
+    let retryTimer: number | null = null;
+    const recover = async (attempt: number) => {
+      const recovered = await timeline.reload();
+      if (cancelled) return;
+      if (recovered) {
+        socket.acknowledgeReplayGap(epoch);
+        acknowledgedReplayGapEpochRef.current = epoch;
+        return;
+      }
+      const delay = Math.min(5_000, 250 * 2 ** attempt);
+      retryTimer = window.setTimeout(() => {
+        retryTimer = null;
+        void recover(attempt + 1);
+      }, delay);
+    };
+    void recover(0);
+    return () => {
+      cancelled = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+    };
+  }, [activeThreadId, socket.acknowledgeReplayGap, socket.connectionState, socket.replayGapEpoch, timeline.reload]);
 
   useEffect(() => {
     const handleBangOutput = (event: Event) => {

@@ -80,6 +80,7 @@ const NOTIFICATION_META_KEY = '__codexWebUiNotificationMeta';
 const SYNTHETIC_PENDING_TURN_PREFIXES = ['turn-start-pending:', 'compact-pending:'];
 const TERMINAL_EVENT_TYPES = new Set(['task_complete', 'task_failed', 'task_interrupted']);
 const TERMINAL_NOTIFICATION_METHODS = new Set(['turn/completed', 'turn/failed', 'turn/interrupted', 'thread/compacted']);
+const LIVE_WARNING_NOTIFICATION_METHODS = new Set(['warning', 'guardianWarning', 'configWarning', 'deprecationNotice']);
 const CLAIMED_QUEUED_USER_ITEM_LIMIT = 50;
 
 export function withTimelineNotificationMeta(notification: unknown, meta: TimelineNotificationMeta): unknown {
@@ -547,6 +548,23 @@ export function notificationsSinceCount<T>(notifications: T[], totalCount: numbe
   return notifications.slice(firstRetainedAfterStart);
 }
 
+export function notificationCountBeforeTurnStart(
+  notifications: unknown[],
+  totalCount: number,
+  scope: TimelineNotificationScope,
+): number | null {
+  if (!scope.activeTurnId) return null;
+  const firstNotificationCount = totalCount - notifications.length + 1;
+  for (let index = notifications.length - 1; index >= 0; index -= 1) {
+    const notification = notifications[index];
+    if (!isRecord(notification) || notification.method !== 'turn/started') continue;
+    if (!notificationMatchesActiveTurn(notification, scope)) continue;
+    if (notificationTurnId(notification) !== scope.activeTurnId) continue;
+    return firstNotificationCount + index - 1;
+  }
+  return null;
+}
+
 export function latestCompletionNotificationCount(
   notifications: unknown[],
   totalCount: number,
@@ -643,18 +661,19 @@ function completedAgentMessage(notification: unknown): CodexItem | null {
   return item.type === 'agentMessage' ? item : null;
 }
 
-function activityItemsFromCompletedNotification(
+function activityItemsFromLifecycleNotification(
   notification: unknown,
   scope: TimelineNotificationScope,
   timestamp: number,
   sortOrder: number | null,
   fallbackKey: string,
 ): TimelineItem[] {
-  if (!isRecord(notification) || notification.method !== 'item/completed') return [];
+  if (!isRecord(notification) || (notification.method !== 'item/started' && notification.method !== 'item/completed')) return [];
   if (!isRecord(notification.params) || !isRecord(notification.params.item)) return [];
 
   const rawItem = notification.params.item as CodexItem;
   if (rawItem.type === 'agentMessage' || rawItem.type === 'userMessage') return [];
+  if (notification.method === 'item/started' && rawItem.type === 'fileChange') return [];
 
   const turnId = notificationTurnId(notification) ?? scope.activeTurnId ?? 'live';
   const converted = turnToTimelineItems({
@@ -726,29 +745,54 @@ function liveStreamingMessageKey(turnId: string | null, sourceId: string | null)
   return sourceId ? `source:${turnId ?? 'unscoped'}:${sourceId}` : `turn:${turnId ?? 'unscoped'}`;
 }
 
-export function liveTurnItemsFromNotifications(
+export interface LiveTurnAccumulator {
+  items: TimelineItem[];
+  itemIndexes: Map<string, number>;
+  streamingIndexes: Map<string, number>;
+  sequence: number;
+  deltaIndex: number | null;
+  notificationCount: number;
+}
+
+export function createLiveTurnAccumulator(): LiveTurnAccumulator {
+  return {
+    items: [],
+    itemIndexes: new Map(),
+    streamingIndexes: new Map(),
+    sequence: 0,
+    deltaIndex: null,
+    notificationCount: 0,
+  };
+}
+
+export function appendLiveTurnNotifications(
+  current: LiveTurnAccumulator,
   notifications: unknown[],
   scope: TimelineNotificationScope,
-  active: boolean,
   now = Date.now(),
   options: { acceptUnscoped?: boolean } = {},
-): TimelineItem[] {
-  const acceptUnscoped = options.acceptUnscoped ?? active;
-  const items: TimelineItem[] = [];
-  const itemIndexes = new Map<string, number>();
-  const streamingIndexes = new Map<string, number>();
-  let sequence = 0;
-  let deltaIndex: number | null = null;
+): LiveTurnAccumulator {
+  if (notifications.length === 0) return current;
+  const acceptUnscoped = options.acceptUnscoped ?? Boolean(scope.activeTurnId);
+  const next: LiveTurnAccumulator = {
+    items: [...current.items],
+    itemIndexes: new Map(current.itemIndexes),
+    streamingIndexes: new Map(current.streamingIndexes),
+    sequence: current.sequence,
+    deltaIndex: current.deltaIndex,
+    notificationCount: current.notificationCount,
+  };
 
   const rememberItem = (item: TimelineItem): number => {
-    const existingIndex = itemIndexes.get(item.id);
+    const existingIndex = next.itemIndexes.get(item.id);
     if (existingIndex !== undefined) {
-      items[existingIndex] = item;
+      const previous = next.items[existingIndex];
+      next.items[existingIndex] = { ...item, timestamp: previous.timestamp, sortOrder: previous.sortOrder } as TimelineItem;
       return existingIndex;
     }
-    itemIndexes.set(item.id, items.length);
-    items.push(item);
-    return items.length - 1;
+    next.itemIndexes.set(item.id, next.items.length);
+    next.items.push(item);
+    return next.items.length - 1;
   };
 
   const pushAssistant = (
@@ -761,19 +805,19 @@ export function liveTurnItemsFromNotifications(
     sortOrder: number | null = null,
   ) => {
     const clearCompletedStreaming = () => {
-      streamingIndexes.delete(liveStreamingMessageKey(turnId, null));
-      if (sourceId) streamingIndexes.delete(liveStreamingMessageKey(turnId, sourceId));
-      deltaIndex = null;
+      next.streamingIndexes.delete(liveStreamingMessageKey(turnId, null));
+      if (sourceId) next.streamingIndexes.delete(liveStreamingMessageKey(turnId, sourceId));
+      next.deltaIndex = null;
     };
-    const previous = items.at(-1);
+    const previous = next.items.at(-1);
     if (previous?.kind === 'assistant' && shouldReplaceLiveAssistantSnapshot(previous, text, phase, turnId, sourceId)) {
-      items[items.length - 1] = { ...previous, text, phase, turnId, sourceId, liveSource };
+      next.items[next.items.length - 1] = { ...previous, text, phase, turnId, sourceId, liveSource };
       clearCompletedStreaming();
       return;
     }
 
-    sequence += 1;
-    const id = liveAssistantItemId(turnId, sourceId, sequence);
+    next.sequence += 1;
+    const id = liveAssistantItemId(turnId, sourceId, next.sequence);
     rememberItem({
       id,
       kind: 'assistant',
@@ -790,20 +834,20 @@ export function liveTurnItemsFromNotifications(
 
   const appendDelta = (delta: string, turnId: string | null, sourceId: string | null, timestamp: number, sortOrder: number | null) => {
     const streamingKey = liveStreamingMessageKey(turnId, sourceId);
-    const existingIndex = streamingIndexes.get(streamingKey) ?? (sourceId ? null : deltaIndex);
+    const existingIndex = next.streamingIndexes.get(streamingKey) ?? (sourceId ? null : next.deltaIndex);
     if (existingIndex !== null && existingIndex !== undefined) {
-      const previous = items[existingIndex];
+      const previous = next.items[existingIndex];
       if (previous?.kind === 'streaming' && (previous.turnId ?? 'unscoped') === (turnId ?? 'unscoped') && (previous.sourceId ?? null) === sourceId) {
-        items[existingIndex] = { ...previous, text: `${previous.text}${delta}`, turnId: previous.turnId ?? turnId, sourceId: previous.sourceId ?? sourceId };
-        deltaIndex = existingIndex;
+        next.items[existingIndex] = { ...previous, text: `${previous.text}${delta}`, turnId: previous.turnId ?? turnId, sourceId: previous.sourceId ?? sourceId };
+        next.deltaIndex = existingIndex;
         return;
       }
     }
 
-    sequence += 1;
-    const id = liveStreamingItemId(turnId, sourceId, sequence);
-    const existingById = itemIndexes.get(id);
-    if (existingById !== undefined && items[existingById]?.kind === 'assistant') return;
+    next.sequence += 1;
+    const id = liveStreamingItemId(turnId, sourceId, next.sequence);
+    const existingById = next.itemIndexes.get(id);
+    if (existingById !== undefined && next.items[existingById]?.kind === 'assistant') return;
     rememberItem({
       id,
       kind: 'streaming',
@@ -814,20 +858,22 @@ export function liveTurnItemsFromNotifications(
       turnId,
       sourceId,
     });
-    const index = itemIndexes.get(id);
+    const index = next.itemIndexes.get(id);
     if (index !== undefined) {
-      deltaIndex = index;
-      streamingIndexes.set(streamingKey, index);
+      next.deltaIndex = index;
+      next.streamingIndexes.set(streamingKey, index);
     }
   };
 
-  for (const [notificationIndex, notification] of notifications.entries()) {
+  for (const notification of notifications) {
+    const notificationIndex = next.notificationCount;
+    next.notificationCount += 1;
     if (!isRecord(notification) || typeof notification.method !== 'string') continue;
     const timestamp = notificationTimestamp(notification, now);
     const sortOrder = notificationSortOrder(notification);
 
     if (TERMINAL_NOTIFICATION_METHODS.has(notification.method)) {
-      if (notificationMatchesActiveTurn(notification, scope)) deltaIndex = null;
+      if (notificationMatchesActiveTurn(notification, scope)) next.deltaIndex = null;
       continue;
     }
 
@@ -840,11 +886,51 @@ export function liveTurnItemsFromNotifications(
       continue;
     }
 
+    if (LIVE_WARNING_NOTIFICATION_METHODS.has(notification.method)) {
+      if (!notificationAllowedInLiveWindow(notification, scope, acceptUnscoped)) continue;
+      const params = notificationParams(notification);
+      if (!isRecord(params)) continue;
+      const summary = stringField(params, 'message') || stringField(params, 'summary');
+      const details = nullableStringField(params, 'details');
+      const text = [summary, details && details !== summary ? details : null].filter((part): part is string => Boolean(part)).join('\n');
+      if (text) {
+        rememberItem({
+          id: `live:warning:${notificationTurnId(notification) ?? scope.activeTurnId ?? 'unscoped'}:${notificationIndex}`,
+          kind: 'warning',
+          timestamp,
+          sortOrder,
+          text,
+          turnId: notificationTurnId(notification) ?? scope.activeTurnId ?? undefined,
+        });
+      }
+      next.deltaIndex = null;
+      continue;
+    }
+
+    if (notification.method === 'error') {
+      if (!notificationAllowedInLiveWindow(notification, scope, acceptUnscoped)) continue;
+      const params = notificationParams(notification);
+      const error = isRecord(params) && isRecord(params.error) ? params.error : null;
+      const message = error ? stringField(error, 'message') : '';
+      if (message) {
+        rememberItem({
+          id: `live:error:${notificationTurnId(notification) ?? scope.activeTurnId ?? 'unscoped'}:${notificationIndex}`,
+          kind: 'error',
+          timestamp,
+          sortOrder,
+          text: message,
+          turnId: notificationTurnId(notification) ?? scope.activeTurnId ?? undefined,
+        });
+      }
+      next.deltaIndex = null;
+      continue;
+    }
+
     if (notification.method === 'event_msg') {
       const payload = notificationPayload(notification);
       if (!isRecord(payload)) continue;
       if (typeof payload.type === 'string' && TERMINAL_EVENT_TYPES.has(payload.type)) {
-        if (notificationIsTurnComplete(notification, scope)) deltaIndex = null;
+        if (notificationIsTurnComplete(notification, scope)) next.deltaIndex = null;
         continue;
       }
       if (payload.type !== 'agent_message') continue;
@@ -861,14 +947,14 @@ export function liveTurnItemsFromNotifications(
           sortOrder,
         );
       }
-      deltaIndex = null;
-      streamingIndexes.delete(liveStreamingMessageKey(notificationTurnId(notification) ?? scope.activeTurnId, null));
+      next.deltaIndex = null;
+      next.streamingIndexes.delete(liveStreamingMessageKey(notificationTurnId(notification) ?? scope.activeTurnId, null));
       continue;
     }
 
-    if (notification.method === 'item/completed') {
+    if (notification.method === 'item/started' || notification.method === 'item/completed') {
       if (!notificationAllowedInLiveWindow(notification, scope, acceptUnscoped)) continue;
-      const agentMessage = completedAgentMessage(notification);
+      const agentMessage = notification.method === 'item/completed' ? completedAgentMessage(notification) : null;
       if (agentMessage) {
         pushAssistant(
           stringField(agentMessage, 'text'),
@@ -879,29 +965,48 @@ export function liveTurnItemsFromNotifications(
           timestamp,
           sortOrder,
         );
-        deltaIndex = null;
+        next.deltaIndex = null;
         continue;
       }
 
-      for (const item of activityItemsFromCompletedNotification(notification, scope, timestamp, sortOrder, String(notificationIndex))) rememberItem(item);
-      deltaIndex = null;
-      streamingIndexes.delete(liveStreamingMessageKey(notificationTurnId(notification) ?? scope.activeTurnId, null));
+      for (const item of activityItemsFromLifecycleNotification(notification, scope, timestamp, sortOrder, String(notificationIndex))) rememberItem(item);
+      next.deltaIndex = null;
+      next.streamingIndexes.delete(liveStreamingMessageKey(notificationTurnId(notification) ?? scope.activeTurnId, null));
     }
   }
 
+  return next;
+}
+
+export function liveTurnItemsFromAccumulator(accumulator: LiveTurnAccumulator, active: boolean): TimelineItem[] {
   let lastStreamingIndex = -1;
-  for (let index = items.length - 1; index >= 0; index -= 1) {
-    if (items[index].kind === 'streaming') {
+  for (let index = accumulator.items.length - 1; index >= 0; index -= 1) {
+    if (accumulator.items[index].kind === 'streaming') {
       lastStreamingIndex = index;
       break;
     }
   }
-  if (lastStreamingIndex >= 0) {
-    const item = items[lastStreamingIndex];
-    if (item.kind === 'streaming') items[lastStreamingIndex] = { ...item, active: active && deltaIndex === lastStreamingIndex };
-  }
-
+  if (lastStreamingIndex < 0) return accumulator.items;
+  const item = accumulator.items[lastStreamingIndex];
+  if (item.kind !== 'streaming') return accumulator.items;
+  const nextActive = active && accumulator.deltaIndex === lastStreamingIndex;
+  if (item.active === nextActive) return accumulator.items;
+  const items = [...accumulator.items];
+  items[lastStreamingIndex] = { ...item, active: nextActive };
   return items;
+}
+
+export function liveTurnItemsFromNotifications(
+  notifications: unknown[],
+  scope: TimelineNotificationScope,
+  active: boolean,
+  now = Date.now(),
+  options: { acceptUnscoped?: boolean } = {},
+): TimelineItem[] {
+  const accumulator = appendLiveTurnNotifications(createLiveTurnAccumulator(), notifications, scope, now, {
+    acceptUnscoped: options.acceptUnscoped ?? active,
+  });
+  return liveTurnItemsFromAccumulator(accumulator, active);
 }
 
 export function visibleLiveTurnItemsForTimeline(
@@ -1363,10 +1468,11 @@ export function nextLiveNotificationWindow(
   current: LiveNotificationWindow,
   scope: TimelineNotificationScope,
   notificationCount: number,
-  options: { pendingStartCount?: number | null } = {},
+  options: { pendingStartCount?: number | null; turnStartCount?: number | null } = {},
 ): LiveNotificationWindow {
   const pendingStartCount = typeof options.pendingStartCount === 'number' ? options.pendingStartCount : null;
-  const newWindowStartCount = pendingStartCount ?? notificationCount;
+  const turnStartCount = typeof options.turnStartCount === 'number' ? options.turnStartCount : null;
+  const newWindowStartCount = pendingStartCount ?? turnStartCount ?? notificationCount;
 
   if (current.activeThreadId !== scope.activeThreadId) {
     return { ...scope, startCount: newWindowStartCount };
@@ -1377,6 +1483,9 @@ export function nextLiveNotificationWindow(
   if (scope.activeTurnId && current.activeTurnId !== scope.activeTurnId) {
     const keepCurrentStart = current.activeTurnId === null || isSyntheticPendingTurnId(current.activeTurnId);
     return { ...scope, startCount: keepCurrentStart ? current.startCount : newWindowStartCount };
+  }
+  if (scope.activeTurnId && current.activeTurnId === scope.activeTurnId && turnStartCount !== null && turnStartCount !== current.startCount) {
+    return { ...current, startCount: turnStartCount };
   }
   if (!current.activeTurnId && !scope.activeTurnId) {
     return { ...scope, startCount: notificationCount };

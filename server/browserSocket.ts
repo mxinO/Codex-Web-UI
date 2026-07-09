@@ -226,6 +226,12 @@ const TURN_STEER_RPC_TIMEOUT_MS = 10 * 60 * 1000;
 const RECENT_NOTIFICATION_MAX_ENTRIES = 500;
 const RECENT_NOTIFICATION_MAX_BYTES = 2 * 1024 * 1024;
 const RECENT_NOTIFICATION_SINGLE_MAX_BYTES = 256 * 1024;
+const UNFORWARDED_BROWSER_NOTIFICATION_METHODS = new Set([
+  'command/exec/outputDelta',
+  'process/outputDelta',
+  'item/commandExecution/outputDelta',
+  'item/fileChange/outputDelta',
+]);
 const RUNTIME_SETTINGS_CONFIRMATION_TIMEOUT_MS = 2_000;
 
 function getOptionalString(params: unknown, key: string): string | null {
@@ -574,7 +580,11 @@ function taskTerminalDisposition(message: { method?: unknown; params?: unknown; 
 }
 
 function notificationTerminalDisposition(message: { method?: unknown; params?: unknown; payload?: unknown }): TerminalDisposition | null {
-  if (message.method === 'turn/completed' || message.method === 'thread/compacted') return 'advance-queue';
+  if (message.method === 'turn/completed') {
+    const status = getStringPath(message.params, ['turn', 'status']);
+    return status === null || status === 'completed' ? 'advance-queue' : 'barrier';
+  }
+  if (message.method === 'thread/compacted') return 'advance-queue';
   if (message.method === 'turn/failed' || message.method === 'turn/interrupted') return 'barrier';
   return taskTerminalDisposition(message);
 }
@@ -2255,9 +2265,40 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
   const replayNotifications = (client: WebSocket, requestedStreamId: string | null, afterSeq: number | null) => {
     if (requestedStreamId === null && afterSeq === null) return;
-    const effectiveAfterSeq = requestedStreamId === notificationStreamId ? afterSeq : null;
-    for (const notification of recentNotifications) {
-      if (effectiveAfterSeq === null || notification.seq > effectiveAfterSeq) sendNotification(client, notification.seq, notification.message);
+    const sameStream = requestedStreamId === notificationStreamId;
+    const effectiveAfterSeq = sameStream ? afterSeq : null;
+    const replay = recentNotifications.filter((notification) => effectiveAfterSeq === null || notification.seq > effectiveAfterSeq);
+
+    if (!sameStream) {
+      send(client, {
+        type: 'codex/replayGap',
+        streamId: notificationStreamId,
+        requestedAfterSeq: afterSeq,
+        firstAvailableSeq: replay[0]?.seq ?? null,
+        latestSeq: recentNotificationSeq,
+      });
+    } else {
+      const validationAfterSeq = effectiveAfterSeq ?? 0;
+      let expectedSeq = validationAfterSeq + 1;
+      let hasGap = validationAfterSeq > recentNotificationSeq;
+      for (const notification of replay) {
+        if (notification.seq !== expectedSeq) hasGap = true;
+        expectedSeq = notification.seq + 1;
+      }
+      if (expectedSeq <= recentNotificationSeq) hasGap = true;
+      if (hasGap) {
+        send(client, {
+          type: 'codex/replayGap',
+          streamId: notificationStreamId,
+          requestedAfterSeq: afterSeq,
+          firstAvailableSeq: replay[0]?.seq ?? null,
+          latestSeq: recentNotificationSeq,
+        });
+      }
+    }
+
+    for (const notification of replay) {
+      sendNotification(client, notification.seq, notification.message);
     }
   };
 
@@ -3113,16 +3154,26 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
 
     if (!threadId || current.activeThreadId !== threadId || current.activeTurnId === turnId) return;
-    if (current.activeTurnId && current.activeTurnId !== turnId && !isPendingTurnForThread(current.activeTurnId, threadId)) return;
+    const canAdoptTurn = (state: HostRuntimeState): boolean => {
+      if (state.activeThreadId !== threadId) return false;
+      if (!state.activeTurnId || state.activeTurnId === turnId || isPendingTurnForThread(state.activeTurnId, threadId)) return true;
+      return completingTurnKeys.has(turnKey(threadId, state.activeTurnId));
+    };
+    if (!canAdoptTurn(current)) return;
 
-    const next = deps.stateStore.update((state) => ({
-      ...state,
-      activeTurnId: state.activeThreadId === threadId ? (alreadyCompleted ? null : turnId) : state.activeTurnId,
-      activeThreadPath: state.activeThreadId === threadId ? (threadPath ?? state.activeThreadPath) : state.activeThreadPath,
-      activeCwd: state.activeThreadId === threadId ? (cwd ?? state.activeCwd) : state.activeCwd,
-    }));
+    let adopted = false;
+    const next = deps.stateStore.update((state) => {
+      if (!canAdoptTurn(state)) return state;
+      adopted = true;
+      return {
+        ...state,
+        activeTurnId: alreadyCompleted ? null : turnId,
+        activeThreadPath: threadPath ?? state.activeThreadPath,
+        activeCwd: cwd ?? state.activeCwd,
+      };
+    });
     broadcastHello(next);
-    maybeSteerQueuedMessage();
+    if (adopted) maybeSteerQueuedMessage();
   };
 
   const handleRuntimeSettingsNotification = (
@@ -3152,7 +3203,8 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   };
 
   const unsubscribeNotification = deps.codex.onNotification((message) => {
-    const seq = rememberNotification(message);
+    const forwardToBrowser = !UNFORWARDED_BROWSER_NOTIFICATION_METHODS.has(message.method);
+    const seq = forwardToBrowser ? rememberNotification(message) : null;
     const isTaskStart = message.method === 'turn/started' || (message.method === 'event_msg' && isTaskStartedEvent(message));
     if (isTaskStart) handleTaskStarted(message);
     const goalState = handleGoalNotification(message);
@@ -3163,7 +3215,9 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       resolveMatchingRuntimeSettingsUpdateWaiter(runtimeSettings.settings);
     }
 
-    for (const client of wss.clients) sendNotification(client, seq, message);
+    if (seq !== null) {
+      for (const client of wss.clients) sendNotification(client, seq, message);
+    }
     const resolvedRequestId = extractResolvedRequestId(message);
     if (resolvedRequestId !== null && pendingServerRequests.delete(requestKey(resolvedRequestId))) {
       broadcastRequestResolved(resolvedRequestId);

@@ -39,6 +39,7 @@ type ServerMessage =
   | { type: 'rpc/result'; id: number; result: unknown }
   | { type: 'rpc/error'; id: number; error: string }
   | { type: 'codex/notification'; streamId?: string; seq?: number; message: unknown }
+  | { type: 'codex/replayGap'; streamId: string; requestedAfterSeq: number | null; firstAvailableSeq: number | null; latestSeq: number }
   | { type: 'codex/request'; message: unknown }
   | { type: 'codex/requestResolved'; requestId: number | string }
   | { type: 'auth/error' };
@@ -48,6 +49,12 @@ const MAX_RETAINED_NOTIFICATIONS = 5000;
 const NOTIFICATION_FLUSH_DELAY_MS = 125;
 const TRANSIENT_AUTH_REJECTION_RETRIES = 3;
 const AUTH_CHECK_TIMEOUT_MS = 10_000;
+const UNRETAINED_OUTPUT_NOTIFICATION_METHODS = new Set([
+  'command/exec/outputDelta',
+  'process/outputDelta',
+  'item/commandExecution/outputDelta',
+  'item/fileChange/outputDelta',
+]);
 
 interface PendingRpc {
   resolve: (v: unknown) => void;
@@ -178,6 +185,13 @@ interface StoredNotificationReplayState {
   seq: number | null;
 }
 
+interface PendingReplayGap {
+  epoch: number;
+  streamId: string;
+  latestSeq: number;
+  postGapMaxSeq: number | null;
+}
+
 function notificationSeqStorageKey(): string {
   return `codex-web-ui:notificationReplay:${window.location.host}`;
 }
@@ -224,6 +238,23 @@ function latestReplayStateAfterNotifications(
   return next;
 }
 
+function replayStateAfterSequence(
+  current: StoredNotificationReplayState,
+  streamId: string | null | undefined,
+  seq: number | null | undefined,
+): StoredNotificationReplayState {
+  if (typeof seq !== 'number' || !Number.isFinite(seq) || seq < 0) return current;
+  const normalizedStreamId = typeof streamId === 'string' && streamId.trim() ? streamId : current.streamId;
+  if (normalizedStreamId !== current.streamId || current.seq === null || seq > current.seq) {
+    return { streamId: normalizedStreamId ?? null, seq };
+  }
+  return current;
+}
+
+function shouldRetainNotification(message: unknown): boolean {
+  return !isRecord(message) || typeof message.method !== 'string' || !UNRETAINED_OUTPUT_NOTIFICATION_METHODS.has(message.method);
+}
+
 export function useCodexSocket() {
   const [connectionState, setConnectionState] = useState<ConnectionState>('connecting');
   const [hello, setHello] = useState<ServerHello | null>(null);
@@ -231,6 +262,7 @@ export function useCodexSocket() {
   const [notificationCount, setNotificationCount] = useState(0);
   const [requests, setRequests] = useState<unknown[]>([]);
   const [reconnectEpoch, setReconnectEpoch] = useState(0);
+  const [replayGapEpoch, setReplayGapEpoch] = useState(0);
   const [authRetryEpoch, setAuthRetryEpoch] = useState(0);
   const wsRef = useRef<WebSocket | null>(null);
   const nextIdRef = useRef(1);
@@ -244,6 +276,9 @@ export function useCodexSocket() {
   const authTokenRef = useRef<string | null>(tokenFromUrl());
   const forceWebSocketTokenRef = useRef(false);
   const storedReplayStateRef = useRef<StoredNotificationReplayState>(readStoredNotificationReplayState());
+  const pendingReplayStateRef = useRef<StoredNotificationReplayState | null>(null);
+  const replayGapCounterRef = useRef(0);
+  const pendingReplayGapRef = useRef<PendingReplayGap | null>(null);
   const seenServerNotificationSeqsRef = useRef<Set<string>>(new Set());
   const nextNotificationOrderRef = useRef(0);
 
@@ -263,19 +298,23 @@ export function useCodexSocket() {
   const flushNotifications = useCallback(() => {
     notificationFlushTimerRef.current = null;
     const buffered = notificationBufferRef.current;
-    if (buffered.length === 0) return;
     notificationBufferRef.current = [];
-    const nextReplayState = latestReplayStateAfterNotifications(storedReplayStateRef.current, buffered);
+    const pendingReplayState = pendingReplayStateRef.current;
+    pendingReplayStateRef.current = null;
+    if (buffered.length === 0 && pendingReplayState === null) return;
+    const nextReplayState = pendingReplayState ?? latestReplayStateAfterNotifications(storedReplayStateRef.current, buffered);
     if (nextReplayState.streamId !== storedReplayStateRef.current.streamId || nextReplayState.seq !== storedReplayStateRef.current.seq) {
       storedReplayStateRef.current = nextReplayState;
       writeStoredNotificationReplayState(nextReplayState);
     }
+    if (buffered.length === 0) return;
     setNotificationCount((count) => count + buffered.length);
     setNotifications((items) => [...items, ...buffered].slice(-MAX_RETAINED_NOTIFICATIONS));
   }, []);
 
   const clearNotificationBuffer = useCallback(() => {
     notificationBufferRef.current = [];
+    pendingReplayStateRef.current = null;
     if (notificationFlushTimerRef.current !== null) {
       window.clearTimeout(notificationFlushTimerRef.current);
       notificationFlushTimerRef.current = null;
@@ -284,6 +323,18 @@ export function useCodexSocket() {
 
   const queueNotification = useCallback(
     (message: unknown, source: { streamId?: string | null; seq?: number | null } = {}) => {
+      const pendingReplayState = replayStateAfterSequence(
+        pendingReplayStateRef.current ?? storedReplayStateRef.current,
+        source.streamId,
+        source.seq,
+      );
+      pendingReplayStateRef.current = pendingReplayState;
+      if (!shouldRetainNotification(message)) {
+        if (notificationFlushTimerRef.current === null) {
+          notificationFlushTimerRef.current = window.setTimeout(flushNotifications, NOTIFICATION_FLUSH_DELAY_MS);
+        }
+        return;
+      }
       const order = (nextNotificationOrderRef.current += 1);
       const notification = withTimelineNotificationMeta(message, {
         order,
@@ -435,7 +486,7 @@ export function useCodexSocket() {
       wsRef.current = ws;
 
       ws.onopen = () => {
-        if (stopped) return;
+        if (stopped || wsRef.current !== ws) return;
         retry = 250;
         if (hasConnectedRef.current) {
           flushNotifications();
@@ -456,6 +507,7 @@ export function useCodexSocket() {
       };
 
       ws.onmessage = (event) => {
+        if (stopped || wsRef.current !== ws) return;
         if (typeof event.data !== 'string') return;
         const message = parseServerMessage(event.data);
         if (!message) return;
@@ -472,8 +524,26 @@ export function useCodexSocket() {
           ws.close();
           if (terminal) return;
         } else if (message.type === 'codex/notification') {
+          const pendingGap = pendingReplayGapRef.current;
+          if (
+            pendingGap &&
+            message.streamId === pendingGap.streamId &&
+            typeof message.seq === 'number' &&
+            Number.isFinite(message.seq)
+          ) {
+            pendingGap.postGapMaxSeq = Math.max(pendingGap.postGapMaxSeq ?? message.seq, message.seq);
+          }
           if (!rememberNotificationSeq(message.streamId, message.seq)) return;
           queueNotification(message.message, { streamId: message.streamId ?? null, seq: message.seq ?? null });
+        } else if (message.type === 'codex/replayGap') {
+          const epoch = (replayGapCounterRef.current += 1);
+          pendingReplayGapRef.current = {
+            epoch,
+            streamId: message.streamId,
+            latestSeq: message.latestSeq,
+            postGapMaxSeq: null,
+          };
+          setReplayGapEpoch(epoch);
         } else if (message.type === 'codex/request') {
           setRequests((items) => [...items.slice(-49), message.message]);
         } else if (message.type === 'codex/requestResolved') {
@@ -489,9 +559,8 @@ export function useCodexSocket() {
       };
 
       ws.onclose = () => {
-        if (wsRef.current === ws) {
-          wsRef.current = null;
-        }
+        if (wsRef.current !== ws) return;
+        wsRef.current = null;
         flushNotifications();
         rejectPending(new Error('socket closed'));
         if (stopped || connectionStateRef.current === 'auth-error') return;
@@ -500,6 +569,7 @@ export function useCodexSocket() {
       };
 
       ws.onerror = () => {
+        if (stopped || wsRef.current !== ws) return;
         ws.close();
       };
     };
@@ -515,6 +585,20 @@ export function useCodexSocket() {
       wsRef.current = null;
     };
   }, [authRetryEpoch, clearNotificationBuffer, flushNotifications, queueNotification, rejectPending, rememberNotificationSeq, rememberNotificationStream, setTrackedConnectionState]);
+
+  const acknowledgeReplayGap = useCallback((epoch: number) => {
+    const gap = pendingReplayGapRef.current;
+    if (!gap || gap.epoch !== epoch) return;
+    flushNotifications();
+    const nextReplayState = {
+      streamId: gap.streamId,
+      seq: Math.max(gap.latestSeq, gap.postGapMaxSeq ?? gap.latestSeq),
+    };
+    storedReplayStateRef.current = nextReplayState;
+    pendingReplayStateRef.current = null;
+    pendingReplayGapRef.current = null;
+    writeStoredNotificationReplayState(nextReplayState);
+  }, [flushNotifications]);
 
   const rpc = useCallback(<T,>(method: string, params?: unknown, timeoutMs = DEFAULT_RPC_TIMEOUT_MS) => {
     const ws = wsRef.current;
@@ -538,5 +622,16 @@ export function useCodexSocket() {
     });
   }, []);
 
-  return { connectionState, hello, notifications, notificationCount, requests, reconnectEpoch, rpc, submitToken };
+  return {
+    connectionState,
+    hello,
+    notifications,
+    notificationCount,
+    requests,
+    reconnectEpoch,
+    replayGapEpoch,
+    acknowledgeReplayGap,
+    rpc,
+    submitToken,
+  };
 }
