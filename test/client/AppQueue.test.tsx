@@ -297,6 +297,39 @@ describe('App queued message tray', () => {
     expect(mocks.reloadTimeline).toHaveBeenCalled();
   });
 
+  it('keeps rendering live progress when an active goal advances to an autonomous turn', async () => {
+    mocks.activeGoal = {
+      threadId: 'thread-1', objective: 'Keep working', status: 'active', tokenBudget: null,
+      tokensUsed: 1, timeUsedSeconds: 1, createdAt: 100, updatedAt: 100,
+    };
+    mocks.notifications = [
+      { method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'inProgress' } } },
+      { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'message-1', delta: 'First turn progress' } },
+    ];
+    mocks.notificationCount = 2;
+
+    renderApp();
+    await flushReact();
+    expect(mocks.chatTimelineItems).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'streaming', text: 'First turn progress', turnId: 'turn-1' }),
+    ]));
+
+    mocks.activeTurnId = 'turn-2';
+    mocks.notifications = [
+      ...mocks.notifications,
+      { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } } },
+      { method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-2', status: 'inProgress' } } },
+      { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-2', itemId: 'message-2', delta: 'Second turn progress' } },
+    ];
+    mocks.notificationCount = 5;
+    rerenderApp();
+    await flushReact();
+
+    expect(mocks.chatTimelineItems).toEqual(expect.arrayContaining([
+      expect.objectContaining({ kind: 'streaming', text: 'Second turn progress', turnId: 'turn-2' }),
+    ]));
+  });
+
   afterEach(() => {
     act(() => {
       root?.unmount();

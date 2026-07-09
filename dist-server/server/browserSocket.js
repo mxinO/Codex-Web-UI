@@ -1212,8 +1212,10 @@ export function attachBrowserSocket(server, deps) {
     let patchCaptureQueueDepth = 0;
     const completingTurnKeys = new Set();
     const terminalTurnKeys = new Set();
+    const terminalTurnDispositions = new Map();
     const completedTurnKeys = new Set();
-    const verifyingUnscopedTerminalKeys = new Set();
+    const verifyingUnscopedTerminalKeys = new Map();
+    const autonomousSuccessorTurnIds = new Map();
     const observedTurnStartKeys = new Set();
     const runtimeOptionUpdates = new Set();
     const goalUpdates = new Set();
@@ -1361,13 +1363,15 @@ export function attachBrowserSocket(server, deps) {
             return null;
         return state.activeCwd;
     };
-    const rememberTerminalTurnKey = (key) => {
+    const rememberTerminalTurnKey = (key, disposition) => {
         terminalTurnKeys.add(key);
+        terminalTurnDispositions.set(key, disposition);
         while (terminalTurnKeys.size > 200) {
             const oldest = terminalTurnKeys.keys().next().value;
             if (typeof oldest !== 'string')
                 break;
             terminalTurnKeys.delete(oldest);
+            terminalTurnDispositions.delete(oldest);
         }
     };
     const rememberCompletedTurnKey = (key) => {
@@ -1386,6 +1390,53 @@ export function attachBrowserSocket(server, deps) {
             terminalTurnKeys.has(turnKey(null, turnId)) ||
             completedTurnKeys.has(turnKey(threadId, turnId)) ||
             completedTurnKeys.has(turnKey(null, turnId)));
+    };
+    const rememberAutonomousSuccessor = (threadId, predecessorTurnId, successorTurnId) => {
+        const predecessorKey = turnKey(threadId, predecessorTurnId);
+        if (autonomousSuccessorTurnIds.has(predecessorKey))
+            return;
+        autonomousSuccessorTurnIds.set(predecessorKey, successorTurnId);
+        while (autonomousSuccessorTurnIds.size > 200) {
+            const oldest = autonomousSuccessorTurnIds.keys().next().value;
+            if (typeof oldest !== 'string')
+                break;
+            autonomousSuccessorTurnIds.delete(oldest);
+        }
+    };
+    const terminalDispositionForTurn = (threadId, turnId) => terminalTurnDispositions.get(turnKey(threadId, turnId)) ??
+        terminalTurnDispositions.get(turnKey(null, turnId)) ??
+        null;
+    const appendAutonomousSuccessor = (threadId, rootTurnId, successorTurnId) => {
+        let predecessorTurnId = rootTurnId;
+        const visited = new Set();
+        while (!visited.has(predecessorTurnId)) {
+            if (predecessorTurnId === successorTurnId || terminalDispositionForTurn(threadId, predecessorTurnId) === 'barrier')
+                return;
+            visited.add(predecessorTurnId);
+            const existingSuccessor = autonomousSuccessorTurnIds.get(turnKey(threadId, predecessorTurnId));
+            if (!existingSuccessor) {
+                rememberAutonomousSuccessor(threadId, predecessorTurnId, successorTurnId);
+                return;
+            }
+            predecessorTurnId = existingSuccessor;
+        }
+    };
+    const autonomousSuccessorDisposition = (steer) => {
+        let predecessorTurnId = steer.turnId;
+        let lastDisposition = null;
+        const visited = new Set();
+        while (!visited.has(predecessorTurnId)) {
+            visited.add(predecessorTurnId);
+            const successorTurnId = autonomousSuccessorTurnIds.get(turnKey(steer.threadId, predecessorTurnId));
+            if (!successorTurnId)
+                return lastDisposition;
+            const disposition = terminalDispositionForTurn(steer.threadId, successorTurnId);
+            if (disposition === 'barrier')
+                return disposition;
+            lastDisposition = disposition;
+            predecessorTurnId = successorTurnId;
+        }
+        return 'barrier';
     };
     const isTerminalOrCompletingTurn = (threadId, turnId) => {
         if (!turnId)
@@ -2566,7 +2617,15 @@ export function attachBrowserSocket(server, deps) {
                 }
                 else if (terminalDisposition === 'advance-queue') {
                     const current = deps.stateStore.read();
-                    if (current.activeThreadId !== claimToSteer.threadId || current.activeTurnId !== claimToSteer.turnId) {
+                    if (autonomousSuccessorDisposition(claimToSteer) === 'barrier') {
+                        followUp = null;
+                    }
+                    else if (current.activeThreadId === claimToSteer.threadId &&
+                        current.activeTurnId &&
+                        current.activeTurnId !== claimToSteer.turnId) {
+                        followUp = 'drain-active-turn';
+                    }
+                    else if (current.activeThreadId !== claimToSteer.threadId || current.activeTurnId !== claimToSteer.turnId) {
                         followUp = 'start-next-turn';
                     }
                 }
@@ -2591,7 +2650,15 @@ export function attachBrowserSocket(server, deps) {
                     broadcastHello(restored);
                 if (terminalDisposition === 'advance-queue') {
                     const current = deps.stateStore.read();
-                    if (current.activeThreadId !== claimToSteer.threadId || current.activeTurnId !== claimToSteer.turnId) {
+                    if (autonomousSuccessorDisposition(claimToSteer) === 'barrier') {
+                        followUp = null;
+                    }
+                    else if (current.activeThreadId === claimToSteer.threadId &&
+                        current.activeTurnId &&
+                        current.activeTurnId !== claimToSteer.turnId) {
+                        followUp = 'drain-active-turn';
+                    }
+                    else if (current.activeThreadId !== claimToSteer.threadId || current.activeTurnId !== claimToSteer.turnId) {
                         followUp = 'start-next-turn';
                     }
                 }
@@ -2623,10 +2690,8 @@ export function attachBrowserSocket(server, deps) {
     const markQueuedMessageMaybeSent = (threadId, queuedMessageId) => {
         let changed = false;
         const next = deps.stateStore.update((state) => {
-            if (state.activeThreadId !== threadId)
-                return state;
             const queue = state.queue.map((message) => {
-                if (message.id !== queuedMessageId || (message.threadId && message.threadId !== threadId))
+                if (message.id !== queuedMessageId || message.threadId !== threadId)
                     return message;
                 if (message.deliveryState === 'maybeSent')
                     return message;
@@ -2636,6 +2701,21 @@ export function attachBrowserSocket(server, deps) {
             return changed ? { ...state, queue } : state;
         });
         return changed ? next : null;
+    };
+    const resumeQueuedWorkAfterSettledCompletionSteer = (steer) => {
+        if (steer.timedOut) {
+            const next = markQueuedMessageMaybeSent(steer.threadId, steer.queuedMessage.id);
+            if (next)
+                broadcastHello(next);
+        }
+        if (autonomousSuccessorDisposition(steer) === 'barrier')
+            return;
+        const current = deps.stateStore.read();
+        if (current.activeThreadId === steer.threadId && current.activeTurnId && current.activeTurnId !== steer.turnId) {
+            maybeSteerQueuedMessage();
+            return;
+        }
+        maybeStartQueuedTurnFromIdle(steer.threadId);
     };
     const handleTurnCompleted = async (message, disposition) => {
         const advanceQueue = disposition === 'advance-queue';
@@ -2655,16 +2735,14 @@ export function attachBrowserSocket(server, deps) {
         const noTurnVerificationKey = noTurnActiveTarget ? turnKey(noTurnActiveTarget.threadId, noTurnActiveTarget.turnId) : null;
         const steerAtReceipt = queuedSteerInFlight;
         let resumeSteeringAfterIgnoredNoTurn = false;
-        if (noTurnVerificationKey)
-            verifyingUnscopedTerminalKeys.add(noTurnVerificationKey);
+        if (noTurnVerificationKey) {
+            verifyingUnscopedTerminalKeys.set(noTurnVerificationKey, (verifyingUnscopedTerminalKeys.get(noTurnVerificationKey) ?? 0) + 1);
+        }
         try {
             let verifiedNoTurnActiveTarget = null;
             if (noTurnActiveTarget) {
                 const verified = await verifyUnscopedActiveCompletionTarget(noTurnActiveTarget);
-                const afterVerify = deps.stateStore.read();
-                if (verified &&
-                    afterVerify.activeThreadId === noTurnActiveTarget.threadId &&
-                    afterVerify.activeTurnId === noTurnActiveTarget.turnId) {
+                if (verified) {
                     verifiedNoTurnActiveTarget = noTurnActiveTarget;
                 }
                 else {
@@ -2684,7 +2762,8 @@ export function attachBrowserSocket(server, deps) {
                 steerAtReceipt.threadId === verifiedNoTurnActiveTarget.threadId &&
                 steerAtReceipt.turnId === verifiedNoTurnActiveTarget.turnId
                 ? steerAtReceipt
-                : queuedSteerInFlight &&
+                : !verifiedNoTurnActiveTarget &&
+                    queuedSteerInFlight &&
                     (!completedThreadId || completedThreadId === queuedSteerInFlight.threadId) &&
                     completionMatchesActiveTurn(queuedSteerInFlight.turnId, queuedSteerInFlight.threadId, completedTurnId, {
                         allowMissingTurnId,
@@ -2694,22 +2773,19 @@ export function attachBrowserSocket(server, deps) {
                     : null;
             if (completingSteer)
                 completingSteer.terminalDisposition = disposition;
-            const matchedActiveTurnAtReceipt = Boolean(current.activeTurnId) &&
-                ((verifiedNoTurnActiveTarget !== null &&
-                    current.activeThreadId === verifiedNoTurnActiveTarget.threadId &&
-                    current.activeTurnId === verifiedNoTurnActiveTarget.turnId) ||
-                    pendingCompactionNoTurnCompletion ||
+            const matchedCurrentActiveTurnAtReceipt = Boolean(current.activeTurnId) &&
+                (pendingCompactionNoTurnCompletion ||
                     (completedTurnId !== null &&
                         (!completedThreadId || completedThreadId === current.activeThreadId) &&
                         completionMatchesActiveTurn(current.activeTurnId, current.activeThreadId, completedTurnId, {
                             allowMissingTurnId,
                             completedThreadId,
                         })));
-            const activeCompletionTarget = matchedActiveTurnAtReceipt
+            const activeCompletionTarget = verifiedNoTurnActiveTarget ?? (matchedCurrentActiveTurnAtReceipt
                 ? { threadId: current.activeThreadId, turnId: current.activeTurnId }
-                : null;
-            const turnIdToFinalize = completedTurnId ?? (matchedActiveTurnAtReceipt ? current.activeTurnId : null);
-            const threadIdToFinalize = completedThreadId ?? (turnIdToFinalize === current.activeTurnId ? current.activeThreadId : null);
+                : null);
+            const turnIdToFinalize = completedTurnId ?? activeCompletionTarget?.turnId ?? null;
+            const threadIdToFinalize = completedThreadId ?? activeCompletionTarget?.threadId ?? null;
             const activeStateMatchesCompletionTarget = (state) => {
                 if (!activeCompletionTarget?.turnId || !state.activeTurnId)
                     return false;
@@ -2726,7 +2802,7 @@ export function attachBrowserSocket(server, deps) {
                 return;
             if (completionKey) {
                 completingTurnKeys.add(completionKey);
-                rememberTerminalTurnKey(completionKey);
+                rememberTerminalTurnKey(completionKey, disposition);
             }
             let finalizedForCompletionKey = false;
             if (turnIdToFinalize) {
@@ -2756,6 +2832,9 @@ export function attachBrowserSocket(server, deps) {
                         rememberCompletedTurnKey(completionKey);
                     }
                 }
+                if (completingSteer && advanceQueue && completingSteer.settled) {
+                    resumeQueuedWorkAfterSettledCompletionSteer(completingSteer);
+                }
                 return;
             }
             if (queuedStartInFlight || queuedSteerInFlight || completingSteer || !advanceQueue) {
@@ -2771,12 +2850,7 @@ export function attachBrowserSocket(server, deps) {
                     }
                 }
                 if (completingSteer && advanceQueue && completingSteer.settled) {
-                    if (completingSteer.timedOut) {
-                        const next = markQueuedMessageMaybeSent(completingSteer.threadId, completingSteer.queuedMessage.id);
-                        if (next)
-                            broadcastHello(next);
-                    }
-                    maybeStartQueuedTurnFromIdle(completingSteer.threadId);
+                    resumeQueuedWorkAfterSettledCompletionSteer(completingSteer);
                 }
                 return;
             }
@@ -2814,8 +2888,13 @@ export function attachBrowserSocket(server, deps) {
             startQueuedTurnFromIdle(claimToStart.threadId, claimToStart.queuedMessage);
         }
         finally {
-            if (noTurnVerificationKey)
-                verifyingUnscopedTerminalKeys.delete(noTurnVerificationKey);
+            if (noTurnVerificationKey) {
+                const remainingOwners = (verifyingUnscopedTerminalKeys.get(noTurnVerificationKey) ?? 1) - 1;
+                if (remainingOwners > 0)
+                    verifyingUnscopedTerminalKeys.set(noTurnVerificationKey, remainingOwners);
+                else
+                    verifyingUnscopedTerminalKeys.delete(noTurnVerificationKey);
+            }
             if (resumeSteeringAfterIgnoredNoTurn && (!steerAtReceipt || !steerAtReceipt.timedOut))
                 maybeSteerQueuedMessage();
             const compactedThreadId = completedThreadId ?? receiptState.activeThreadId;
@@ -2908,15 +2987,25 @@ export function attachBrowserSocket(server, deps) {
                 return false;
             if (!state.activeTurnId || state.activeTurnId === turnId || isPendingTurnForThread(state.activeTurnId, threadId))
                 return true;
-            return completingTurnKeys.has(turnKey(threadId, state.activeTurnId));
+            const activeTurnKey = turnKey(threadId, state.activeTurnId);
+            return completingTurnKeys.has(activeTurnKey) || verifyingUnscopedTerminalKeys.has(activeTurnKey);
         };
         if (!canAdoptTurn(current))
             return;
         let adopted = false;
+        let adoptedPredecessorTurnId = null;
+        const terminalPredecessorTurnId = queuedSteerInFlight?.threadId === threadId &&
+            queuedSteerInFlight.turnId !== turnId &&
+            queuedSteerInFlight.terminalDisposition === 'advance-queue'
+            ? queuedSteerInFlight.turnId
+            : null;
         const next = deps.stateStore.update((state) => {
             if (!canAdoptTurn(state))
                 return state;
             adopted = true;
+            if (state.activeTurnId && state.activeTurnId !== turnId && !isPendingTurnForThread(state.activeTurnId, threadId)) {
+                adoptedPredecessorTurnId = state.activeTurnId;
+            }
             return {
                 ...state,
                 activeTurnId: alreadyCompleted ? null : turnId,
@@ -2924,6 +3013,12 @@ export function attachBrowserSocket(server, deps) {
                 activeCwd: cwd ?? state.activeCwd,
             };
         });
+        if (adopted && adoptedPredecessorTurnId) {
+            rememberAutonomousSuccessor(threadId, adoptedPredecessorTurnId, turnId);
+        }
+        else if (adopted && terminalPredecessorTurnId) {
+            appendAutonomousSuccessor(threadId, terminalPredecessorTurnId, turnId);
+        }
         broadcastHello(next);
         if (adopted)
             maybeSteerQueuedMessage();
