@@ -8,7 +8,7 @@ import { isInteractiveCommandBlocked, runBangCommand } from './bangCommand.js';
 import { FileEditStore, sessionFileEditDbPath } from './fileEditStore.js';
 import { addGitRepo, gitCommit, gitDiffForRepo, gitStagePaths, gitStatusForRepo, gitUnstagePaths, listGitRepos, removeGitRepo, } from './gitTracker.js';
 import { assertPathInsideRoot, openExistingFileInsideRoot, readOpenedFileFully, resolveExistingPathInsideRoot, resolveWritablePathInsideRoot, writeFileInsideRoot, } from './fileTransfer.js';
-import { logWarn } from './logger.js';
+import { logInfo, logWarn } from './logger.js';
 import { enqueueMessage, normalizeQueueLimit, prependQueuedMessagesForThread, queueForThread, removeQueuedMessage, shiftQueuedMessage, updateQueuedMessage, } from './queue.js';
 import { readLatestTurnRuntimeContext } from './turnRuntimeStatus.js';
 function send(ws, payload) {
@@ -3059,6 +3059,15 @@ export function attachBrowserSocket(server, deps) {
         if (runtimeSettings) {
             broadcastHello(runtimeSettings.state);
             resolveMatchingRuntimeSettingsUpdateWaiter(runtimeSettings.settings);
+        }
+        if (message.method === 'model/safetyBuffering/updated' && isRecord(message.params) && typeof message.params.showBufferingUi === 'boolean') {
+            logInfo('Codex model safety buffering updated', {
+                threadId: notificationThreadId(message),
+                turnId: notificationTurnId(message),
+                model: getStringPath(message.params, ['model']),
+                showBufferingUi: message.params.showBufferingUi,
+                fasterModel: getStringPath(message.params, ['fasterModel']),
+            });
         }
         if (seq !== null) {
             for (const client of wss.clients)

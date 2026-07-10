@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   CODEX_APP_SERVER_STARTUP_TIMEOUT_MS,
   CodexAppServer,
+  codexAppServerArgs,
   prepareCodexChildRuntimeEnv,
   resolveCodexSpawnConfig,
   sanitizeProcessArgvForTrace,
@@ -272,6 +273,31 @@ describe('CodexAppServer lifecycle', () => {
       runtime.cleanup();
     }
     expect(runtime.nodeWrapperPath ? existsSync(runtime.nodeWrapperPath) : false).toBe(false);
+  });
+
+  it('passes an isolated SQLite home to the Codex child environment', () => {
+    const root = tempRoot();
+    const realNode = join(root, 'node-real');
+    const sqliteHome = join(root, 'codex-sqlite', 'login-node');
+    writeFileSync(realNode, '#!/bin/sh\n');
+    chmodSync(realNode, 0o755);
+
+    const runtime = prepareCodexChildRuntimeEnv({ PATH: '/usr/bin' }, 'linux', realNode, sqliteHome);
+    try {
+      expect(runtime.env.CODEX_SQLITE_HOME).toBe(sqliteHome);
+    } finally {
+      runtime.cleanup();
+    }
+  });
+
+  it('forces the isolated SQLite home through Codex config precedence', () => {
+    expect(codexAppServerArgs('/tmp/codex sqlite/host')).toEqual([
+      '-c',
+      'sqlite_home="/tmp/codex sqlite/host"',
+      'app-server',
+      '--listen',
+      'ws://127.0.0.1:0',
+    ]);
   });
 
   it('logs sanitized node wrapper trace lines when process tracing is enabled', () => {

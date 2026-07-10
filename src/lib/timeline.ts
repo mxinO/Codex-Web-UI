@@ -434,28 +434,61 @@ export function trimTimelineWindow<T>(items: T[], limit: number): T[] {
   return items.length <= limit ? items : items.slice(items.length - limit);
 }
 
+function reorderOrderedSlots(items: TimelineItem[]): TimelineItem[] {
+  const orderedSlots: number[] = [];
+  const orderedItems: Array<{ item: TimelineItem; index: number; order: number }> = [];
+  items.forEach((item, index) => {
+    if (typeof item.sortOrder !== 'number' || !Number.isFinite(item.sortOrder)) return;
+    orderedSlots.push(index);
+    orderedItems.push({ item, index, order: item.sortOrder });
+  });
+  if (orderedItems.length < 2) return items;
+
+  orderedItems.sort((a, b) => a.order - b.order || a.index - b.index);
+  const reordered = [...items];
+  orderedSlots.forEach((slot, index) => {
+    reordered[slot] = orderedItems[index].item;
+  });
+  return reordered;
+}
+
+function reorderTimelineSubsequences(
+  items: TimelineItem[],
+  keyForItem: (item: TimelineItem) => string | number | null,
+  reorder: (items: TimelineItem[]) => TimelineItem[],
+): TimelineItem[] {
+  const positionsByKey = new Map<string | number, number[]>();
+  items.forEach((item, index) => {
+    const key = keyForItem(item);
+    if (key === null) return;
+    const positions = positionsByKey.get(key);
+    if (positions) positions.push(index);
+    else positionsByKey.set(key, [index]);
+  });
+
+  const reordered = [...items];
+  for (const positions of positionsByKey.values()) {
+    const subsequence = reorder(positions.map((position) => reordered[position]));
+    positions.forEach((position, index) => {
+      reordered[position] = subsequence[index];
+    });
+  }
+  return reordered;
+}
+
 export function mergeTimelineItemsByTimestamp(items: TimelineItem[]): TimelineItem[] {
-  return items
+  const byTimestamp = items
     .map((item, index) => ({ item, index }))
-    .sort((a, b) => {
-      const aTime = Number.isFinite(a.item.timestamp) ? a.item.timestamp : 0;
-      const bTime = Number.isFinite(b.item.timestamp) ? b.item.timestamp : 0;
-      const aOrder = typeof a.item.sortOrder === 'number' && Number.isFinite(a.item.sortOrder) ? a.item.sortOrder : null;
-      const bOrder = typeof b.item.sortOrder === 'number' && Number.isFinite(b.item.sortOrder) ? b.item.sortOrder : null;
-      const aTurnId = timelineItemTurnId(a.item);
-      const bTurnId = timelineItemTurnId(b.item);
-      const sameTurn = aTurnId !== null && aTurnId === bTurnId;
-      let activityBeforeFinal = 0;
-      if (sameTurn && isFinalAssistantTimelineItem(a.item) && isTurnActivityItem(b.item)) activityBeforeFinal = 1;
-      else if (sameTurn && isTurnActivityItem(a.item) && isFinalAssistantTimelineItem(b.item)) activityBeforeFinal = -1;
-      const orderCompare = aOrder !== null && bOrder !== null ? aOrder - bOrder : 0;
-      const fallbackOrderCompare = (aOrder ?? a.index) - (bOrder ?? b.index);
-      if (sameTurn) {
-        return orderCompare || activityBeforeFinal || aTime - bTime || fallbackOrderCompare || a.index - b.index;
-      }
-      return aTime - bTime || fallbackOrderCompare || a.index - b.index;
-    })
+    .sort((a, b) => (Number.isFinite(a.item.timestamp) ? a.item.timestamp : 0) - (Number.isFinite(b.item.timestamp) ? b.item.timestamp : 0) || a.index - b.index)
     .map(({ item }) => item);
+  const withTimestampTiesOrdered = reorderTimelineSubsequences(
+    byTimestamp,
+    (item) => (Number.isFinite(item.timestamp) ? item.timestamp : 0),
+    reorderOrderedSlots,
+  );
+  return reorderTimelineSubsequences(withTimestampTiesOrdered, timelineItemTurnId, (turnItems) =>
+    finalAssistantAfterLaterActivity(reorderOrderedSlots(turnItems)),
+  );
 }
 
 export function timelineItemTurnId(item: TimelineItem): string | null {
@@ -903,6 +936,30 @@ export function appendLiveTurnNotifications(
           turnId: notificationTurnId(notification) ?? scope.activeTurnId ?? undefined,
         });
       }
+      next.deltaIndex = null;
+      continue;
+    }
+
+    if (notification.method === 'model/safetyBuffering/updated') {
+      if (!notificationAllowedInLiveWindow(notification, scope, acceptUnscoped)) continue;
+      const params = notificationParams(notification);
+      if (!isRecord(params) || typeof params.showBufferingUi !== 'boolean') continue;
+      const turnId = notificationTurnId(notification) ?? scope.activeTurnId;
+      const id = `live:model-safety-buffering:${turnId ?? 'unscoped'}`;
+      if (!params.showBufferingUi && !next.itemIndexes.has(id)) continue;
+      const model = stringField(params, 'model', 'the selected model');
+      const fasterModel = nullableStringField(params, 'fasterModel');
+      const text = params.showBufferingUi
+        ? `Additional safety checks are running for ${model}. Codex will continue automatically.${fasterModel ? ` To retry faster, stop this turn and select ${fasterModel} from the model menu.` : ''}`
+        : `Additional safety checks completed for ${model}.`;
+      rememberItem({
+        id,
+        kind: params.showBufferingUi ? 'warning' : 'notice',
+        timestamp,
+        sortOrder,
+        text,
+        turnId: turnId ?? undefined,
+      });
       next.deltaIndex = null;
       continue;
     }

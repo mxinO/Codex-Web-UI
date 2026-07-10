@@ -13,7 +13,7 @@ import {
   parseTokenFromCookieScopes,
 } from './auth.js';
 import { attachBrowserSocket } from './browserSocket.js';
-import { readConfig } from './config.js';
+import { readConfig, resolveCodexSqliteHome } from './config.js';
 import { createFileContentHandler } from './fileContent.js';
 import { createFileDownloadHandler } from './fileDownload.js';
 import { createFilePreviewHandler } from './filePreview.js';
@@ -29,6 +29,7 @@ const packageRoot = resolvePackageRoot();
 const startCwd = resolveStartCwd();
 const safeHostname = config.hostname.replace(/[^A-Za-z0-9_.-]/g, '_');
 const logFilePath = path.join(config.stateDir, `${safeHostname}.log`);
+const codexSqliteHome = resolveCodexSqliteHome(config.stateDir, config.hostname);
 const nodeWebApiOptions = ['--no-experimental-fetch', '--no-experimental-websocket', '--no-experimental-eventsource'].filter((option) =>
   process.allowedNodeEnvironmentFlags.has(option),
 );
@@ -43,6 +44,7 @@ logInfo('Starting Codex Web UI server', {
   stateDir: config.stateDir,
   startCwd,
   logFilePath,
+  codexSqliteHome,
   nodeWebApis: nodeWebApiOptions.length > 0 && nodeWebApiOptions.every((option) => nodeOptions.includes(option)) ? 'disabled' : 'default',
 });
 
@@ -55,7 +57,7 @@ const fallbackAuthScope = `${config.hostname}:${config.port}`;
 
 stateStore.update((state) => ({ ...state, authTokenHash: tokenHash }));
 
-const codex = new CodexAppServer({ cwd: startCwd, mock: config.mock });
+const codex = new CodexAppServer({ cwd: startCwd, mock: config.mock, sqliteHome: codexSqliteHome });
 try {
   await codex.start();
 } catch (error) {

@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { readConfig } from '../../server/config.js';
+import { readConfig, resolveCodexSqliteHome } from '../../server/config.js';
 import { HostStateStore } from '../../server/hostState.js';
 import { enqueueMessage, prependQueuedMessagesForThread } from '../../server/queue.js';
 
@@ -25,6 +25,21 @@ describe('readConfig', () => {
 
   it('keeps the environment state directory fallback', () => {
     expect(readConfig([], { CODEX_WEB_UI_STATE_DIR: '/tmp/env-state' }).stateDir).toBe('/tmp/env-state');
+  });
+
+  it('isolates Codex SQLite state by hostname while preserving an explicit override', () => {
+    const firstHost = resolveCodexSqliteHome('/tmp/codex-web-ui-state', 'login/node:1', {});
+    const secondHost = resolveCodexSqliteHome('/tmp/codex-web-ui-state', 'login-node-2', {});
+    const formerlyCollidingHost = resolveCodexSqliteHome('/tmp/codex-web-ui-state', 'login:node/1', {});
+    expect(firstHost).toMatch(/^\/tmp\/codex-web-ui-state\/codex-sqlite\/login_node_1-[a-f0-9]{16}$/);
+    expect(secondHost).toMatch(/^\/tmp\/codex-web-ui-state\/codex-sqlite\/login-node-2-[a-f0-9]{16}$/);
+    expect(firstHost).not.toBe(secondHost);
+    expect(firstHost).not.toBe(formerlyCollidingHost);
+    expect(
+      resolveCodexSqliteHome('/tmp/codex-web-ui-state', 'login-node', {
+        CODEX_WEB_UI_CODEX_SQLITE_HOME: '/scratch/codex-sqlite',
+      }),
+    ).toBe('/scratch/codex-sqlite');
   });
 
   it.each(['NaN', 'Infinity', '-Infinity', '0', '-1'])(

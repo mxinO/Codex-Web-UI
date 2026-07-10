@@ -115,20 +115,25 @@ exec ${shellQuote(realNode)} "$@"
         },
     };
 }
-export function prepareCodexChildRuntimeEnv(env, platform = process.platform, realNode = process.execPath) {
-    if (preserveNodeWebApis(env))
-        return { env, nodeWrapperPath: null, cleanup: () => undefined };
+export function prepareCodexChildRuntimeEnv(env, platform = process.platform, realNode = process.execPath, sqliteHome) {
+    const childEnv = sqliteHome ? { ...env, CODEX_SQLITE_HOME: sqliteHome } : env;
+    if (preserveNodeWebApis(childEnv))
+        return { env: childEnv, nodeWrapperPath: null, cleanup: () => undefined };
     const wrapper = createNodeWrapper(realNode, platform);
     if (!wrapper)
-        return { env, nodeWrapperPath: null, cleanup: () => undefined };
+        return { env: childEnv, nodeWrapperPath: null, cleanup: () => undefined };
     return {
         env: {
-            ...env,
-            PATH: [wrapper.directory, ...pathEntries(env)].join(path.delimiter),
+            ...childEnv,
+            PATH: [wrapper.directory, ...pathEntries(childEnv)].join(path.delimiter),
         },
         nodeWrapperPath: wrapper.path,
         cleanup: wrapper.cleanup,
     };
+}
+export function codexAppServerArgs(sqliteHome) {
+    const configArgs = sqliteHome ? ['-c', `sqlite_home=${JSON.stringify(sqliteHome)}`] : [];
+    return [...configArgs, 'app-server', '--listen', 'ws://127.0.0.1:0'];
 }
 function selectedTraceEnv(pid) {
     const result = {};
@@ -572,7 +577,11 @@ export class CodexAppServer {
         return new Promise((resolve, reject) => {
             const lifecycleId = ++this.lifecycleId;
             const codexSpawn = resolveCodexSpawnConfig();
-            const runtimeEnv = prepareCodexChildRuntimeEnv(codexSpawn.env);
+            if (this.options.sqliteHome) {
+                fs.mkdirSync(this.options.sqliteHome, { recursive: true, mode: 0o700 });
+                fs.chmodSync(this.options.sqliteHome, 0o700);
+            }
+            const runtimeEnv = prepareCodexChildRuntimeEnv(codexSpawn.env, process.platform, process.execPath, this.options.sqliteHome);
             const runtimeNodeOptions = runtimeEnv.env.NODE_OPTIONS?.split(/\s+/).filter(Boolean) ?? [];
             let runtimeCleaned = false;
             const cleanupRuntime = () => {
@@ -585,13 +594,14 @@ export class CodexAppServer {
                 cwd: this.options.cwd,
                 command: codexSpawn.command,
                 source: codexSpawn.source,
+                sqliteHome: this.options.sqliteHome ?? null,
                 launchMode: codexLaunchMode(process.env),
                 nodeWebApis: ACTIVE_NODE_WEB_API_MEMORY_OPTIONS.length > 0 && ACTIVE_NODE_WEB_API_MEMORY_OPTIONS.every((option) => runtimeNodeOptions.includes(option)) ? 'disabled' : 'default',
                 nodeWrapper: runtimeEnv.nodeWrapperPath ? 'enabled' : 'disabled',
             });
             let child;
             try {
-                child = spawn(codexSpawn.command, ['app-server', '--listen', 'ws://127.0.0.1:0'], {
+                child = spawn(codexSpawn.command, codexAppServerArgs(this.options.sqliteHome), {
                     cwd: this.options.cwd,
                     env: runtimeEnv.env,
                     stdio: ['ignore', 'pipe', 'pipe'],

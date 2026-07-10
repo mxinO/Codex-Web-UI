@@ -351,6 +351,61 @@ describe('timeline', () => {
     expect(mergeTimelineItemsByTimestamp([second, first]).map((item) => item.id)).toEqual(['turn-1:a1', 'turn-1:cmd-1']);
   });
 
+  it('preserves persisted user order when retained turn items have sortOrder', () => {
+    const older: TimelineItem[] = Array.from({ length: 20 }, (_, index) => ({
+      id: `old-${index}`,
+      kind: 'user',
+      timestamp: index,
+      text: `old ${index}`,
+    }));
+    const user: TimelineItem = {
+      id: 'turn-1:user',
+      kind: 'user',
+      timestamp: 1000,
+      text: 'Question',
+      turnId: 'turn-1',
+    };
+    const command: TimelineItem = {
+      id: 'turn-1:command',
+      kind: 'command',
+      timestamp: 1000,
+      sortOrder: 1,
+      command: 'pwd',
+      cwd: '/repo',
+      output: '/repo\n',
+      status: 'completed',
+      exitCode: 0,
+      turnId: 'turn-1',
+    };
+    const final: TimelineItem = {
+      id: 'turn-1:final',
+      kind: 'assistant',
+      timestamp: 1000,
+      sortOrder: 2,
+      text: 'Done.',
+      phase: 'final_answer',
+      turnId: 'turn-1',
+    };
+
+    expect(mergeTimelineItemsByTimestamp([...older, user, command, final]).slice(-3).map((item) => item.id)).toEqual([
+      'turn-1:user',
+      'turn-1:command',
+      'turn-1:final',
+    ]);
+  });
+
+  it('sorts ordered timestamp ties without moving an unordered anchor', () => {
+    const later: TimelineItem = { id: 'turn-a:later', kind: 'notice', timestamp: 1000, sortOrder: 2, text: 'later', turnId: 'turn-a' };
+    const anchor: TimelineItem = { id: 'turn-b:anchor', kind: 'notice', timestamp: 1000, text: 'anchor', turnId: 'turn-b' };
+    const earlier: TimelineItem = { id: 'turn-c:earlier', kind: 'notice', timestamp: 1000, sortOrder: 1, text: 'earlier', turnId: 'turn-c' };
+
+    expect(mergeTimelineItemsByTimestamp([later, anchor, earlier]).map((item) => item.id)).toEqual([
+      'turn-c:earlier',
+      'turn-b:anchor',
+      'turn-a:later',
+    ]);
+  });
+
   it('keeps same-turn activity before a persisted final assistant even when live activity has a later timestamp', () => {
     const final: TimelineItem = {
       id: 'turn-1:final',
@@ -364,6 +419,32 @@ describe('timeline', () => {
       id: 'turn-1:cmd-1',
       kind: 'command',
       timestamp: 5000,
+      sortOrder: 2,
+      command: 'pwd',
+      cwd: '/repo',
+      output: '/repo\n',
+      status: 'completed',
+      exitCode: 0,
+      turnId: 'turn-1',
+    };
+
+    expect(mergeTimelineItemsByTimestamp([final, command]).map((item) => item.id)).toEqual(['turn-1:cmd-1', 'turn-1:final']);
+  });
+
+  it('keeps same-turn activity before a final assistant when both have sortOrder', () => {
+    const final: TimelineItem = {
+      id: 'turn-1:final',
+      kind: 'assistant',
+      timestamp: 1000,
+      sortOrder: 1,
+      text: 'Done.',
+      phase: 'final_answer',
+      turnId: 'turn-1',
+    };
+    const command: TimelineItem = {
+      id: 'turn-1:cmd-1',
+      kind: 'command',
+      timestamp: 1000,
       sortOrder: 2,
       command: 'pwd',
       cwd: '/repo',
@@ -2838,6 +2919,65 @@ describe('timeline', () => {
     expect(liveTurnItemsFromAccumulator(accumulator, true)).toEqual([
       expect.objectContaining({ kind: 'warning', text: 'Retrying the request.', sortOrder: 12, timestamp: 1200 }),
     ]);
+  });
+
+  it('shows model safety buffering and records when the check completes', () => {
+    const scope = { activeThreadId: 'thread-1', activeTurnId: 'turn-1' };
+    const buffering = withTimelineNotificationMeta(
+      {
+        method: 'model/safetyBuffering/updated',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          model: 'gpt-5.6-sol',
+          useCases: ['cyber'],
+          reasons: ['additional_check'],
+          showBufferingUi: true,
+          fasterModel: 'gpt-5.6-luna',
+        },
+      },
+      { order: 13, receivedAt: 1300, streamId: 'stream-1', seq: 13 },
+    );
+    const completed = withTimelineNotificationMeta(
+      {
+        method: 'model/safetyBuffering/updated',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          model: 'gpt-5.6-sol',
+          useCases: ['cyber'],
+          reasons: [],
+          showBufferingUi: false,
+          fasterModel: 'gpt-5.6-luna',
+        },
+      },
+      { order: 14, receivedAt: 1400, streamId: 'stream-1', seq: 14 },
+    );
+
+    let accumulator = appendLiveTurnNotifications(createLiveTurnAccumulator(), [buffering], scope, 100);
+    expect(liveTurnItemsFromAccumulator(accumulator, true)).toEqual([
+      expect.objectContaining({
+        id: 'live:model-safety-buffering:turn-1',
+        kind: 'warning',
+        text: expect.stringContaining('gpt-5.6-luna'),
+        sortOrder: 13,
+        timestamp: 1300,
+      }),
+    ]);
+
+    accumulator = appendLiveTurnNotifications(accumulator, [completed], scope, 100);
+    expect(liveTurnItemsFromAccumulator(accumulator, true)).toEqual([
+      expect.objectContaining({
+        id: 'live:model-safety-buffering:turn-1',
+        kind: 'notice',
+        text: expect.stringContaining('completed'),
+        sortOrder: 13,
+        timestamp: 1300,
+      }),
+    ]);
+
+    const falseOnly = appendLiveTurnNotifications(createLiveTurnAccumulator(), [completed], scope, 100);
+    expect(liveTurnItemsFromAccumulator(falseOnly, true)).toEqual([]);
   });
 
   it('uses notification metadata timestamps for live turn item ordering', () => {

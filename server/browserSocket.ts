@@ -29,7 +29,7 @@ import {
 } from './fileTransfer.js';
 import type { HostStateStore } from './hostState.js';
 import type { JsonRpcServerRequest } from './jsonRpc.js';
-import { logWarn } from './logger.js';
+import { logInfo, logWarn } from './logger.js';
 import {
   enqueueMessage,
   normalizeQueueLimit,
@@ -3314,6 +3314,15 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     if (runtimeSettings) {
       broadcastHello(runtimeSettings.state);
       resolveMatchingRuntimeSettingsUpdateWaiter(runtimeSettings.settings);
+    }
+    if (message.method === 'model/safetyBuffering/updated' && isRecord(message.params) && typeof message.params.showBufferingUi === 'boolean') {
+      logInfo('Codex model safety buffering updated', {
+        threadId: notificationThreadId(message),
+        turnId: notificationTurnId(message),
+        model: getStringPath(message.params, ['model']),
+        showBufferingUi: message.params.showBufferingUi,
+        fasterModel: getStringPath(message.params, ['fasterModel']),
+      });
     }
 
     if (seq !== null) {

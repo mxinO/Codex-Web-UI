@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { normalizeQueueLimit } from './queue.js';
@@ -12,6 +13,13 @@ export interface ServerConfig {
   queueLimit: number;
   commandTimeoutMs: number;
   commandOutputBytes: number;
+}
+
+export function resolveCodexSqliteHome(stateDir: string, hostname: string, env = process.env): string {
+  const override = env.CODEX_WEB_UI_CODEX_SQLITE_HOME?.trim();
+  const readableHostname = hostname.replace(/[^A-Za-z0-9_.-]/g, '_').slice(0, 96) || 'host';
+  const hostnameDigest = createHash('sha256').update(hostname).digest('hex').slice(0, 16);
+  return path.resolve(override || path.join(stateDir, 'codex-sqlite', `${readableHostname}-${hostnameDigest}`));
 }
 
 export function readConfig(argv = process.argv.slice(2), env = process.env): ServerConfig {
