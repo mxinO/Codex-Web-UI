@@ -20,7 +20,30 @@ const NODE_WEBSOCKET_MEMORY_OPTION = '--no-experimental-websocket';
 const NODE_EVENTSOURCE_MEMORY_OPTION = '--no-experimental-eventsource';
 const NODE_WEB_API_MEMORY_OPTIONS = [NODE_FETCH_MEMORY_OPTION, NODE_WEBSOCKET_MEMORY_OPTION, NODE_EVENTSOURCE_MEMORY_OPTION];
 const ACTIVE_NODE_WEB_API_MEMORY_OPTIONS = NODE_WEB_API_MEMORY_OPTIONS.filter((option) => process.allowedNodeEnvironmentFlags.has(option));
-export const CODEX_APP_SERVER_STARTUP_TIMEOUT_MS = 60_000;
+export const CODEX_APP_SERVER_STARTUP_TIMEOUT_MS = 5 * 60_000;
+const MIN_CODEX_APP_SERVER_STARTUP_TIMEOUT_MS = 60_000;
+const MAX_CODEX_APP_SERVER_STARTUP_TIMEOUT_MS = 60 * 60_000;
+export class CodexBackfillBusyStartupError extends Error {
+    constructor(message) {
+        super(message);
+        this.name = 'CodexBackfillBusyStartupError';
+    }
+}
+export function codexBackfillBusyStartupLine(line) {
+    return line.includes('timed out waiting for state db backfill at ') && line.includes('(status: running)');
+}
+export function isCodexBackfillBusyStartupError(error) {
+    return error instanceof CodexBackfillBusyStartupError;
+}
+export function resolveCodexAppServerStartupTimeoutMs(env = process.env) {
+    const configured = Number(env.CODEX_WEB_UI_CODEX_STARTUP_TIMEOUT_MS?.trim());
+    if (!Number.isFinite(configured) ||
+        configured < MIN_CODEX_APP_SERVER_STARTUP_TIMEOUT_MS ||
+        configured > MAX_CODEX_APP_SERVER_STARTUP_TIMEOUT_MS) {
+        return CODEX_APP_SERVER_STARTUP_TIMEOUT_MS;
+    }
+    return Math.floor(configured);
+}
 function truthyEnv(value) {
     return /^(1|true|yes)$/i.test(value ?? '');
 }
@@ -583,6 +606,7 @@ export class CodexAppServer {
             }
             const runtimeEnv = prepareCodexChildRuntimeEnv(codexSpawn.env, process.platform, process.execPath, this.options.sqliteHome);
             const runtimeNodeOptions = runtimeEnv.env.NODE_OPTIONS?.split(/\s+/).filter(Boolean) ?? [];
+            const startupTimeoutMs = resolveCodexAppServerStartupTimeoutMs(runtimeEnv.env);
             let runtimeCleaned = false;
             const cleanupRuntime = () => {
                 if (runtimeCleaned)
@@ -595,6 +619,7 @@ export class CodexAppServer {
                 command: codexSpawn.command,
                 source: codexSpawn.source,
                 sqliteHome: this.options.sqliteHome ?? null,
+                startupTimeoutMs,
                 launchMode: codexLaunchMode(process.env),
                 nodeWebApis: ACTIVE_NODE_WEB_API_MEMORY_OPTIONS.length > 0 && ACTIVE_NODE_WEB_API_MEMORY_OPTIONS.every((option) => runtimeNodeOptions.includes(option)) ? 'disabled' : 'default',
                 nodeWrapper: runtimeEnv.nodeWrapperPath ? 'enabled' : 'disabled',
@@ -617,11 +642,12 @@ export class CodexAppServer {
             const cleanupProcessTrace = startCodexProcessTrace(child.pid);
             let settled = false;
             let connecting = false;
+            let backfillBusy = false;
             const stdoutBuffer = new StartupOutputBuffer((line) => handleOutputLine('stdout', line));
             const stderrBuffer = new StartupOutputBuffer((line) => handleOutputLine('stderr', line));
             const startupTimeout = setTimeout(() => {
                 fail(new Error('Timed out waiting for Codex app-server startup'));
-            }, CODEX_APP_SERVER_STARTUP_TIMEOUT_MS);
+            }, startupTimeoutMs);
             const cleanupStartup = () => {
                 clearTimeout(startupTimeout);
                 child.off('exit', onStartupExit);
@@ -669,11 +695,16 @@ export class CodexAppServer {
                 }
             };
             const onStartupExit = (code, signal) => {
-                fail(new Error(`Codex app-server exited during startup: ${this.formatExit(code, signal)}`));
+                const exit = this.formatExit(code, signal);
+                fail(backfillBusy
+                    ? new CodexBackfillBusyStartupError(`Codex app-server exited while state backfill was already running: ${exit}`)
+                    : new Error(`Codex app-server exited during startup: ${exit}`));
             };
             const handleOutputLine = (stream, line) => {
                 if (!this.isCurrentLifecycle(lifecycleId, child))
                     return;
+                if (stream === 'stderr' && codexBackfillBusyStartupLine(line))
+                    backfillBusy = true;
                 this.captureReadyz(line);
                 if (line.trim()) {
                     const meta = { pid: child.pid, line };

@@ -6,6 +6,7 @@ import { CodexAppServer } from './appServer.js';
 import { createAuthToken, authCookie, authScopeFromHostHeader, hashToken, isTokenValid, parseTokenFromCookieScopes, } from './auth.js';
 import { attachBrowserSocket } from './browserSocket.js';
 import { readConfig, resolveCodexSqliteHome } from './config.js';
+import { startCodexWithBackfillRetry } from './codexStartup.js';
 import { createFileContentHandler } from './fileContent.js';
 import { createFileDownloadHandler } from './fileDownload.js';
 import { createFilePreviewHandler } from './filePreview.js';
@@ -45,7 +46,7 @@ const fallbackAuthScope = `${config.hostname}:${config.port}`;
 stateStore.update((state) => ({ ...state, authTokenHash: tokenHash }));
 const codex = new CodexAppServer({ cwd: startCwd, mock: config.mock, sqliteHome: codexSqliteHome });
 try {
-    await codex.start();
+    await startCodexWithBackfillRetry(codex);
 }
 catch (error) {
     logError('Failed to start initial Codex app-server', error);

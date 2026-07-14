@@ -8,7 +8,9 @@ import {
   CODEX_APP_SERVER_STARTUP_TIMEOUT_MS,
   CodexAppServer,
   codexAppServerArgs,
+  codexBackfillBusyStartupLine,
   prepareCodexChildRuntimeEnv,
+  resolveCodexAppServerStartupTimeoutMs,
   resolveCodexSpawnConfig,
   sanitizeProcessArgvForTrace,
 } from '../../server/appServer.js';
@@ -95,7 +97,33 @@ describe('Codex process tracing', () => {
 
 describe('CodexAppServer lifecycle', () => {
   it('allows Codex state backfill to finish before startup times out', () => {
-    expect(CODEX_APP_SERVER_STARTUP_TIMEOUT_MS).toBeGreaterThan(30_000);
+    expect(CODEX_APP_SERVER_STARTUP_TIMEOUT_MS).toBe(5 * 60_000);
+    expect(resolveCodexAppServerStartupTimeoutMs({ CODEX_WEB_UI_CODEX_STARTUP_TIMEOUT_MS: '60000' })).toBe(60_000);
+    expect(resolveCodexAppServerStartupTimeoutMs({ CODEX_WEB_UI_CODEX_STARTUP_TIMEOUT_MS: 'invalid' })).toBe(
+      CODEX_APP_SERVER_STARTUP_TIMEOUT_MS,
+    );
+    expect(resolveCodexAppServerStartupTimeoutMs({ CODEX_WEB_UI_CODEX_STARTUP_TIMEOUT_MS: '59999' })).toBe(
+      CODEX_APP_SERVER_STARTUP_TIMEOUT_MS,
+    );
+    expect(resolveCodexAppServerStartupTimeoutMs({ CODEX_WEB_UI_CODEX_STARTUP_TIMEOUT_MS: '3600001' })).toBe(
+      CODEX_APP_SERVER_STARTUP_TIMEOUT_MS,
+    );
+  });
+
+  it('recognizes only the terminal Codex state-backfill timeout', () => {
+    expect(
+      codexBackfillBusyStartupLine(
+        'Error: failed to initialize sqlite state runtime: timed out waiting for state db backfill at /home/me/.codex after 30s (status: running)',
+      ),
+    ).toBe(true);
+    expect(
+      codexBackfillBusyStartupLine('state db backfill is running at /home/me/.codex; waiting up to 30s before retrying startup initialization'),
+    ).toBe(false);
+    expect(
+      codexBackfillBusyStartupLine('Error: timed out waiting for state db backfill at /home/me/.codex after 30s (status: complete)'),
+    ).toBe(
+      false,
+    );
   });
 
   afterEach(() => {
