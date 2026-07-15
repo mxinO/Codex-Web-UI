@@ -41,6 +41,7 @@ vi.mock('../../src/hooks/useThreadTimeline', () => ({
     retryScheduled: false,
     hasOlder: false,
     isViewingLatest: true,
+    replacingLatest: false,
     loadOlder: mocks.loadOlder,
     jumpToLatest: mocks.jumpToLatest,
     reload: mocks.reloadTimeline,

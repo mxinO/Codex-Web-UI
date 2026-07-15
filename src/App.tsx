@@ -49,17 +49,16 @@ import {
   isSyntheticPendingTurnId,
   liveTurnItemsFromAccumulator,
   mergeRetainedLiveTurnItems,
-  mergeTimelineItemsByTimestamp,
   nextLiveNotificationWindow,
   notificationCountBeforeTurnStart,
   notificationsSinceCount,
   notificationMatchesActiveTurn,
   pendingUserItemsWithoutHistory,
   requestKey,
+  reconcileTimelineItemsByArrival,
   retargetSyntheticUserItemsToTurn,
   timelineItemsWithLiveTurnOverlay,
   timelineItemsWithRetainedLiveTurnOverlay,
-  timelineItemsWithRetainedTurnTimestamps,
   visibleRetainedLiveTurnItemsForTimeline,
   visibleLiveTurnItemsForTimeline,
   type TimelineItem,
@@ -335,6 +334,7 @@ export default function App() {
   const modelCatalogRequestRef = useRef<Promise<CodexModelOption[]> | null>(null);
   const modelCatalogGenerationRef = useRef(0);
   const runtimeOptionsBusyRef = useRef(false);
+  const latestChatOrderRef = useRef<{ threadId: string | null; items: TimelineItem[] }>({ threadId: null, items: [] });
   const runtimeStatusScopeRef = useRef<RuntimeStatusScope>({
     threadId: activeThreadId,
     threadPath: activeThreadPath,
@@ -479,10 +479,6 @@ export default function App() {
     () => timelineItemsWithRetainedLiveTurnOverlay(timelineItemsForChat, retainedOverlayItems),
     [retainedOverlayItems, timelineItemsForChat],
   );
-  const retainedLiveTurnItemsForChat = useMemo(
-    () => timelineItemsWithRetainedTurnTimestamps(timelineItemsForChat, retainedLiveTurnItems),
-    [retainedLiveTurnItems, timelineItemsForChat],
-  );
   const latestCompletionCount = useMemo(
     () =>
       latestCompletionNotificationCount(socket.notifications, socket.notificationCount, {
@@ -496,8 +492,8 @@ export default function App() {
     [liveTurnItems, state?.activeTurnId, timelineItemsForChatWithRetainedOverlay],
   );
   const visibleRetainedLiveTurnItems = useMemo(
-    () => visibleRetainedLiveTurnItemsForTimeline(timelineItemsForChatWithRetainedOverlay, visibleLiveTurnItems, retainedLiveTurnItemsForChat),
-    [retainedLiveTurnItemsForChat, timelineItemsForChatWithRetainedOverlay, visibleLiveTurnItems],
+    () => visibleRetainedLiveTurnItemsForTimeline(timelineItemsForChatWithRetainedOverlay, visibleLiveTurnItems, retainedLiveTurnItems),
+    [retainedLiveTurnItems, timelineItemsForChatWithRetainedOverlay, visibleLiveTurnItems],
   );
   const historyFileSummaryTurnIds = useMemo(
     () =>
@@ -512,10 +508,6 @@ export default function App() {
     () => retainedFileSummaryItems.filter((item) => !historyFileSummaryTurnIds.has(item.turnId)),
     [historyFileSummaryTurnIds, retainedFileSummaryItems],
   );
-  const visibleRetainedFileSummaryItemsForChat = useMemo(
-    () => timelineItemsWithRetainedTurnTimestamps(timelineItemsForChat, visibleRetainedFileSummaryItems),
-    [timelineItemsForChat, visibleRetainedFileSummaryItems],
-  );
   const approvalItems = useMemo(
     () =>
       approvalItemsFromRequests(socket.requests, answeredApprovals).map((item) => ({
@@ -524,19 +516,45 @@ export default function App() {
       })),
     [answeredApprovals, localSortOrder, socket.requests],
   );
-  const chatItems = useMemo<TimelineItem[]>(() => {
-    if (!timeline.isViewingLatest) return timeline.items;
-    return mergeTimelineItemsByTimestamp([
+  const visiblePendingUserItems = useMemo(
+    () => pendingUserItemsWithoutHistory(timeline.items, retargetSyntheticUserItemsToTurn(pendingUserItems, state?.activeTurnId)),
+    [pendingUserItems, state?.activeTurnId, timeline.items],
+  );
+  const visibleClaimedQueuedUserItems = useMemo(
+    () => claimedQueuedUserItemsWithoutHistory(timeline.items, retargetSyntheticUserItemsToTurn(claimedQueuedUserItems, state?.activeTurnId)),
+    [claimedQueuedUserItems, state?.activeTurnId, timeline.items],
+  );
+  const chatCandidates = useMemo<TimelineItem[]>(
+    () => [
       ...timelineItemsForChatWithRetainedOverlay,
       ...visibleRetainedLiveTurnItems,
-      ...visibleRetainedFileSummaryItemsForChat,
-      ...pendingUserItems,
-      ...claimedQueuedUserItems,
+      ...visibleRetainedFileSummaryItems,
+      ...visiblePendingUserItems,
+      ...visibleClaimedQueuedUserItems,
       ...ephemeralItems,
       ...visibleLiveTurnItems,
       ...approvalItems,
-    ]);
-  }, [approvalItems, claimedQueuedUserItems, ephemeralItems, pendingUserItems, timeline.isViewingLatest, timeline.items, timelineItemsForChatWithRetainedOverlay, visibleLiveTurnItems, visibleRetainedFileSummaryItemsForChat, visibleRetainedLiveTurnItems]);
+    ],
+    [
+      approvalItems,
+      ephemeralItems,
+      timelineItemsForChatWithRetainedOverlay,
+      visibleClaimedQueuedUserItems,
+      visibleLiveTurnItems,
+      visiblePendingUserItems,
+      visibleRetainedFileSummaryItems,
+      visibleRetainedLiveTurnItems,
+    ],
+  );
+  const chatItems = useMemo<TimelineItem[]>(() => {
+    if (!timeline.isViewingLatest || timeline.replacingLatest) return timeline.items;
+    const previousItems = latestChatOrderRef.current.threadId === activeThreadId ? latestChatOrderRef.current.items : [];
+    return reconcileTimelineItemsByArrival(previousItems, chatCandidates);
+  }, [activeThreadId, chatCandidates, timeline.isViewingLatest, timeline.items, timeline.replacingLatest]);
+  useLayoutEffect(() => {
+    if (!timeline.isViewingLatest || timeline.replacingLatest) return;
+    latestChatOrderRef.current = { threadId: activeThreadId, items: chatItems };
+  }, [activeThreadId, chatItems, timeline.isViewingLatest, timeline.replacingLatest]);
   const serverModel = sanitizeStoredModel(state?.model ?? null);
   const serverEffort = sanitizeStoredEffort(state?.effort ?? null);
   const serverMode = sanitizeStoredMode(state?.mode ?? null);
@@ -974,8 +992,11 @@ export default function App() {
   }, [activeThreadId, lastNotification, loadActiveFileSummary, state?.activeTurnId]);
 
   useEffect(() => {
-    setPendingUserItems((items) => pendingUserItemsWithoutHistory(timeline.items, items));
-  }, [timeline.items]);
+    setPendingUserItems((items) => {
+      const retargeted = retargetSyntheticUserItemsToTurn(items, state?.activeTurnId);
+      return pendingUserItemsWithoutHistory(timeline.items, retargeted);
+    });
+  }, [state?.activeTurnId, timeline.items]);
 
   useEffect(() => {
     if (!activeThreadId || latestCompletionCount === null || !timeline.isViewingLatest) return;
@@ -1222,12 +1243,22 @@ export default function App() {
     const pendingWindow = { id, threadId: activeThreadId, startCount: socket.notificationCount };
     updateRetainedLiveTurnItems(timelineItemsForChat, visibleLiveTurnItems);
     setPendingTurnWindow(pendingWindow);
-    setPendingUserItems((items) => [...items, { id, kind: 'user', timestamp: now, sortOrder: localSortOrder(id), text }]);
+    setPendingUserItems((items) => [
+      ...items,
+      {
+        id,
+        kind: 'user',
+        timestamp: now,
+        sortOrder: localSortOrder(id),
+        text,
+        turnId: state?.activeTurnId ?? `turn-start-pending:${activeThreadId ?? 'unscoped'}`,
+      },
+    ]);
     return () => {
       setPendingUserItems((items) => items.filter((item) => item.id !== id));
       setPendingTurnWindow((current) => (current?.id === pendingWindow.id ? null : current));
     };
-  }, [activeThreadId, localSortOrder, socket.notificationCount, timelineItemsForChat, updateRetainedLiveTurnItems, visibleLiveTurnItems]);
+  }, [activeThreadId, localSortOrder, socket.notificationCount, state?.activeTurnId, timelineItemsForChat, updateRetainedLiveTurnItems, visibleLiveTurnItems]);
 
   const addDirectSubmitError = useCallback((_: string, error: string) => {
     const id = `direct-submit-error:${Date.now()}:${(ephemeralCounterRef.current += 1)}`;

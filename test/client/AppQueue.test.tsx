@@ -18,7 +18,7 @@ const mocks = vi.hoisted(() => ({
   acknowledgeReplayGap: vi.fn(),
   submitToken: vi.fn(),
   queue: [] as Array<{ id: string; text: string; createdAt: number }>,
-  timelineItems: [] as Array<{ id: string; kind: string; timestamp: number; text?: string }>,
+  timelineItems: [] as Array<{ id: string; kind: string; timestamp: number; text?: string; turnId?: string }>,
   notifications: [] as unknown[],
   notificationCount: 0,
   requests: [] as unknown[],
@@ -30,6 +30,7 @@ const mocks = vi.hoisted(() => ({
   reconnectEpoch: 0,
   replayGapEpoch: 0,
   timelineIsViewingLatest: true,
+  timelineReplacingLatest: false,
   runtimeModel: 'gpt-5.4' as string | null,
   runtimeEffort: 'high' as string | null,
   runtimeMode: null as string | null,
@@ -70,6 +71,7 @@ vi.mock('../../src/hooks/useThreadTimeline', () => ({
     retryScheduled: false,
     hasOlder: false,
     isViewingLatest: mocks.timelineIsViewingLatest,
+    replacingLatest: mocks.timelineReplacingLatest,
     loadOlder: mocks.loadOlder,
     jumpToLatest: mocks.jumpToLatest,
     reload: mocks.reloadTimeline,
@@ -191,6 +193,7 @@ describe('App queued message tray', () => {
     mocks.reloadTimeline.mockReset().mockResolvedValue(true);
     mocks.acknowledgeReplayGap.mockReset();
     mocks.timelineIsViewingLatest = true;
+    mocks.timelineReplacingLatest = false;
     mocks.runtimeModel = 'gpt-5.4';
     mocks.runtimeEffort = 'high';
     mocks.runtimeMode = null;
@@ -370,6 +373,95 @@ describe('App queued message tray', () => {
       'already-visible',
       'claimed-queued:user:q1',
     ]);
+  });
+
+  it('does not pin a claimed mid-turn prompt below later persisted replies', async () => {
+    const queued = { id: 'q1', text: 'steered prompt', createdAt: 1000 };
+    mocks.queue = [queued];
+    mocks.stateQueue = [queued];
+    mocks.timelineItems = [
+      { id: 'turn-1:before', kind: 'assistant', timestamp: 1000, text: 'Before', turnId: 'turn-1' },
+    ];
+    renderApp();
+    await flushReact();
+
+    mocks.queue = [];
+    mocks.stateQueue = [];
+    rerenderApp();
+    await flushReact();
+
+    mocks.timelineItems = [
+      { id: 'turn-1:before', kind: 'assistant', timestamp: 1000, text: 'Before', turnId: 'turn-1' },
+      { id: 'turn-1:after', kind: 'assistant', timestamp: 1000, text: 'After', turnId: 'turn-1' },
+    ];
+    rerenderApp();
+    await flushReact();
+    expect(mocks.chatTimelineItems.map((item) => item.id)).toEqual([
+      'turn-1:before',
+      'claimed-queued:user:q1',
+      'turn-1:after',
+    ]);
+
+    mocks.timelineItems = [
+      { id: 'turn-1:before', kind: 'assistant', timestamp: 1000, text: 'Before', turnId: 'turn-1' },
+      { id: 'turn-1:user', kind: 'user', timestamp: 1000, text: 'steered prompt', turnId: 'turn-1' },
+      { id: 'turn-1:after', kind: 'assistant', timestamp: 1000, text: 'After', turnId: 'turn-1' },
+    ];
+    rerenderApp();
+    await flushReact();
+    expect(mocks.chatTimelineItems.map((item) => item.id)).toEqual([
+      'turn-1:before',
+      'turn-1:user',
+      'turn-1:after',
+    ]);
+  });
+
+  it('does not let an in-flight latest-page replacement overwrite remembered order', async () => {
+    mocks.timelineItems = [
+      { id: 'first', kind: 'user', timestamp: 2000, text: 'first' },
+      { id: 'second', kind: 'user', timestamp: 1000, text: 'second' },
+    ];
+    renderApp();
+    await flushReact();
+
+    mocks.timelineReplacingLatest = true;
+    mocks.timelineItems = [
+      { id: 'second', kind: 'user', timestamp: 1000, text: 'second' },
+      { id: 'first', kind: 'user', timestamp: 2000, text: 'first' },
+    ];
+    rerenderApp();
+    await flushReact();
+
+    mocks.timelineReplacingLatest = false;
+    mocks.timelineItems = [
+      { id: 'first', kind: 'user', timestamp: 2000, text: 'first' },
+      { id: 'second', kind: 'user', timestamp: 1000, text: 'second' },
+      { id: 'third', kind: 'user', timestamp: 500, text: 'third' },
+    ];
+    rerenderApp();
+    await flushReact();
+
+    expect(mocks.chatTimelineItems.map((item) => item.id)).toEqual(['first', 'second', 'third']);
+  });
+
+  it('seeds a new thread from its own order when item ids are reused', async () => {
+    mocks.timelineItems = [
+      { id: 'same-a', kind: 'user', timestamp: 1000, text: 'A' },
+      { id: 'same-b', kind: 'user', timestamp: 2000, text: 'B' },
+    ];
+    renderApp();
+    await flushReact();
+
+    mocks.activeThreadId = 'thread-2';
+    mocks.activeThreadPath = '/rollouts/thread-2.jsonl';
+    mocks.timelineItems = [
+      { id: 'same-b', kind: 'user', timestamp: 2000, text: 'B' },
+      { id: 'same-a', kind: 'user', timestamp: 1000, text: 'A' },
+    ];
+    rerenderApp();
+    await flushReact();
+
+    expect(mocks.chatTimelineItems.map((item) => item.id)).toEqual(['same-b', 'same-a']);
   });
 
   it('returns canceled queued message text to the composer', async () => {

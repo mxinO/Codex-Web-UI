@@ -1349,7 +1349,15 @@ describe('useThreadTimeline', () => {
     await act(async () => {
       currentTimeline?.jumpToLatest();
     });
-    expect((currentTimeline as HookResult & { isViewingLatest?: boolean })?.isViewingLatest).toBe(true);
+    expect(currentTimeline?.isViewingLatest).toBe(true);
+    expect(currentTimeline?.replacingLatest).toBe(true);
+    let overlappingReloadResult: boolean | undefined;
+    await act(async () => {
+      overlappingReloadResult = await currentTimeline?.reload();
+    });
+    expect(overlappingReloadResult).toBe(false);
+    expect(rpc).toHaveBeenCalledTimes(3);
+    expect(currentTimeline?.replacingLatest).toBe(true);
     expect(rpc).toHaveBeenLastCalledWith('thread/turns/list', {
       threadId: 'thread-1',
       limit: 12,
@@ -1363,7 +1371,41 @@ describe('useThreadTimeline', () => {
 
     expect(currentTimeline?.items.map((item) => item.kind === 'assistant' ? item.text : '')).toEqual(['latest-restored']);
     expect(currentTimeline?.hasOlder).toBe(true);
-    expect((currentTimeline as HookResult & { isViewingLatest?: boolean })?.isViewingLatest).toBe(true);
+    expect(currentTimeline?.isViewingLatest).toBe(true);
+    expect(currentTimeline?.replacingLatest).toBe(false);
+  });
+
+  it('returns to older-history mode when a latest-page replacement fails', async () => {
+    const latest = deferred<RpcResult>();
+    const older = deferred<RpcResult>();
+    const failedLatest = deferred<RpcResult>();
+    const rpc = vi.fn().mockReturnValueOnce(latest.promise).mockReturnValueOnce(older.promise).mockReturnValueOnce(failedLatest.promise);
+
+    await renderHook('thread-1', asRpc(rpc));
+    await act(async () => {
+      latest.resolve({ data: [makeTurn('latest-initial')], nextCursor: 'cursor-1' });
+      await latest.promise;
+    });
+    await act(async () => {
+      currentTimeline?.loadOlder();
+    });
+    await act(async () => {
+      older.resolve({ data: [makeTurn('older-page')], nextCursor: null });
+      await older.promise;
+    });
+
+    await act(async () => {
+      currentTimeline?.jumpToLatest();
+    });
+    expect(currentTimeline?.replacingLatest).toBe(true);
+    await act(async () => {
+      failedLatest.reject(new Error('network lag'));
+      await failedLatest.promise.catch(() => undefined);
+    });
+
+    expect(currentTimeline?.items.map(itemText)).toEqual(['older-page', 'latest-initial']);
+    expect(currentTimeline?.isViewingLatest).toBe(false);
+    expect(currentTimeline?.replacingLatest).toBe(false);
   });
 
   it('stale request for old thread does not overwrite current thread items', async () => {

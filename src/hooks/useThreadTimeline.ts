@@ -407,6 +407,7 @@ export function useThreadTimeline(
   const activeThreadRef = useRef(activeThreadId);
   const activeThreadPathRef = useRef(activeThreadPath);
   const isViewingLatestRef = useRef(true);
+  const replacingLatestRef = useRef(false);
   const requestGenerationRef = useRef(0);
   const initialRetryTimerRef = useRef<number | null>(null);
   const initialRetryAttemptRef = useRef(0);
@@ -417,6 +418,7 @@ export function useThreadTimeline(
   const [loadError, setLoadError] = useState<string | null>(null);
   const [retryScheduled, setRetryScheduled] = useState(false);
   const [isViewingLatest, setIsViewingLatest] = useState(true);
+  const [replacingLatest, setReplacingLatest] = useState(false);
   activeThreadRef.current = activeThreadId;
   activeThreadPathRef.current = activeThreadPath;
   isViewingLatestRef.current = isViewingLatest;
@@ -450,6 +452,7 @@ export function useThreadTimeline(
 
   const fetchLatest = useCallback(async (mode: 'merge' | 'replace') => {
     if (!activeThreadId) return false;
+    if (mode === 'merge' && replacingLatestRef.current) return false;
     const threadId = activeThreadId;
     const generation = ++requestGenerationRef.current;
 
@@ -457,7 +460,11 @@ export function useThreadTimeline(
     setLoading(true);
     setLoadError(null);
     setRetryScheduled(false);
-    if (mode === 'replace') setIsViewingLatest(true);
+    if (mode === 'replace') {
+      replacingLatestRef.current = true;
+      setIsViewingLatest(true);
+      setReplacingLatest(true);
+    }
     try {
       const result = await fetchLatestPage(threadId);
       if (!isCurrentRequest(threadId, generation)) return false;
@@ -471,10 +478,17 @@ export function useThreadTimeline(
     } catch (error) {
       if (!isCurrentRequest(threadId, generation)) return false;
       setLoadError(errorMessage(error));
+      if (mode === 'replace') setIsViewingLatest(false);
       // Keep the last successfully rendered timeline during transient transport or app-server failures.
       return false;
     } finally {
-      if (isCurrentRequest(threadId, generation)) setLoading(false);
+      if (isCurrentRequest(threadId, generation)) {
+        setLoading(false);
+        if (mode === 'replace') {
+          replacingLatestRef.current = false;
+          setReplacingLatest(false);
+        }
+      }
     }
   }, [activeThreadId, clearInitialRetryTimer, fetchLatestPage, isCurrentRequest]);
 
@@ -519,6 +533,8 @@ export function useThreadTimeline(
     setLoadError(null);
     setRetryScheduled(false);
     setIsViewingLatest(true);
+    replacingLatestRef.current = false;
+    setReplacingLatest(false);
 
     if (!threadId) {
       setLoading(false);
@@ -579,5 +595,6 @@ export function useThreadTimeline(
     reload,
     jumpToLatest,
     isViewingLatest,
+    replacingLatest,
   };
 }

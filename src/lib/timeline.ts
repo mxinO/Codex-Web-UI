@@ -434,61 +434,138 @@ export function trimTimelineWindow<T>(items: T[], limit: number): T[] {
   return items.length <= limit ? items : items.slice(items.length - limit);
 }
 
-function reorderOrderedSlots(items: TimelineItem[]): TimelineItem[] {
-  const orderedSlots: number[] = [];
-  const orderedItems: Array<{ item: TimelineItem; index: number; order: number }> = [];
-  items.forEach((item, index) => {
-    if (typeof item.sortOrder !== 'number' || !Number.isFinite(item.sortOrder)) return;
-    orderedSlots.push(index);
-    orderedItems.push({ item, index, order: item.sortOrder });
-  });
-  if (orderedItems.length < 2) return items;
-
-  orderedItems.sort((a, b) => a.order - b.order || a.index - b.index);
-  const reordered = [...items];
-  orderedSlots.forEach((slot, index) => {
-    reordered[slot] = orderedItems[index].item;
-  });
-  return reordered;
+function itemWithoutOrderingMetadata(item: TimelineItem): unknown {
+  const { timestamp: _timestamp, sortOrder: _sortOrder, ...content } = item;
+  return content;
 }
 
-function reorderTimelineSubsequences(
-  items: TimelineItem[],
-  keyForItem: (item: TimelineItem) => string | number | null,
-  reorder: (items: TimelineItem[]) => TimelineItem[],
-): TimelineItem[] {
-  const positionsByKey = new Map<string | number, number[]>();
+function occurrenceContentKey(item: TimelineItem): string {
+  return JSON.stringify(itemWithoutOrderingMetadata(item));
+}
+
+function syntheticUserMatchesPersisted(previous: Extract<TimelineItem, { kind: 'user' }>, candidate: TimelineItem): boolean {
+  if (candidate.kind !== 'user' || candidate.text.trim() !== previous.text.trim()) return false;
+  if (!previous.id.startsWith('claimed-queued:user:') && !previous.id.startsWith('pending:user:')) return false;
+  if (previous.turnId && !isSyntheticPendingTurnId(previous.turnId)) return candidate.turnId === previous.turnId;
+  return Boolean(candidate.turnId);
+}
+
+function liveAssistantMatchesPersisted(
+  previous: Extract<TimelineItem, { kind: 'assistant' | 'streaming' }>,
+  candidate: TimelineItem,
+): boolean {
+  const isLive = previous.kind === 'streaming' || previous.id.startsWith('live:') || Boolean(previous.liveSource);
+  if (!isLive || candidate.kind !== 'assistant') return false;
+  const previousTurnId = timelineItemTurnId(previous);
+  const candidateTurnId = timelineItemTurnId(candidate);
+  if (previousTurnId && candidateTurnId !== previousTurnId) return false;
+  if (previous.kind === 'streaming' && !previous.active && !previous.sourceId && isFinalAssistantTimelineItem(candidate)) return true;
+  return messageLikelyCovers(previous.text, candidate.text) || messageLikelyCovers(candidate.text, previous.text);
+}
+
+function isSemanticReplacement(previous: TimelineItem, candidate: TimelineItem): boolean {
+  if (previous.kind === 'user') return syntheticUserMatchesPersisted(previous, candidate);
+  if (previous.kind === 'assistant' || previous.kind === 'streaming') return liveAssistantMatchesPersisted(previous, candidate);
+  return false;
+}
+
+function orderingTurnId(item: TimelineItem): string | null {
+  if ('turnId' in item && typeof item.turnId === 'string' && item.turnId) return item.turnId;
+  return null;
+}
+
+function initialTimelineOrder(items: TimelineItem[]): TimelineItem[] {
+  const itemsByTurn = new Map<string, TimelineItem[]>();
+  const turnOrder: string[] = [];
+  const scopedPositions: number[] = [];
   items.forEach((item, index) => {
-    const key = keyForItem(item);
-    if (key === null) return;
-    const positions = positionsByKey.get(key);
-    if (positions) positions.push(index);
-    else positionsByKey.set(key, [index]);
+    const turnId = orderingTurnId(item);
+    if (!turnId) return;
+    scopedPositions.push(index);
+    const turnItems = itemsByTurn.get(turnId);
+    if (turnItems) turnItems.push(item);
+    else {
+      itemsByTurn.set(turnId, [item]);
+      turnOrder.push(turnId);
+    }
   });
 
-  const reordered = [...items];
-  for (const positions of positionsByKey.values()) {
-    const subsequence = reorder(positions.map((position) => reordered[position]));
-    positions.forEach((position, index) => {
-      reordered[position] = subsequence[index];
+  const orderedScopedItems = turnOrder.flatMap((turnId) => finalAssistantAfterLaterActivity(itemsByTurn.get(turnId) ?? []));
+  const ordered = [...items];
+  scopedPositions.forEach((position, index) => {
+    ordered[position] = orderedScopedItems[index];
+  });
+  return ordered;
+}
+
+export function reconcileTimelineItemsByArrival(previousItems: TimelineItem[], candidateItems: TimelineItem[]): TimelineItem[] {
+  if (previousItems.length === 0) return initialTimelineOrder(candidateItems);
+  if (candidateItems.length === 0) return [];
+
+  const matches = new Map<number, number>();
+  const consumedCandidates = new Set<number>();
+  const matchRemainingByKey = (keyForItem: (item: TimelineItem) => string | null) => {
+    const candidatesByKey = new Map<string, { indexes: number[]; offset: number }>();
+    candidateItems.forEach((candidate, candidateIndex) => {
+      if (consumedCandidates.has(candidateIndex)) return;
+      const key = keyForItem(candidate);
+      if (key === null) return;
+      const entries = candidatesByKey.get(key);
+      if (entries) entries.indexes.push(candidateIndex);
+      else candidatesByKey.set(key, { indexes: [candidateIndex], offset: 0 });
     });
-  }
-  return reordered;
-}
+    previousItems.forEach((previous, previousIndex) => {
+      if (matches.has(previousIndex)) return;
+      const key = keyForItem(previous);
+      if (key === null) return;
+      const entries = candidatesByKey.get(key);
+      if (!entries || entries.offset >= entries.indexes.length) return;
+      const candidateIndex = entries.indexes[entries.offset];
+      entries.offset += 1;
+      matches.set(previousIndex, candidateIndex);
+      consumedCandidates.add(candidateIndex);
+    });
+  };
 
-export function mergeTimelineItemsByTimestamp(items: TimelineItem[]): TimelineItem[] {
-  const byTimestamp = items
-    .map((item, index) => ({ item, index }))
-    .sort((a, b) => (Number.isFinite(a.item.timestamp) ? a.item.timestamp : 0) - (Number.isFinite(b.item.timestamp) ? b.item.timestamp : 0) || a.index - b.index)
-    .map(({ item }) => item);
-  const withTimestampTiesOrdered = reorderTimelineSubsequences(
-    byTimestamp,
-    (item) => (Number.isFinite(item.timestamp) ? item.timestamp : 0),
-    reorderOrderedSlots,
+  const idKindCounts = new Map<string, number>();
+  for (const item of [...previousItems, ...candidateItems]) {
+    const key = `${item.id}\0${item.kind}`;
+    idKindCounts.set(key, (idKindCounts.get(key) ?? 0) + 1);
+  }
+  matchRemainingByKey(
+    (item) => {
+      const idKind = `${item.id}\0${item.kind}`;
+      return (idKindCounts.get(idKind) ?? 0) > 2 ? `${idKind}\0${occurrenceContentKey(item)}` : null;
+    },
   );
-  return reorderTimelineSubsequences(withTimestampTiesOrdered, timelineItemTurnId, (turnItems) =>
-    finalAssistantAfterLaterActivity(reorderOrderedSlots(turnItems)),
-  );
+  matchRemainingByKey((item) => `${item.id}\0${item.kind}`);
+  matchRemainingByKey((item) => item.id);
+  previousItems.forEach((previous, previousIndex) => {
+    if (matches.has(previousIndex)) return;
+    let candidateIndex = -1;
+    const start = previous.kind === 'user' ? candidateItems.length - 1 : 0;
+    const end = previous.kind === 'user' ? -1 : candidateItems.length;
+    const step = previous.kind === 'user' ? -1 : 1;
+    for (let index = start; index !== end; index += step) {
+      if (!consumedCandidates.has(index) && isSemanticReplacement(previous, candidateItems[index])) {
+        candidateIndex = index;
+        break;
+      }
+    }
+    if (candidateIndex < 0) return;
+    matches.set(previousIndex, candidateIndex);
+    consumedCandidates.add(candidateIndex);
+  });
+
+  const reconciled: TimelineItem[] = [];
+  previousItems.forEach((_, previousIndex) => {
+    const candidateIndex = matches.get(previousIndex);
+    if (candidateIndex !== undefined) reconciled.push(candidateItems[candidateIndex]);
+  });
+  candidateItems.forEach((candidate, index) => {
+    if (!consumedCandidates.has(index)) reconciled.push(candidate);
+  });
+  return reconciled;
 }
 
 export function timelineItemTurnId(item: TimelineItem): string | null {
@@ -1321,31 +1398,6 @@ export function timelineItemsWithRetainedLiveTurnOverlay(historyItems: TimelineI
   return changed ? filtered : historyItems;
 }
 
-export function timelineItemsWithRetainedTurnTimestamps<T extends TimelineItem>(historyItems: TimelineItem[], retainedItems: T[]): T[] {
-  const orderSensitiveTurnIds = retainedActivityTurnIdsMissingFromHistory(historyItems, retainedItems);
-  if (orderSensitiveTurnIds.size === 0) return retainedItems;
-
-  const historyTimestampsByTurn = new Map<string, number>();
-  for (const item of historyItems) {
-    const turnId = timelineItemTurnId(item);
-    if (!turnId || !orderSensitiveTurnIds.has(turnId)) continue;
-    const timestamp = Number.isFinite(item.timestamp) ? item.timestamp : 0;
-    const current = historyTimestampsByTurn.get(turnId);
-    if (current === undefined || timestamp < current) historyTimestampsByTurn.set(turnId, timestamp);
-  }
-
-  let changed = false;
-  const normalized = retainedItems.map((item) => {
-    const turnId = timelineItemTurnId(item);
-    const timestamp = turnId ? historyTimestampsByTurn.get(turnId) : undefined;
-    if (timestamp === undefined || item.timestamp === timestamp) return item;
-    changed = true;
-    return { ...item, timestamp };
-  });
-
-  return changed ? normalized : retainedItems;
-}
-
 export function visibleRetainedLiveTurnItemsForTimeline(
   historyItems: TimelineItem[],
   currentLiveItems: TimelineItem[],
@@ -1363,7 +1415,10 @@ export function pendingUserItemsWithoutHistory<T extends Extract<TimelineItem, {
   return pendingItems.filter(
     (pending) =>
       !historyItems.some(
-        (item) => item.kind === 'user' && item.text.trim() === pending.text.trim() && item.timestamp >= pending.timestamp - 60_000,
+        (item) =>
+          item.kind === 'user' &&
+          item.text.trim() === pending.text.trim() &&
+          Boolean(pending.turnId && !isSyntheticPendingTurnId(pending.turnId) && item.turnId === pending.turnId),
       ),
   );
 }
@@ -1375,7 +1430,7 @@ export function claimedQueuedUserItemsWithoutHistory<T extends Extract<TimelineI
         (item) =>
           item.kind === 'user' &&
           item.text.trim() === pending.text.trim() &&
-          ((pending.turnId && item.turnId === pending.turnId) || item.timestamp >= pending.timestamp),
+          Boolean(pending.turnId && !isSyntheticPendingTurnId(pending.turnId) && item.turnId === pending.turnId),
       ),
   );
   return visible.length > CLAIMED_QUEUED_USER_ITEM_LIMIT ? visible.slice(-CLAIMED_QUEUED_USER_ITEM_LIMIT) : visible;

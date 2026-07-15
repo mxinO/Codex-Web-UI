@@ -7,7 +7,7 @@ import {
   createLiveTurnAccumulator,
   liveStreamingItemFromNotifications,
   mergeRetainedLiveTurnItems,
-  mergeTimelineItemsByTimestamp,
+  reconcileTimelineItemsByArrival,
   nextLiveNotificationWindow,
   notificationCountBeforeTurnStart,
   notificationsSinceCount,
@@ -25,7 +25,6 @@ import {
   shouldShowLiveStreamingItem,
   timelineItemsWithLiveTurnOverlay,
   timelineItemsWithRetainedLiveTurnOverlay,
-  timelineItemsWithRetainedTurnTimestamps,
   withTimelineNotificationMeta,
   turnToTimelineItems,
   trimTimelineWindow,
@@ -290,7 +289,7 @@ describe('timeline', () => {
     expect(trimmed[0].id).toBe('5');
   });
 
-  it('merges ephemeral bang output by timestamp instead of pinning it to the bottom', () => {
+  it('preserves candidate order without consulting timestamps or sortOrder', () => {
     const bang: TimelineItem = {
       id: 'bang:1000:1',
       kind: 'bangCommand',
@@ -304,42 +303,91 @@ describe('timeline', () => {
     const user: TimelineItem = { id: 'u1', kind: 'user', timestamp: 2000, text: 'next prompt' };
     const assistant: TimelineItem = { id: 'a1', kind: 'assistant', timestamp: 2000, text: 'reply', phase: null };
 
-    expect(mergeTimelineItemsByTimestamp([user, assistant, bang]).map((item) => item.id)).toEqual(['bang:1000:1', 'u1', 'a1']);
+    expect(reconcileTimelineItemsByArrival([], [user, assistant, bang]).map((item) => item.id)).toEqual([
+      'u1',
+      'a1',
+      'bang:1000:1',
+    ]);
   });
 
-  it('uses sortOrder to break same-timestamp ties for mixed live and client items', () => {
-    const live: TimelineItem = { id: 'live-1', kind: 'assistant', timestamp: 1000, sortOrder: 10, text: 'live first', phase: 'commentary', turnId: 'turn-1' };
+  it('keeps existing rows in place and appends newly observed candidates', () => {
+    const reply: TimelineItem = { id: 'reply', kind: 'assistant', timestamp: 1000, text: 'reply', phase: 'commentary' };
     const bang: TimelineItem = {
       id: 'bang-1',
       kind: 'bangCommand',
-      timestamp: 1000,
-      sortOrder: 11,
+      timestamp: 2000,
       command: 'pwd',
       cwd: '/repo',
       output: '/repo\n',
       status: 'completed',
       exitCode: 0,
     };
-    const queued: TimelineItem = { id: 'queued-1', kind: 'queued', timestamp: 1000, sortOrder: 12, message: { id: 'q1', text: 'next', createdAt: 1000 } };
+    const persistedLater: TimelineItem = { id: 'persisted-later', kind: 'assistant', timestamp: 1000, text: 'later', phase: null };
 
-    expect(mergeTimelineItemsByTimestamp([queued, bang, live]).map((item) => item.id)).toEqual(['live-1', 'bang-1', 'queued-1']);
+    expect(reconcileTimelineItemsByArrival([reply, bang], [reply, persistedLater, bang]).map((item) => item.id)).toEqual([
+      'reply',
+      'bang-1',
+      'persisted-later',
+    ]);
   });
 
-  it('uses notification sortOrder before timestamps inside the same turn', () => {
-    const first: TimelineItem = {
-      id: 'turn-1:a1',
-      kind: 'assistant',
-      timestamp: 5000,
-      sortOrder: 1,
-      text: 'I will inspect that.',
-      phase: 'commentary',
-      turnId: 'turn-1',
+  it('updates a same-id row without moving it past later rows', () => {
+    const streaming: TimelineItem = { id: 'message-1', kind: 'streaming', timestamp: 1000, text: 'Hel', active: true, turnId: 'turn-1' };
+    const later: TimelineItem = { id: 'tool-1', kind: 'notice', timestamp: 2000, text: 'Working', turnId: 'turn-1' };
+    const updated: TimelineItem = { ...streaming, text: 'Hello' };
+
+    expect(reconcileTimelineItemsByArrival([streaming, later], [later, updated])).toEqual([updated, later]);
+  });
+
+  it('updates a same-id kind transition without moving it past later rows', () => {
+    const streaming: TimelineItem = { id: 'message-1', kind: 'streaming', timestamp: 1000, text: 'Done', active: false, turnId: 'turn-1' };
+    const later: TimelineItem = { id: 'tool-1', kind: 'notice', timestamp: 2000, text: 'Working', turnId: 'turn-1' };
+    const final: TimelineItem = { id: 'message-1', kind: 'assistant', timestamp: 3000, text: 'Done', phase: 'final_answer', turnId: 'turn-1' };
+
+    expect(reconcileTimelineItemsByArrival([streaming, later], [later, final])).toEqual([final, later]);
+  });
+
+  it('matches duplicate ids by occurrence content before removing a stale copy', () => {
+    const first: TimelineItem = { id: 'turn-1:a1', kind: 'assistant', timestamp: 1000, text: 'first', phase: null, turnId: 'turn-1' };
+    const anchor: TimelineItem = { id: 'turn-1:tool', kind: 'notice', timestamp: 1000, text: 'anchor', turnId: 'turn-1' };
+    const second: TimelineItem = { id: 'turn-1:a1', kind: 'assistant', timestamp: 1000, text: 'second', phase: null, turnId: 'turn-1' };
+
+    expect(reconcileTimelineItemsByArrival([first, anchor, second], [second, anchor])).toEqual([anchor, second]);
+  });
+
+  it('keeps a synthetic user slot when persisted history changes its id', () => {
+    const pending: TimelineItem = {
+      id: 'pending:user:1',
+      kind: 'user',
+      timestamp: 2000,
+      text: 'question',
+      turnId: 'turn-start-pending:thread-1',
     };
-    const second: TimelineItem = {
+    const later: TimelineItem = { id: 'live:later', kind: 'assistant', timestamp: 3000, text: 'answer', phase: null, turnId: 'turn-2' };
+    const persisted: TimelineItem = { id: 'turn-2:user', kind: 'user', timestamp: 0, text: 'question', turnId: 'turn-2' };
+
+    expect(reconcileTimelineItemsByArrival([pending, later], [later, persisted])).toEqual([persisted, later]);
+  });
+
+  it('removes a real-turn pending user when matching history has an unrelated timestamp', () => {
+    const pending: Extract<TimelineItem, { kind: 'user' }> = {
+      id: 'pending:user:1',
+      kind: 'user',
+      timestamp: 50_000,
+      text: 'question',
+      turnId: 'turn-2',
+    };
+    const persisted: TimelineItem = { id: 'turn-2:user', kind: 'user', timestamp: 0, text: 'question', turnId: 'turn-2' };
+
+    expect(pendingUserItemsWithoutHistory([persisted], [pending])).toEqual([]);
+  });
+
+  it('keeps a source-less live assistant slot when persisted history changes its id', () => {
+    const live: TimelineItem = { id: 'live:assistant:turn-1:1', kind: 'assistant', timestamp: 1000, text: 'Done.', phase: null, turnId: 'turn-1' };
+    const command: TimelineItem = {
       id: 'turn-1:cmd-1',
       kind: 'command',
-      timestamp: 1000,
-      sortOrder: 2,
+      timestamp: 2000,
       command: 'pwd',
       cwd: '/repo',
       output: '/repo\n',
@@ -347,29 +395,64 @@ describe('timeline', () => {
       exitCode: 0,
       turnId: 'turn-1',
     };
+    const persisted: TimelineItem = { id: 'turn-1:persisted', kind: 'assistant', timestamp: 1000, text: 'Done.', phase: null, turnId: 'turn-1' };
 
-    expect(mergeTimelineItemsByTimestamp([second, first]).map((item) => item.id)).toEqual(['turn-1:a1', 'turn-1:cmd-1']);
+    expect(reconcileTimelineItemsByArrival([live, command], [command, persisted])).toEqual([persisted, command]);
   });
 
-  it('preserves persisted user order when retained turn items have sortOrder', () => {
-    const older: TimelineItem[] = Array.from({ length: 20 }, (_, index) => ({
-      id: `old-${index}`,
-      kind: 'user',
-      timestamp: index,
-      text: `old ${index}`,
-    }));
-    const user: TimelineItem = {
-      id: 'turn-1:user',
-      kind: 'user',
+  it('keeps a sourceful live assistant slot when persisted history changes source ids', () => {
+    const live: TimelineItem = {
+      id: 'turn-1:live-source',
+      kind: 'assistant',
       timestamp: 1000,
-      text: 'Question',
+      text: 'Done.',
+      phase: null,
+      turnId: 'turn-1',
+      sourceId: 'live-source',
+      liveSource: 'event_msg',
+    };
+    const later: TimelineItem = { id: 'turn-1:later', kind: 'notice', timestamp: 2000, text: 'later', turnId: 'turn-1' };
+    const persisted: TimelineItem = {
+      id: 'turn-1:persisted-source',
+      kind: 'assistant',
+      timestamp: 0,
+      text: 'Done.',
+      phase: null,
+      turnId: 'turn-1',
+      sourceId: 'persisted-source',
+    };
+
+    expect(reconcileTimelineItemsByArrival([live, later], [later, persisted])).toEqual([persisted, later]);
+  });
+
+  it('keeps an inactive source-less stream slot when a final replaces its partial text', () => {
+    const partial: TimelineItem = {
+      id: 'live:streaming:turn-1:1',
+      kind: 'streaming',
+      timestamp: 1000,
+      text: 'Partial wording',
+      active: false,
       turnId: 'turn-1',
     };
+    const later: TimelineItem = { id: 'turn-1:later', kind: 'notice', timestamp: 2000, text: 'later', turnId: 'turn-1' };
+    const final: TimelineItem = {
+      id: 'turn-1:final',
+      kind: 'assistant',
+      timestamp: 0,
+      text: 'Different final wording.',
+      phase: 'final_answer',
+      turnId: 'turn-1',
+    };
+
+    expect(reconcileTimelineItemsByArrival([partial, later], [later, final])).toEqual([final, later]);
+  });
+
+  it('normalizes same-turn final/activity order only when seeding a timeline', () => {
+    const final: TimelineItem = { id: 'turn-1:final', kind: 'assistant', timestamp: 1000, text: 'Done.', phase: 'final_answer', turnId: 'turn-1' };
     const command: TimelineItem = {
       id: 'turn-1:command',
       kind: 'command',
-      timestamp: 1000,
-      sortOrder: 1,
+      timestamp: 5000,
       command: 'pwd',
       cwd: '/repo',
       output: '/repo\n',
@@ -377,101 +460,27 @@ describe('timeline', () => {
       exitCode: 0,
       turnId: 'turn-1',
     };
-    const final: TimelineItem = {
-      id: 'turn-1:final',
-      kind: 'assistant',
-      timestamp: 1000,
-      sortOrder: 2,
-      text: 'Done.',
-      phase: 'final_answer',
-      turnId: 'turn-1',
+    const bang: TimelineItem = {
+      id: 'bang:1',
+      kind: 'bangCommand',
+      timestamp: 2000,
+      command: 'pwd',
+      cwd: '/repo',
+      output: '/repo\n',
+      status: 'completed',
+      exitCode: 0,
     };
 
-    expect(mergeTimelineItemsByTimestamp([...older, user, command, final]).slice(-3).map((item) => item.id)).toEqual([
-      'turn-1:user',
+    expect(reconcileTimelineItemsByArrival([], [final, bang, command]).map((item) => item.id)).toEqual([
       'turn-1:command',
+      'bang:1',
       'turn-1:final',
     ]);
-  });
-
-  it('sorts ordered timestamp ties without moving an unordered anchor', () => {
-    const later: TimelineItem = { id: 'turn-a:later', kind: 'notice', timestamp: 1000, sortOrder: 2, text: 'later', turnId: 'turn-a' };
-    const anchor: TimelineItem = { id: 'turn-b:anchor', kind: 'notice', timestamp: 1000, text: 'anchor', turnId: 'turn-b' };
-    const earlier: TimelineItem = { id: 'turn-c:earlier', kind: 'notice', timestamp: 1000, sortOrder: 1, text: 'earlier', turnId: 'turn-c' };
-
-    expect(mergeTimelineItemsByTimestamp([later, anchor, earlier]).map((item) => item.id)).toEqual([
-      'turn-c:earlier',
-      'turn-b:anchor',
-      'turn-a:later',
+    expect(reconcileTimelineItemsByArrival([final, bang], [final, bang, command]).map((item) => item.id)).toEqual([
+      'turn-1:final',
+      'bang:1',
+      'turn-1:command',
     ]);
-  });
-
-  it('keeps same-turn activity before a persisted final assistant even when live activity has a later timestamp', () => {
-    const final: TimelineItem = {
-      id: 'turn-1:final',
-      kind: 'assistant',
-      timestamp: 1000,
-      text: 'Done.',
-      phase: 'final_answer',
-      turnId: 'turn-1',
-    };
-    const command: TimelineItem = {
-      id: 'turn-1:cmd-1',
-      kind: 'command',
-      timestamp: 5000,
-      sortOrder: 2,
-      command: 'pwd',
-      cwd: '/repo',
-      output: '/repo\n',
-      status: 'completed',
-      exitCode: 0,
-      turnId: 'turn-1',
-    };
-
-    expect(mergeTimelineItemsByTimestamp([final, command]).map((item) => item.id)).toEqual(['turn-1:cmd-1', 'turn-1:final']);
-  });
-
-  it('keeps same-turn activity before a final assistant when both have sortOrder', () => {
-    const final: TimelineItem = {
-      id: 'turn-1:final',
-      kind: 'assistant',
-      timestamp: 1000,
-      sortOrder: 1,
-      text: 'Done.',
-      phase: 'final_answer',
-      turnId: 'turn-1',
-    };
-    const command: TimelineItem = {
-      id: 'turn-1:cmd-1',
-      kind: 'command',
-      timestamp: 1000,
-      sortOrder: 2,
-      command: 'pwd',
-      cwd: '/repo',
-      output: '/repo\n',
-      status: 'completed',
-      exitCode: 0,
-      turnId: 'turn-1',
-    };
-
-    expect(mergeTimelineItemsByTimestamp([final, command]).map((item) => item.id)).toEqual(['turn-1:cmd-1', 'turn-1:final']);
-  });
-
-  it('does not apply same-turn final/activity ordering to unscoped items', () => {
-    const final: TimelineItem = { id: 'unscoped-final', kind: 'assistant', timestamp: 1000, sortOrder: 1, text: 'Done.', phase: 'final_answer' };
-    const command: TimelineItem = {
-      id: 'unscoped-command',
-      kind: 'command',
-      timestamp: 1000,
-      sortOrder: 2,
-      command: 'pwd',
-      cwd: '/repo',
-      output: '/repo\n',
-      status: 'completed',
-      exitCode: 0,
-    };
-
-    expect(mergeTimelineItemsByTimestamp([command, final]).map((item) => item.id)).toEqual(['unscoped-final', 'unscoped-command']);
   });
 
   it('normalizes malformed arrays and missing item ids defensively', () => {
@@ -1750,7 +1759,7 @@ describe('timeline', () => {
 
     const retained = mergeRetainedLiveTurnItems(staleHistory, [], completedLiveItems);
     const visible = visibleLiveTurnItemsForTimeline([...staleHistory, pendingUser], retained);
-    const merged = mergeTimelineItemsByTimestamp([...staleHistory, ...visible, pendingUser]);
+    const merged = reconcileTimelineItemsByArrival([], [...staleHistory, ...visible, pendingUser]);
 
     expect(merged.map((item) => (item.kind === 'assistant' || item.kind === 'streaming' || item.kind === 'user' ? item.text : item.id))).toEqual([
       'Older persisted answer.',
@@ -1825,7 +1834,7 @@ describe('timeline', () => {
     const retained = mergeRetainedLiveTurnItems(caughtUpHistory, [], completedLiveItems);
     const overlaidHistory = timelineItemsWithRetainedLiveTurnOverlay(caughtUpHistory, retained);
     const visibleRetained = visibleRetainedLiveTurnItemsForTimeline(overlaidHistory, [], retained);
-    const merged = mergeTimelineItemsByTimestamp([...overlaidHistory, ...visibleRetained]);
+    const merged = reconcileTimelineItemsByArrival([], [...overlaidHistory, ...visibleRetained]);
 
     expect(merged.map((item) => (item.kind === 'assistant' || item.kind === 'user' ? item.text : item.id))).toEqual([
       'question',
@@ -1860,6 +1869,7 @@ describe('timeline', () => {
         output: '/repo\n',
         status: 'completed',
         exitCode: 0,
+        turnId: 'turn-1',
       },
       {
         id: 'turn-1:live-final',
@@ -1872,10 +1882,9 @@ describe('timeline', () => {
       },
     ];
 
-    const normalizedRetained = timelineItemsWithRetainedTurnTimestamps(caughtUpHistory, retained);
-    const overlaidHistory = timelineItemsWithRetainedLiveTurnOverlay(caughtUpHistory, normalizedRetained);
-    const visibleRetained = visibleRetainedLiveTurnItemsForTimeline(overlaidHistory, [], normalizedRetained);
-    const merged = mergeTimelineItemsByTimestamp([...overlaidHistory, ...visibleRetained]);
+    const overlaidHistory = timelineItemsWithRetainedLiveTurnOverlay(caughtUpHistory, retained);
+    const visibleRetained = visibleRetainedLiveTurnItemsForTimeline(overlaidHistory, [], retained);
+    const merged = reconcileTimelineItemsByArrival([], [...overlaidHistory, ...visibleRetained]);
 
     expect(merged.map((item) => (item.kind === 'assistant' || item.kind === 'user' ? item.text : item.id))).toEqual([
       'first question',
@@ -1923,10 +1932,9 @@ describe('timeline', () => {
       1000,
     );
 
-    const normalizedRetained = timelineItemsWithRetainedTurnTimestamps(history, retained);
-    const overlaidHistory = timelineItemsWithRetainedLiveTurnOverlay(history, normalizedRetained);
-    const visibleRetained = visibleRetainedLiveTurnItemsForTimeline(overlaidHistory, [], normalizedRetained);
-    const merged = mergeTimelineItemsByTimestamp([...overlaidHistory, ...visibleRetained]);
+    const overlaidHistory = timelineItemsWithRetainedLiveTurnOverlay(history, retained);
+    const visibleRetained = visibleRetainedLiveTurnItemsForTimeline(overlaidHistory, [], retained);
+    const merged = reconcileTimelineItemsByArrival([], [...overlaidHistory, ...visibleRetained]);
 
     expect(merged.map((item) => (item.kind === 'assistant' || item.kind === 'user' ? item.text : item.id))).toEqual([
       'first question',
@@ -1949,8 +1957,7 @@ describe('timeline', () => {
       files: [{ path: '/repo/a.txt', changeCount: 1 }],
     };
 
-    const normalizedSummary = timelineItemsWithRetainedTurnTimestamps(history, [retainedSummary]);
-    const merged = mergeTimelineItemsByTimestamp([...history, ...normalizedSummary]);
+    const merged = reconcileTimelineItemsByArrival([], [...history, retainedSummary]);
 
     expect(merged.map((item) => (item.kind === 'assistant' || item.kind === 'user' ? item.text : item.id))).toEqual([
       'question',
@@ -2084,20 +2091,36 @@ describe('timeline', () => {
     ]);
     expect(pendingUserItemsWithoutHistory([], claimed)).toEqual(claimed);
     expect(
-      claimedQueuedUserItemsWithoutHistory([{ id: 'turn-2:u1', kind: 'user', timestamp: 1500, text: 'queued prompt' }], claimed),
+      claimedQueuedUserItemsWithoutHistory(
+        [{ id: 'turn-2:u1', kind: 'user', timestamp: 0, text: 'queued prompt', turnId: 'turn-2' }],
+        claimed,
+      ),
+    ).toEqual(claimed);
+    const retargeted = retargetSyntheticUserItemsToTurn(claimed, 'turn-2');
+    expect(
+      claimedQueuedUserItemsWithoutHistory(
+        [{ id: 'turn-2:u1', kind: 'user', timestamp: 0, text: 'queued prompt', turnId: 'turn-2' }],
+        retargeted,
+      ),
     ).toEqual([]);
   });
 
   it('does not confirm a claimed queued prompt from an earlier identical user message', () => {
     const claimed: Extract<TimelineItem, { kind: 'user' }>[] = [
-      { id: 'claimed-queued:user:queued-1', kind: 'user', timestamp: 1000, sortOrder: 10, text: 'same' },
+      { id: 'claimed-queued:user:queued-1', kind: 'user', timestamp: 1000, sortOrder: 10, text: 'same', turnId: 'turn-new' },
     ];
 
     expect(
-      claimedQueuedUserItemsWithoutHistory([{ id: 'turn-old:u1', kind: 'user', timestamp: 900, text: 'same' }], claimed),
+      claimedQueuedUserItemsWithoutHistory(
+        [{ id: 'turn-old:u1', kind: 'user', timestamp: 2000, text: 'same', turnId: 'turn-old' }],
+        claimed,
+      ),
     ).toEqual(claimed);
     expect(
-      claimedQueuedUserItemsWithoutHistory([{ id: 'turn-new:u1', kind: 'user', timestamp: 1500, text: 'same' }], claimed),
+      claimedQueuedUserItemsWithoutHistory(
+        [{ id: 'turn-new:u1', kind: 'user', timestamp: 0, text: 'same', turnId: 'turn-new' }],
+        claimed,
+      ),
     ).toEqual([]);
   });
 
@@ -2185,12 +2208,18 @@ describe('timeline', () => {
       1000,
     );
 
-    expect(claimedQueuedUserItemsWithoutHistory([{ id: 'turn-old:u1', kind: 'user', timestamp: 900, text: 'same' }], claimed)).toEqual(
-      claimed,
-    );
-    expect(claimedQueuedUserItemsWithoutHistory([{ id: 'turn-new:u1', kind: 'user', timestamp: 1500, text: 'same' }], claimed)).toEqual(
-      [],
-    );
+    expect(
+      claimedQueuedUserItemsWithoutHistory(
+        [{ id: 'turn-old:u1', kind: 'user', timestamp: 2000, text: 'same', turnId: 'turn-old' }],
+        claimed,
+      ),
+    ).toEqual(claimed);
+    expect(
+      claimedQueuedUserItemsWithoutHistory(
+        [{ id: 'turn-late:u1', kind: 'user', timestamp: 0, text: 'same', turnId: 'turn-late' }],
+        claimed,
+      ),
+    ).toEqual([]);
   });
 
   it('claims only the first removed queued head on an active-turn transition', () => {
@@ -2273,7 +2302,7 @@ describe('timeline', () => {
       turnId: 'turn-1',
     };
 
-    expect(mergeTimelineItemsByTimestamp([existing, ...claimed]).map((item) => item.id)).toEqual([
+    expect(reconcileTimelineItemsByArrival([], [existing, ...claimed]).map((item) => item.id)).toEqual([
       'already-visible',
       'claimed-queued:user:q1',
     ]);
@@ -2839,7 +2868,7 @@ describe('timeline', () => {
 
     expect(items.map((item) => item.kind)).toEqual(['assistant', 'command']);
     expect(items.map((item) => item.sortOrder)).toEqual([10, 20]);
-    expect(mergeTimelineItemsByTimestamp(items).map((item) => item.kind)).toEqual(['assistant', 'command']);
+    expect(reconcileTimelineItemsByArrival([], items).map((item) => item.kind)).toEqual(['assistant', 'command']);
   });
 
   it('does not leave an empty file-change start card when completion expands into edit cards', () => {
@@ -3146,7 +3175,7 @@ describe('timeline', () => {
 
     const overlaidHistory = timelineItemsWithLiveTurnOverlay(persistedHistory, liveItems, 'turn-1');
     const visibleLiveItems = visibleLiveTurnItemsForTimeline(overlaidHistory, liveItems);
-    const merged = mergeTimelineItemsByTimestamp([...overlaidHistory, ...visibleLiveItems]);
+    const merged = reconcileTimelineItemsByArrival([], [...overlaidHistory, ...visibleLiveItems]);
 
     expect(merged.map((item) => (item.kind === 'assistant' || item.kind === 'user' ? item.text : item.id))).toEqual([
       'go',
