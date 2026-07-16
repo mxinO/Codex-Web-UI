@@ -9,6 +9,22 @@ export interface CodexRunOptions {
   sandbox?: CodexSandboxMode;
 }
 
+export type ModelCapacityRetryStatus = 'scheduled' | 'starting' | 'inFlight';
+
+export interface ModelCapacityRetry {
+  status: ModelCapacityRetryStatus;
+  threadId: string;
+  failedTurnId: string;
+  attempt: number;
+  retryAt: number | null;
+  claimedAt: number | null;
+  operationId: string;
+  retryTurnId: string | null;
+  reconcileCursor: string | null;
+  cancelRequested: boolean;
+  options?: CodexRunOptions;
+}
+
 export interface QueuedMessage {
   id: string;
   threadId?: string;
@@ -101,6 +117,7 @@ export interface HostRuntimeState {
   mode: CodexCollaborationMode | null;
   sandbox: CodexSandboxMode | null;
   activeGoal: ThreadGoal | null;
+  modelCapacityRetry: ModelCapacityRetry | null;
   authTokenHash: string | null;
   appServerUrl: string | null;
   appServerPid: number | null;

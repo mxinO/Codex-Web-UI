@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { timelineNotificationMeta, withTimelineNotificationMeta } from '../lib/timeline';
-import type { CodexRunOptions, ThreadGoal } from '../types/ui';
+import type { CodexRunOptions, ModelCapacityRetry, ThreadGoal } from '../types/ui';
 
 export type ConnectionState = 'connecting' | 'connected' | 'disconnected' | 'auth-error';
 
@@ -28,6 +28,7 @@ interface ServerHello {
     mode: string | null;
     sandbox: string | null;
     activeGoal: ThreadGoal | null;
+    modelCapacityRetry: ModelCapacityRetry | null;
     theme: 'dark' | 'light';
     queue: Array<{ id: string; threadId?: string; text: string; createdAt: number; deliveryState?: 'maybeSent'; options?: Partial<CodexRunOptions> }>;
   };

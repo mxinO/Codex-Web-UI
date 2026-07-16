@@ -70,6 +70,8 @@ async function makeHarness(
     token?: string;
     authCookieScope?: string;
     headers?: Record<string, string>;
+    modelCapacityRetryDelayMs?: number;
+    modelCapacityReconcileDelayMs?: number;
   } = {},
 ) {
   const server = http.createServer();
@@ -112,6 +114,8 @@ async function makeHarness(
     token: options.token ?? 'token',
     authCookieScope: options.authCookieScope,
     startCwd: options.startCwd,
+    modelCapacityRetryDelayMs: options.modelCapacityRetryDelayMs,
+    modelCapacityReconcileDelayMs: options.modelCapacityReconcileDelayMs,
   });
 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -225,12 +229,34 @@ async function waitForRequestCalls(request: ReturnType<typeof vi.fn>, count: num
   throw new Error(`request was called ${request.mock.calls.length} times, expected ${count}`);
 }
 
+async function waitForRequestMethodCalls(request: ReturnType<typeof vi.fn>, method: string, count: number): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (request.mock.calls.filter(([calledMethod]) => calledMethod === method).length >= count) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
+  const actual = request.mock.calls.filter(([calledMethod]) => calledMethod === method).length;
+  throw new Error(`${method} was called ${actual} times, expected ${count}`);
+}
+
 async function waitForActiveTurnCleared(stateStore: HostStateStore): Promise<void> {
   for (let attempt = 0; attempt < 20; attempt += 1) {
     if (stateStore.read().activeTurnId === null) return;
     await new Promise<void>((resolve) => setTimeout(resolve, 0));
   }
   throw new Error(`active turn was not cleared: ${stateStore.read().activeTurnId ?? '<null>'}`);
+}
+
+async function waitForState(
+  stateStore: HostStateStore,
+  predicate: (state: HostRuntimeState) => boolean,
+  description: string,
+): Promise<HostRuntimeState> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const state = stateStore.read();
+    if (predicate(state)) return state;
+    await new Promise<void>((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error(`timed out waiting for ${description}`);
 }
 
 function git(cwd: string, args: string[], stdin?: string): string {
@@ -3303,6 +3329,549 @@ describe('attachBrowserSocket session RPCs', () => {
     expect(request).toHaveBeenCalledWith('thread/goal/clear', { threadId: 'thread-1' });
     expect(request).not.toHaveBeenCalledWith('turn/interrupt', expect.anything());
     expect(stateStore.read()).toMatchObject({ activeGoal: null, activeTurnId: 'normal-turn-1' });
+  });
+});
+
+describe('attachBrowserSocket model capacity retry', () => {
+  const capacityError = {
+    message: 'Selected model is at capacity. Please try a different model.',
+    codexErrorInfo: 'serverOverloaded',
+  };
+
+  function failTurn(notify: (method: string, params?: unknown) => void, turnId: string, error: unknown = capacityError): void {
+    notify('turn/completed', {
+      threadId: 'thread-1',
+      turn: { id: turnId, status: 'failed', error },
+    });
+  }
+
+  it('schedules one persisted retry only for a terminal model-capacity failure', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-1',
+      model: 'gpt-5.4',
+      effort: 'high',
+    });
+
+    failTurn(notify, 'turn-1');
+    const scheduled = await waitForState(stateStore, (state) => state.modelCapacityRetry?.status === 'scheduled', 'capacity retry');
+    const operationId = scheduled.modelCapacityRetry?.operationId;
+
+    expect(scheduled).toMatchObject({
+      activeTurnId: null,
+      modelCapacityRetry: {
+        threadId: 'thread-1',
+        failedTurnId: 'turn-1',
+        attempt: 1,
+        status: 'scheduled',
+        cancelRequested: false,
+        options: { model: 'gpt-5.4', effort: 'high' },
+      },
+    });
+
+    failTurn(notify, 'turn-1');
+    await flushPromises();
+    expect(stateStore.read().modelCapacityRetry?.operationId).toBe(operationId);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('does not retry an internally retried or unrelated failed turn', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { stateStore, notifyRaw, notify } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: 'turn-1' });
+
+    notifyRaw({
+      jsonrpc: '2.0',
+      method: 'error',
+      params: { threadId: 'thread-1', turnId: 'turn-1', error: capacityError, willRetry: true },
+    });
+    failTurn(notify, 'turn-1', { message: 'A different failure' });
+    await waitForActiveTurnCleared(stateStore);
+
+    expect(stateStore.read().modelCapacityRetry).toBeNull();
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('starts a retry with frozen options and backs off again on repeated capacity failure', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/repo', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'turn/start') return { turn: { id: 'turn-retry-1' } } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { stateStore, notify } = await makeHarness(request, { modelCapacityRetryDelayMs: 20 });
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-1',
+      activeCwd: '/repo',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      model: 'gpt-5.4',
+      effort: 'high',
+    });
+
+    failTurn(notify, 'turn-1');
+    const scheduled = await waitForState(stateStore, (state) => state.modelCapacityRetry?.status === 'scheduled', 'scheduled retry');
+    const firstOperationId = scheduled.modelCapacityRetry?.operationId;
+    await waitForState(stateStore, (state) => state.modelCapacityRetry?.status === 'inFlight', 'started retry');
+
+    expect(request).toHaveBeenCalledWith(
+      'turn/start',
+      expect.objectContaining({
+        threadId: 'thread-1',
+        clientUserMessageId: firstOperationId,
+        model: 'gpt-5.4',
+        effort: 'high',
+      }),
+      TURN_START_RPC_TIMEOUT_MS,
+    );
+
+    failTurn(notify, 'turn-retry-1');
+    const second = await waitForState(
+      stateStore,
+      (state) => state.modelCapacityRetry?.status === 'scheduled' && state.modelCapacityRetry.attempt === 2,
+      'second capacity retry',
+    );
+    expect(second.modelCapacityRetry?.operationId).not.toBe(firstOperationId);
+    expect(second.modelCapacityRetry?.failedTurnId).toBe('turn-retry-1');
+  });
+
+  it('lets Stop cancel a scheduled retry without starting Codex', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, notify } = await makeHarness(request, { modelCapacityRetryDelayMs: 100 });
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: 'turn-1' });
+    failTurn(notify, 'turn-1');
+    await waitForState(stateStore, (state) => state.modelCapacityRetry?.status === 'scheduled', 'scheduled retry');
+
+    const response = nextRpcResponse(ws, 701);
+    ws.send(JSON.stringify({ type: 'rpc', id: 701, method: 'webui/turn/interrupt' }));
+
+    expect(await response).toEqual({
+      type: 'rpc/result',
+      id: 701,
+      result: { ok: true, cancelledModelCapacityRetry: true },
+    });
+    expect(stateStore.read()).toMatchObject({ activeTurnId: null, modelCapacityRetry: null });
+    await new Promise<void>((resolve) => setTimeout(resolve, 120));
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('marks a starting retry cancelled before its turn id arrives, then interrupts it', async () => {
+    const startResult = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/repo', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'turn/start') return startResult.promise as Promise<T>;
+      if (method === 'turn/interrupt') return { ok: true } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request, {
+      modelCapacityRetryDelayMs: 0,
+      modelCapacityReconcileDelayMs: 1_000,
+    });
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeTurnId: 'turn-1',
+      activeCwd: '/repo',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+    });
+    failTurn(notify, 'turn-1');
+    await waitForState(stateStore, (state) => state.modelCapacityRetry?.status === 'starting', 'starting retry');
+
+    const response = nextRpcResponse(ws, 702);
+    ws.send(JSON.stringify({ type: 'rpc', id: 702, method: 'webui/turn/interrupt' }));
+    expect(await response).toEqual({ type: 'rpc/result', id: 702, result: { ok: true, cancellationPending: true } });
+    expect(stateStore.read().modelCapacityRetry?.cancelRequested).toBe(true);
+
+    startResult.resolve({ turn: { id: 'turn-retry-cancelled' } });
+    await waitForRequestCalls(request, 3);
+    await waitForState(stateStore, (state) => state.modelCapacityRetry === null, 'cancelled retry cleanup');
+    expect(request).toHaveBeenCalledWith('turn/interrupt', {
+      threadId: 'thread-1',
+      turnId: 'turn-retry-cancelled',
+    });
+  });
+
+  it('keeps queued messages visible without draining them while a retry is scheduled', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { ws, stateStore, notify } = await makeHarness(request, { modelCapacityRetryDelayMs: 1_000 });
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: 'turn-1' });
+    failTurn(notify, 'turn-1');
+    await waitForState(stateStore, (state) => state.modelCapacityRetry?.status === 'scheduled', 'scheduled retry');
+
+    const response = nextRpcResponse(ws, 703);
+    ws.send(JSON.stringify({
+      type: 'rpc',
+      id: 703,
+      method: 'webui/queue/enqueue',
+      params: { threadId: 'thread-1', text: 'queued while waiting' },
+    }));
+    expect((await response).type).toBe('rpc/result');
+    expect(stateStore.read().queue).toEqual([
+      expect.objectContaining({ threadId: 'thread-1', text: 'queued while waiting' }),
+    ]);
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it('uses a terminal error notification as a bounded fallback for older app-server payloads', async () => {
+    const request = vi.fn<CodexAppServer['request']>();
+    const { stateStore, notifyRaw, notify } = await makeHarness(request);
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: 'turn-legacy' });
+
+    notifyRaw({
+      jsonrpc: '2.0',
+      method: 'error',
+      params: { threadId: 'thread-1', turnId: 'turn-legacy', error: capacityError, willRetry: false },
+    });
+    failTurn(notify, 'turn-legacy', null);
+
+    const state = await waitForState(stateStore, (current) => current.modelCapacityRetry?.status === 'scheduled', 'legacy capacity retry');
+    expect(state.modelCapacityRetry).toMatchObject({ failedTurnId: 'turn-legacy', attempt: 1 });
+  });
+
+  it('re-arms a persisted scheduled retry after the UI server restarts', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/repo', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'turn/start') return { turn: { id: 'turn-after-restart' } } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { stateStore } = await makeHarness(request, {
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+        activeCwd: '/repo',
+        modelCapacityRetry: {
+          status: 'scheduled',
+          threadId: 'thread-1',
+          failedTurnId: 'turn-failed',
+          attempt: 2,
+          retryAt: Date.now() + 20,
+          claimedAt: null,
+          operationId: 'capacity-operation-restart',
+          retryTurnId: null,
+          reconcileCursor: null,
+          cancelRequested: false,
+        },
+      },
+    });
+
+    const state = await waitForState(stateStore, (current) => current.modelCapacityRetry?.status === 'inFlight', 'persisted retry start');
+    expect(state).toMatchObject({ activeTurnId: 'turn-after-restart', modelCapacityRetry: { attempt: 2 } });
+    expect(request).toHaveBeenCalledWith(
+      'turn/start',
+      expect.objectContaining({ clientUserMessageId: 'capacity-operation-restart' }),
+      TURN_START_RPC_TIMEOUT_MS,
+    );
+  });
+
+  it('reconciles an orphaned persisted start before scheduling the next attempt', async () => {
+    const claimedAt = Date.now() - 1_000;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/repo', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'thread/turns/list') {
+        return {
+          data: [{
+            id: 'orphaned-turn',
+            status: 'inProgress',
+            startedAt: Math.floor(claimedAt / 1_000),
+            items: [{ type: 'userMessage', clientId: 'capacity-operation-orphaned' }],
+          }],
+          nextCursor: null,
+        } as T;
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { stateStore } = await makeHarness(request, {
+      modelCapacityRetryDelayMs: 1_000,
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+        activeCwd: '/repo',
+        activeTurnId: 'turn-start-pending:thread-1',
+        modelCapacityRetry: {
+          status: 'starting',
+          threadId: 'thread-1',
+          failedTurnId: 'turn-failed',
+          attempt: 1,
+          retryAt: null,
+          claimedAt,
+          operationId: 'capacity-operation-orphaned',
+          retryTurnId: null,
+          reconcileCursor: null,
+          cancelRequested: false,
+        },
+      },
+    });
+
+    const state = await waitForState(
+      stateStore,
+      (current) => current.modelCapacityRetry?.status === 'scheduled' && current.modelCapacityRetry.attempt === 2,
+      'orphaned retry reschedule',
+    );
+    expect(state.activeTurnId).toBeNull();
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/resume', 'thread/turns/list']);
+  });
+
+  it('cancels a scheduled retry when switching sessions succeeds', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/start') {
+        return { thread: { id: 'thread-2', cwd: '/other', path: '/sessions/thread-2.jsonl' }, model: 'gpt-5.4' } as T;
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request, { modelCapacityRetryDelayMs: 1_000 });
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: 'turn-1' });
+    failTurn(notify, 'turn-1');
+    await waitForState(stateStore, (state) => state.modelCapacityRetry?.status === 'scheduled', 'scheduled retry');
+
+    const response = nextRpcResponse(ws, 704);
+    ws.send(JSON.stringify({ type: 'rpc', id: 704, method: 'webui/session/start', params: { cwd: '/other' } }));
+    expect((await response).type).toBe('rpc/result');
+    expect(stateStore.read()).toMatchObject({ activeThreadId: 'thread-2', activeTurnId: null, modelCapacityRetry: null });
+  });
+
+  it('keeps a timed-out same-generation start ambiguous after an authoritative no-match', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/repo', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'turn/start') throw new Error('JSON-RPC request timed out: turn/start');
+      if (method === 'thread/turns/list') return { data: [], nextCursor: null } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { stateStore, notify } = await makeHarness(request, {
+      modelCapacityRetryDelayMs: 0,
+      modelCapacityReconcileDelayMs: 10,
+    });
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeCwd: '/repo',
+      activeTurnId: 'turn-1',
+    });
+    failTurn(notify, 'turn-1');
+    await waitForRequestMethodCalls(request, 'thread/turns/list', 2);
+
+    expect(stateStore.read().modelCapacityRetry).toMatchObject({ status: 'starting', attempt: 1 });
+    expect(request.mock.calls.filter(([method]) => method === 'turn/start')).toHaveLength(1);
+
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-late' });
+    const adopted = await waitForState(stateStore, (state) => state.modelCapacityRetry?.status === 'inFlight', 'late retry adoption');
+    expect(adopted).toMatchObject({ activeTurnId: 'turn-late', modelCapacityRetry: { retryTurnId: 'turn-late' } });
+    expect(request.mock.calls.filter(([method]) => method === 'turn/start')).toHaveLength(1);
+  });
+
+  it('keeps Stop pending across a timed-out no-match and interrupts a late accepted retry', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/repo', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'turn/start') throw new Error('JSON-RPC request timed out: turn/start');
+      if (method === 'thread/turns/list') return { data: [], nextCursor: null } as T;
+      if (method === 'turn/interrupt') return { ok: true } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request, {
+      modelCapacityRetryDelayMs: 0,
+      modelCapacityReconcileDelayMs: 10,
+    });
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeCwd: '/repo',
+      activeTurnId: 'turn-1',
+    });
+    failTurn(notify, 'turn-1');
+    await waitForRequestMethodCalls(request, 'thread/turns/list', 1);
+
+    const response = nextRpcResponse(ws, 705);
+    ws.send(JSON.stringify({ type: 'rpc', id: 705, method: 'webui/turn/interrupt' }));
+    expect(await response).toEqual({ type: 'rpc/result', id: 705, result: { ok: true, cancellationPending: true } });
+    await waitForRequestMethodCalls(request, 'thread/turns/list', 2);
+    expect(stateStore.read().modelCapacityRetry).toMatchObject({ status: 'starting', cancelRequested: true });
+
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-late-cancelled' });
+    await waitForState(stateStore, (state) => state.modelCapacityRetry === null, 'late retry interruption');
+    expect(request).toHaveBeenCalledWith('turn/interrupt', {
+      threadId: 'thread-1',
+      turnId: 'turn-late-cancelled',
+    });
+    expect(request.mock.calls.filter(([method]) => method === 'turn/start')).toHaveLength(1);
+  });
+
+  it('reconciles a successful retry start response that omits the turn id', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/repo', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'turn/start') return { ok: true } as T;
+      if (method === 'thread/turns/list') return { data: [], nextCursor: null } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { stateStore, notify } = await makeHarness(request, {
+      modelCapacityRetryDelayMs: 0,
+      modelCapacityReconcileDelayMs: 10,
+    });
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeCwd: '/repo',
+      activeTurnId: 'turn-1',
+    });
+    failTurn(notify, 'turn-1');
+    await waitForRequestMethodCalls(request, 'thread/turns/list', 2);
+
+    expect(stateStore.read().modelCapacityRetry).toMatchObject({ status: 'starting', attempt: 1 });
+    expect(request.mock.calls.filter(([method]) => method === 'turn/start')).toHaveLength(1);
+
+    notify('turn/started', { threadId: 'thread-1', turnId: 'turn-late-without-response-id' });
+    const adopted = await waitForState(stateStore, (state) => state.modelCapacityRetry?.status === 'inFlight', 'id-less retry adoption');
+    expect(adopted).toMatchObject({
+      activeTurnId: 'turn-late-without-response-id',
+      modelCapacityRetry: { retryTurnId: 'turn-late-without-response-id' },
+    });
+    expect(request.mock.calls.filter(([method]) => method === 'turn/start')).toHaveLength(1);
+  });
+
+  it('does not schedule a retry when Stop races the original capacity failure', async () => {
+    const interrupt = deferred<unknown>();
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/repo', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'turn/interrupt') return interrupt.promise as Promise<T>;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeCwd: '/repo',
+      activeTurnId: 'turn-1',
+    });
+
+    const response = nextRpcResponse(ws, 706);
+    ws.send(JSON.stringify({ type: 'rpc', id: 706, method: 'webui/turn/interrupt' }));
+    await waitForRequestCalls(request, 2);
+    failTurn(notify, 'turn-1');
+    await waitForActiveTurnCleared(stateStore);
+    interrupt.resolve({ ok: true });
+
+    expect(await response).toEqual({ type: 'rpc/result', id: 706, result: { ok: true } });
+    expect(stateStore.read().modelCapacityRetry).toBeNull();
+    expect(request.mock.calls.filter(([method]) => method === 'turn/start')).toHaveLength(0);
+  });
+
+  it('continues persisted reconciliation beyond the per-cycle page budget', async () => {
+    const claimedAt = Date.now() - 10_000;
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string, params?: unknown) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/repo', path: '/sessions/thread-1.jsonl' } } as T;
+      if (method === 'thread/turns/list') {
+        const cursor = (params as { cursor?: string | null }).cursor ?? null;
+        if (cursor === 'cursor-20') {
+          return {
+            data: [{
+              id: 'turn-capacity-page-21',
+              status: 'failed',
+              error: capacityError,
+              startedAt: Math.floor(claimedAt / 1_000),
+              items: [{ type: 'userMessage', clientId: 'capacity-operation-paged' }],
+            }],
+            nextCursor: null,
+          } as T;
+        }
+        const page = cursor ? Number(cursor.slice('cursor-'.length)) : 0;
+        return {
+          data: [{ id: `unrelated-${page}`, status: 'completed', startedAt: Math.floor(Date.now() / 1_000), items: [] }],
+          nextCursor: `cursor-${page + 1}`,
+        } as T;
+      }
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { stateStore } = await makeHarness(request, {
+      modelCapacityRetryDelayMs: 1_000,
+      modelCapacityReconcileDelayMs: 0,
+      initialState: {
+        activeThreadId: 'thread-1',
+        activeThreadPath: '/sessions/thread-1.jsonl',
+        activeCwd: '/repo',
+        activeTurnId: 'turn-start-pending:thread-1',
+        modelCapacityRetry: {
+          status: 'starting',
+          threadId: 'thread-1',
+          failedTurnId: 'turn-failed',
+          attempt: 1,
+          retryAt: null,
+          claimedAt,
+          operationId: 'capacity-operation-paged',
+          retryTurnId: null,
+          reconcileCursor: null,
+          cancelRequested: false,
+        },
+      },
+    });
+
+    const state = await waitForState(
+      stateStore,
+      (current) => current.modelCapacityRetry?.status === 'scheduled' && current.modelCapacityRetry.attempt === 2,
+      'paged retry reconciliation',
+    );
+    const listCalls = request.mock.calls.filter(([method]) => method === 'thread/turns/list');
+    expect(listCalls).toHaveLength(21);
+    expect(listCalls[20]?.[1]).toMatchObject({ cursor: 'cursor-20' });
+    expect(state.modelCapacityRetry?.failedTurnId).toBe('turn-capacity-page-21');
+  });
+
+  it('re-arms a scheduled retry when a goal cancellation request fails', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async (method: string) => {
+      if (method === 'thread/goal/set') throw new Error('goal update failed');
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, notify } = await makeHarness(request, { modelCapacityRetryDelayMs: 1_000 });
+    stateStore.write({ ...stateStore.read(), activeThreadId: 'thread-1', activeTurnId: 'turn-1' });
+    failTurn(notify, 'turn-1');
+    const scheduled = await waitForState(stateStore, (state) => state.modelCapacityRetry?.status === 'scheduled', 'scheduled retry');
+
+    const response = nextRpcResponse(ws, 707);
+    ws.send(JSON.stringify({
+      type: 'rpc',
+      id: 707,
+      method: 'webui/thread/goal/set',
+      params: { threadId: 'thread-1', status: 'paused' },
+    }));
+    expect(await response).toEqual({ type: 'rpc/error', id: 707, error: 'goal update failed' });
+    expect(stateStore.read().modelCapacityRetry?.operationId).toBe(scheduled.modelCapacityRetry?.operationId);
+  });
+
+  it('allows an app-server restart to resolve a stopped ambiguous retry', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockImplementation(async <T = unknown>(method: string) => {
+      if (method === 'thread/resume') return { thread: { id: 'thread-1', cwd: '/repo', path: '/sessions/thread-1.jsonl' } } as T;
+      throw new Error(`unexpected method: ${method}`);
+    });
+    const { ws, stateStore, restart } = await makeHarness(request);
+    stateStore.write({
+      ...stateStore.read(),
+      activeThreadId: 'thread-1',
+      activeThreadPath: '/sessions/thread-1.jsonl',
+      activeCwd: '/repo',
+      activeTurnId: 'turn-start-pending:thread-1',
+      modelCapacityRetry: {
+        status: 'starting',
+        threadId: 'thread-1',
+        failedTurnId: 'turn-1',
+        attempt: 1,
+        retryAt: null,
+        claimedAt: Date.now(),
+        operationId: 'capacity-operation-cancelled',
+        retryTurnId: null,
+        reconcileCursor: null,
+        cancelRequested: true,
+      },
+    });
+
+    const response = nextRpcResponse(ws, 708);
+    ws.send(JSON.stringify({ type: 'rpc', id: 708, method: 'webui/codex/restart' }));
+    expect((await response).type).toBe('rpc/result');
+    expect(restart).toHaveBeenCalledTimes(1);
+    expect(stateStore.read()).toMatchObject({ activeTurnId: null, modelCapacityRetry: null });
   });
 });
 

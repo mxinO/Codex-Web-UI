@@ -4,7 +4,7 @@ import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import App from '../../src/App';
-import type { ThreadGoal } from '../../src/types/ui';
+import type { ModelCapacityRetry, ThreadGoal } from '../../src/types/ui';
 
 const mocks = vi.hoisted(() => ({
   rpc: vi.fn(),
@@ -27,6 +27,7 @@ const mocks = vi.hoisted(() => ({
   activeThreadPath: '/rollouts/thread-1.jsonl' as string | null,
   activeTurnId: 'turn-1' as string | null,
   activeGoal: null as ThreadGoal | null,
+  modelCapacityRetry: null as ModelCapacityRetry | null,
   reconnectEpoch: 0,
   replayGapEpoch: 0,
   timelineIsViewingLatest: true,
@@ -42,6 +43,7 @@ const mocks = vi.hoisted(() => ({
     text?: string;
     status?: Record<string, unknown>;
   }>,
+  chatTimelineProps: null as null | { showActivityRunning?: boolean; activityRunningLabel?: string },
   headerProps: null as null | {
     model?: string | null;
     effort?: string | null;
@@ -52,10 +54,12 @@ const mocks = vi.hoisted(() => ({
     onOpenRuntimeOptions?: () => void;
     onSelectModel?: (model: string) => void;
     onSelectEffort?: (effort: string) => void;
+    onRestartCodex?: () => void;
   },
   inputProps: null as null | {
     runOptions?: { model: string | null; effort: string | null; mode: string | null; sandbox: string | null };
     draftOverride: string | null;
+    isRunning?: boolean;
   },
 }));
 
@@ -92,6 +96,7 @@ vi.mock('../../src/hooks/useCodexSocket', () => ({
         mode: mocks.runtimeMode,
         sandbox: mocks.runtimeSandbox,
         activeGoal: mocks.activeGoal,
+        modelCapacityRetry: mocks.modelCapacityRetry,
         queue: mocks.stateQueue,
       },
     },
@@ -107,8 +112,10 @@ vi.mock('../../src/hooks/useCodexSocket', () => ({
 }));
 vi.mock('../../src/components/AuthOverlay', () => ({ default: () => null }));
 vi.mock('../../src/components/ChatTimeline', () => ({
-  default: ({ items }: { items: typeof mocks.chatTimelineItems }) => {
+  default: (props: { items: typeof mocks.chatTimelineItems; showActivityRunning?: boolean; activityRunningLabel?: string }) => {
+    const { items } = props;
     mocks.chatTimelineItems = items;
+    mocks.chatTimelineProps = props;
     return (
       <div data-testid="chat-timeline">
         {items.map((item) => (
@@ -188,6 +195,7 @@ describe('App queued message tray', () => {
     mocks.activeThreadPath = '/rollouts/thread-1.jsonl';
     mocks.activeTurnId = 'turn-1';
     mocks.activeGoal = null;
+    mocks.modelCapacityRetry = null;
     mocks.reconnectEpoch = 0;
     mocks.replayGapEpoch = 0;
     mocks.reloadTimeline.mockReset().mockResolvedValue(true);
@@ -199,6 +207,7 @@ describe('App queued message tray', () => {
     mocks.runtimeMode = null;
     mocks.runtimeSandbox = 'workspace-write';
     mocks.chatTimelineItems = [];
+    mocks.chatTimelineProps = null;
     mocks.headerProps = null;
     mocks.inputProps = null;
     window.localStorage.clear();
@@ -352,6 +361,52 @@ describe('App queued message tray', () => {
 
     expect(document.querySelector('.queue-tray .queued-message')?.textContent).toContain('queued text');
     expect(document.querySelector('[data-chat-kind="queued"]')).toBeNull();
+  });
+
+  it('treats a scheduled model-capacity retry as running and shows its waiting label', async () => {
+    mocks.activeTurnId = null;
+    mocks.modelCapacityRetry = {
+      status: 'scheduled',
+      threadId: 'thread-1',
+      failedTurnId: 'turn-1',
+      attempt: 1,
+      retryAt: Date.now() + 60_000,
+      claimedAt: null,
+      operationId: 'capacity-operation-1',
+      retryTurnId: null,
+      reconcileCursor: null,
+      cancelRequested: false,
+    };
+
+    renderApp();
+    await flushReact();
+
+    expect(mocks.inputProps?.isRunning).toBe(true);
+    expect(mocks.chatTimelineProps).toMatchObject({
+      showActivityRunning: true,
+      activityRunningLabel: 'Waiting for model capacity',
+    });
+  });
+
+  it('allows Codex restart after a timed-out capacity retry has been stopped', async () => {
+    mocks.activeTurnId = 'turn-start-pending:thread-1';
+    mocks.modelCapacityRetry = {
+      status: 'starting',
+      threadId: 'thread-1',
+      failedTurnId: 'turn-1',
+      attempt: 1,
+      retryAt: null,
+      claimedAt: Date.now(),
+      operationId: 'capacity-operation-cancelled',
+      retryTurnId: null,
+      reconcileCursor: null,
+      cancelRequested: true,
+    };
+
+    renderApp();
+    await flushReact();
+
+    expect(mocks.headerProps?.onRestartCodex).toEqual(expect.any(Function));
   });
 
   it('appends a claimed mid-turn prompt to the visible message flow', async () => {

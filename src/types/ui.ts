@@ -43,6 +43,20 @@ export interface CodexRunOptions {
   sandbox: string | null;
 }
 
+export interface ModelCapacityRetry {
+  status: 'scheduled' | 'starting' | 'inFlight';
+  threadId: string;
+  failedTurnId: string;
+  attempt: number;
+  retryAt: number | null;
+  claimedAt: number | null;
+  operationId: string;
+  retryTurnId: string | null;
+  reconcileCursor: string | null;
+  cancelRequested: boolean;
+  options?: Partial<CodexRunOptions>;
+}
+
 export interface CodexReasoningEffortOption {
   reasoningEffort: string;
   description: string;

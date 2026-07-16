@@ -5,6 +5,7 @@ import type { TimelineItem } from '../lib/timeline';
 interface ActivityBlockProps {
   items: TimelineItem[];
   running?: boolean;
+  runningLabel?: string;
   onOpenDetail: (item: TimelineItem) => void;
 }
 
@@ -132,22 +133,23 @@ const MemoActivityRow = memo(ActivityRow, (previous, next) => {
   return previous.onOpenDetail === next.onOpenDetail && previous.item === next.item;
 });
 
-function RunningActivityRow() {
+function RunningActivityRow({ label }: { label: string }) {
+  const waitingForCapacity = label === 'Waiting for model capacity';
   return (
     <div className="activity-card activity-card--running" role="status" aria-live="polite">
       <span className="activity-card__icon activity-card__icon--running">
         <LoaderCircle size={15} aria-hidden="true" />
       </span>
       <span className="activity-card__body">
-        <strong>Running</strong>
-        <small>Codex is working</small>
+        <strong>{label}</strong>
+        <small>{waitingForCapacity ? 'Automatic retry is scheduled' : 'Codex is working'}</small>
       </span>
       <span className="activity-card__badge activity-card__badge--running">active</span>
     </div>
   );
 }
 
-function ActivityBlock({ items, running = false, onOpenDetail }: ActivityBlockProps) {
+function ActivityBlock({ items, running = false, runningLabel = 'Running', onOpenDetail }: ActivityBlockProps) {
   const label = items.length === 1 ? 'Activity' : 'Activity';
   const eventCount = items.length === 1 ? '1 event' : `${items.length} events`;
   const headerMeta = running ? (items.length > 0 ? `${eventCount} · running` : 'running') : eventCount;
@@ -161,12 +163,17 @@ function ActivityBlock({ items, running = false, onOpenDetail }: ActivityBlockPr
         {items.map((item) => (
           <MemoActivityRow key={item.id} item={item} onOpenDetail={onOpenDetail} />
         ))}
-        {running && <RunningActivityRow />}
+        {running && <RunningActivityRow label={runningLabel} />}
       </div>
     </div>
   );
 }
 
 export default memo(ActivityBlock, (previous, next) => {
-  return previous.running === next.running && previous.onOpenDetail === next.onOpenDetail && activityItemListEqual(previous.items, next.items);
+  return (
+    previous.running === next.running &&
+    previous.runningLabel === next.runningLabel &&
+    previous.onOpenDetail === next.onOpenDetail &&
+    activityItemListEqual(previous.items, next.items)
+  );
 });

@@ -571,7 +571,14 @@ export default function App() {
     () => ({ model: runModel, mode: effectiveMode(runMode, runModel), effort: runEffort, sandbox: runSandbox }),
     [runEffort, runMode, runModel, runSandbox],
   );
-  const isRunning = Boolean(state?.activeTurnId || (pendingCompactionThreadId && pendingCompactionThreadId === activeThreadId));
+  const modelCapacityRetry = state?.modelCapacityRetry?.threadId === activeThreadId ? state.modelCapacityRetry : null;
+  const waitingForModelCapacity = modelCapacityRetry?.status === 'scheduled';
+  const capacityRetryCancellationPending = modelCapacityRetry?.cancelRequested === true;
+  const isRunning = Boolean(
+    state?.activeTurnId ||
+    modelCapacityRetry ||
+    (pendingCompactionThreadId && pendingCompactionThreadId === activeThreadId),
+  );
   const activeGoal = state?.activeGoal ?? null;
   const threadGoal = activeGoal && activeGoal.threadId === activeThreadId ? activeGoal : null;
   const visibleGoal = threadGoal?.status !== 'complete' ? threadGoal : null;
@@ -594,7 +601,7 @@ export default function App() {
   }, [activeIdleGoalKey, idleGoalGraceGeneration]);
 
   const restartCodex = useCallback(async () => {
-    if (isRunning) {
+    if (isRunning && !capacityRetryCancellationPending) {
       setSessionError('Stop the active turn before restarting Codex');
       return;
     }
@@ -611,7 +618,7 @@ export default function App() {
     } finally {
       setCodexRestarting(false);
     }
-  }, [activeThreadId, invalidateModelCatalog, isRunning, showTransientSessionMessage, socket.rpc, timeline.reload]);
+  }, [activeThreadId, capacityRetryCancellationPending, invalidateModelCatalog, isRunning, showTransientSessionMessage, socket.rpc, timeline.reload]);
 
   useEffect(() => {
     if (!activeThreadId || socket.connectionState !== 'connected') return;
@@ -1716,7 +1723,11 @@ export default function App() {
         sessionError={sessionError}
         onOpenSessions={socket.connectionState === 'connected' && !runtimeOptionsBusy ? () => void loadSessions() : undefined}
         onNewSession={socket.connectionState === 'connected' && !runtimeOptionsBusy ? openNewSessionPicker : undefined}
-        onRestartCodex={socket.connectionState === 'connected' && !isRunning && !runtimeOptionsBusy ? () => void restartCodex() : undefined}
+        onRestartCodex={
+          socket.connectionState === 'connected' && (!isRunning || capacityRetryCancellationPending) && !runtimeOptionsBusy
+            ? () => void restartCodex()
+            : undefined
+        }
         codexRestarting={codexRestarting}
         sessionPicker={
           <SessionPicker
@@ -1743,6 +1754,7 @@ export default function App() {
                   hasOlder={timeline.hasOlder}
                   showJumpToLatest={!timeline.isViewingLatest}
                   showActivityRunning={timeline.isViewingLatest && showActivityRunning}
+                  activityRunningLabel={waitingForModelCapacity ? 'Waiting for model capacity' : 'Running'}
                   loading={timeline.loading}
                   loadError={timeline.loadError}
                   retryScheduled={timeline.retryScheduled}

@@ -46,6 +46,7 @@ import type {
   CodexSandboxMode,
   GitDiffResult,
   HostRuntimeState,
+  ModelCapacityRetry,
   QueuedMessage,
   RuntimeSettingsConfirmation,
   ThreadGoal,
@@ -59,6 +60,8 @@ interface BrowserSocketDeps {
   token: string;
   authCookieScope?: string;
   startCwd?: string;
+  modelCapacityRetryDelayMs?: number;
+  modelCapacityReconcileDelayMs?: number;
 }
 
 interface BrowserRequest {
@@ -80,6 +83,7 @@ interface TurnStartParams {
   threadId: string;
   text: string;
   options?: CodexRunOptions;
+  clientUserMessageId?: string;
 }
 
 interface RuntimeSettingsNotification {
@@ -233,6 +237,13 @@ const UNFORWARDED_BROWSER_NOTIFICATION_METHODS = new Set([
   'item/fileChange/outputDelta',
 ]);
 const RUNTIME_SETTINGS_CONFIRMATION_TIMEOUT_MS = 2_000;
+const MODEL_CAPACITY_ERROR_MESSAGE = 'Selected model is at capacity. Please try a different model.';
+const MODEL_CAPACITY_RETRY_DELAYS_MS = [60_000, 120_000, 240_000, 300_000];
+const MODEL_CAPACITY_RECONCILE_DELAY_MS = 30_000;
+const MODEL_CAPACITY_RETRY_PROMPT = 'Continue the previous request from where it stopped after the temporary model-capacity error.';
+const MODEL_CAPACITY_RECONCILE_PAGE_LIMIT = 100;
+const MODEL_CAPACITY_RECONCILE_MAX_PAGES = 20;
+const MAX_TIMER_DELAY_MS = 2_147_483_647;
 
 function getOptionalString(params: unknown, key: string): string | null {
   if (!isRecord(params) || !hasOwn(params, key)) return null;
@@ -412,6 +423,49 @@ function runOptionsFromRuntimeState(state: HostRuntimeState): CodexRunOptions | 
   if (state.sandbox) options.sandbox = state.sandbox;
   if (state.mode && state.model) options.mode = state.mode;
   return Object.keys(options).length > 0 ? options : undefined;
+}
+
+function modelCapacityRetryDelayMs(attempt: number, override?: number): number {
+  if (override !== undefined) return Math.max(0, override);
+  return MODEL_CAPACITY_RETRY_DELAYS_MS[Math.min(Math.max(1, attempt), MODEL_CAPACITY_RETRY_DELAYS_MS.length) - 1];
+}
+
+function turnErrorValue(message: { params?: unknown }): unknown {
+  return getValuePath(message.params, ['turn', 'error']);
+}
+
+function isModelCapacityError(value: unknown): boolean {
+  return (
+    getStringPath(value, ['codexErrorInfo']) === 'serverOverloaded' ||
+    getStringPath(value, ['codex_error_info']) === 'serverOverloaded' ||
+    getStringPath(value, ['message']) === MODEL_CAPACITY_ERROR_MESSAGE
+  );
+}
+
+function isFailedModelCapacityCompletion(message: { method?: unknown; params?: unknown }): boolean {
+  return (
+    message.method === 'turn/completed' &&
+    getStringPath(message.params, ['turn', 'status']) === 'failed' &&
+    isModelCapacityError(turnErrorValue(message))
+  );
+}
+
+function isTerminalModelCapacityErrorNotification(message: { method?: unknown; params?: unknown }): boolean {
+  return (
+    message.method === 'error' &&
+    getValuePath(message.params, ['willRetry']) === false &&
+    isModelCapacityError(getValuePath(message.params, ['error']))
+  );
+}
+
+function turnUserMessageClientId(turn: unknown): string | null {
+  const items = getValuePath(turn, ['items']);
+  if (!Array.isArray(items)) return null;
+  for (const item of items) {
+    if (getStringPath(item, ['type']) !== 'userMessage') continue;
+    return getStringPath(item, ['clientId']) ?? getStringPath(item, ['client_id']);
+  }
+  return null;
 }
 
 function notificationPayload(message: { params?: unknown; payload?: unknown }): unknown {
@@ -1334,6 +1388,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   let runtimeSettingsUpdateWaiter: RuntimeSettingsUpdateWaiter | null = null;
   let restartInFlight: Promise<unknown> | null = null;
   let sessionChangeInFlight = false;
+  let modelCapacityRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  let modelCapacityReconcileTimer: ReturnType<typeof setTimeout> | null = null;
+  const currentGenerationCapacityRetryOperations = new Set<string>();
+  const legacyModelCapacityFailureKeys = new Set<string>();
   const timedOutQueuedStarts = new Map<string, TimedOutQueuedStart>();
   const retainedDirectStartContexts = new Map<string, TurnContext>();
   let directStartContextGeneration = 0;
@@ -1389,6 +1447,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const terminalTurnKeys = new Set<string>();
   const terminalTurnDispositions = new Map<string, TerminalDisposition>();
   const completedTurnKeys = new Set<string>();
+  const cancelledTurnKeys = new Set<string>();
   const verifyingUnscopedTerminalKeys = new Map<string, number>();
   const autonomousSuccessorTurnIds = new Map<string, string>();
   const observedTurnStartKeys = new Set<string>();
@@ -1403,6 +1462,23 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const turnCwds = new Map<string, string>();
   const livePatchTurnKeys = new Set<string>();
   const capturedPatchEventKeys = new Set<string>();
+
+  const modelCapacityRetryForThread = (state: HostRuntimeState, threadId?: string | null): ModelCapacityRetry | null => {
+    const retry = state.modelCapacityRetry;
+    if (!retry) return null;
+    if (threadId && retry.threadId !== threadId) return null;
+    return retry;
+  };
+
+  const codexBusy = (state: HostRuntimeState, threadId?: string | null): boolean =>
+    Boolean(state.activeTurnId || modelCapacityRetryForThread(state, threadId));
+
+  const clearModelCapacityTimers = (): void => {
+    if (modelCapacityRetryTimer) clearTimeout(modelCapacityRetryTimer);
+    if (modelCapacityReconcileTimer) clearTimeout(modelCapacityReconcileTimer);
+    modelCapacityRetryTimer = null;
+    modelCapacityReconcileTimer = null;
+  };
 
   const recordRuntimeSettingsConfirmation = (
     threadId: string | null,
@@ -1517,6 +1593,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
     resumedThreadIds.clear();
     resumeThreadPromises.clear();
+    currentGenerationCapacityRetryOperations.clear();
     compactionsInFlight.clear();
     suppressedGoalQueueStarts.clear();
     suppressedGoalQueueSteers.clear();
@@ -1573,6 +1650,15 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       const oldest = completedTurnKeys.keys().next().value;
       if (typeof oldest !== 'string') break;
       completedTurnKeys.delete(oldest);
+    }
+  };
+
+  const rememberCancelledTurn = (threadId: string | null, turnId: string): void => {
+    cancelledTurnKeys.add(turnKey(threadId, turnId));
+    while (cancelledTurnKeys.size > 200) {
+      const oldest = cancelledTurnKeys.values().next().value;
+      if (typeof oldest !== 'string') break;
+      cancelledTurnKeys.delete(oldest);
     }
   };
 
@@ -2436,6 +2522,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         activeThreadPath: null,
         activeTurnId: null,
         activeGoal: null,
+        modelCapacityRetry: null,
         model: null,
         effort: null,
         mode: null,
@@ -2454,6 +2541,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const shouldDrainQueueAfterAttachActiveTurnClear = Boolean(
     stateBeforeAttachActiveTurnClear.activeThreadId &&
       stateBeforeAttachActiveTurnClear.activeTurnId &&
+      !stateBeforeAttachActiveTurnClear.modelCapacityRetry &&
       queueForThread(stateBeforeAttachActiveTurnClear.queue, stateBeforeAttachActiveTurnClear.activeThreadId).length > 0,
   );
   const attachActiveThreadIdAfterClear = clearActiveTurn({}, { broadcast: false }).activeThreadId;
@@ -2579,7 +2667,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     return resumePromise;
   };
 
-  const startTurn = async ({ threadId, text, options }: TurnStartParams, onContext?: (context: TurnContext) => void) => {
+  const startTurn = async ({ threadId, text, options, clientUserMessageId }: TurnStartParams, onContext?: (context: TurnContext) => void) => {
     await ensureThreadResumed(threadId);
     const context = startContextForThread(threadId);
     onContext?.(context);
@@ -2590,6 +2678,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         applyTurnRunOptions(
           {
             threadId,
+            ...(clientUserMessageId ? { clientUserMessageId } : {}),
             input: [{ type: 'text', text, text_elements: [] }],
           },
           options,
@@ -2603,6 +2692,380 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     } finally {
       const index = pendingTurnStartContexts.indexOf(context);
       if (index >= 0) pendingTurnStartContexts.splice(index, 1);
+    }
+  };
+
+  const scheduledModelCapacityRetry = (
+    threadId: string,
+    failedTurnId: string,
+    attempt: number,
+    options: CodexRunOptions | undefined,
+  ): ModelCapacityRetry => ({
+    status: 'scheduled',
+    threadId,
+    failedTurnId,
+    attempt,
+    retryAt: Date.now() + modelCapacityRetryDelayMs(attempt, deps.modelCapacityRetryDelayMs),
+    claimedAt: null,
+    operationId: randomUUID(),
+    retryTurnId: null,
+    reconcileCursor: null,
+    cancelRequested: false,
+    ...(options ? { options } : {}),
+  });
+
+  const clearModelCapacityRetry = (operationId?: string): HostRuntimeState | null => {
+    let changed = false;
+    let clearedOperationId: string | null = null;
+    const state = deps.stateStore.update((current) => {
+      const retry = current.modelCapacityRetry;
+      if (!retry || (operationId && retry.operationId !== operationId)) return current;
+      changed = true;
+      clearedOperationId = retry.operationId;
+      return { ...current, modelCapacityRetry: null };
+    });
+    if (clearedOperationId) {
+      clearModelCapacityTimers();
+      currentGenerationCapacityRetryOperations.delete(clearedOperationId);
+    }
+    return changed ? state : null;
+  };
+
+  const scheduleModelCapacityRetry = (
+    threadId: string,
+    failedTurnId: string,
+    attempt: number,
+    options: CodexRunOptions | undefined,
+    expectedOperationId?: string,
+  ): HostRuntimeState | null => {
+    const scheduled = scheduledModelCapacityRetry(threadId, failedTurnId, attempt, options);
+    let changed = false;
+    let replacedOperationId: string | null = null;
+    const state = deps.stateStore.update((current) => {
+      if (current.activeThreadId !== threadId || current.activeTurnId) return current;
+      const existing = current.modelCapacityRetry;
+      if (expectedOperationId && existing?.operationId !== expectedOperationId) return current;
+      if (existing?.cancelRequested) return { ...current, modelCapacityRetry: null };
+      if (!expectedOperationId && existing) return current;
+      changed = true;
+      replacedOperationId = existing?.operationId ?? null;
+      return { ...current, modelCapacityRetry: scheduled };
+    });
+    if (!changed) return null;
+    if (replacedOperationId) currentGenerationCapacityRetryOperations.delete(replacedOperationId);
+    broadcastHello(state);
+    armModelCapacityRetry(state.modelCapacityRetry);
+    return state;
+  };
+
+  const scheduleModelCapacityReconciliation = (retry: ModelCapacityRetry): void => {
+    if (modelCapacityReconcileTimer) clearTimeout(modelCapacityReconcileTimer);
+    const delay = deps.modelCapacityReconcileDelayMs ?? MODEL_CAPACITY_RECONCILE_DELAY_MS;
+    modelCapacityReconcileTimer = setTimeout(() => {
+      modelCapacityReconcileTimer = null;
+      void reconcilePersistedModelCapacityRetry(retry.operationId);
+    }, Math.max(0, delay));
+    modelCapacityReconcileTimer.unref?.();
+  };
+
+  const rescheduleModelCapacityRetry = (retry: ModelCapacityRetry, failedTurnId = retry.failedTurnId): void => {
+    const state = deps.stateStore.read();
+    const current = state.modelCapacityRetry;
+    if (!current || current.operationId !== retry.operationId) return;
+    if (current.cancelRequested) {
+      const cleared = clearModelCapacityRetry(retry.operationId);
+      if (cleared) broadcastHello(cleared);
+      return;
+    }
+    const cleared = deps.stateStore.update((latest) => (
+      latest.modelCapacityRetry?.operationId === retry.operationId
+        ? { ...latest, activeTurnId: null }
+        : latest
+    ));
+    currentGenerationCapacityRetryOperations.delete(retry.operationId);
+    scheduleModelCapacityRetry(retry.threadId, failedTurnId, retry.attempt + 1, retry.options, retry.operationId);
+    if (cleared.modelCapacityRetry?.operationId !== retry.operationId) broadcastHello(cleared);
+  };
+
+  const markModelCapacityRetryCancelled = (operationId: string): ModelCapacityRetry | null => {
+    let marked: ModelCapacityRetry | null = null;
+    const state = deps.stateStore.update((current) => {
+      const retry = current.modelCapacityRetry;
+      if (!retry || retry.operationId !== operationId) return current;
+      marked = retry.cancelRequested ? retry : { ...retry, cancelRequested: true };
+      return retry.cancelRequested ? current : { ...current, modelCapacityRetry: marked };
+    });
+    if (marked) broadcastHello(state);
+    return marked;
+  };
+
+  const interruptAcceptedModelCapacityRetry = async (retry: ModelCapacityRetry): Promise<void> => {
+    const turnId = retry.retryTurnId;
+    if (!turnId) return;
+    try {
+      await ensureThreadResumed(retry.threadId);
+      await requestCodex('turn/interrupt', { threadId: retry.threadId, turnId });
+    } catch (error) {
+      if (!shouldClearActiveTurnAfterInterruptFailure(error)) {
+        logWarn('Failed to interrupt cancelled model-capacity retry turn', error);
+        scheduleModelCapacityReconciliation(retry);
+        return;
+      }
+    }
+    await finalizeActiveTurnBeforeClear(retry.threadId, turnId, deps.stateStore.read().activeThreadPath);
+    const cleared = clearModelCapacityRetry(retry.operationId);
+    const state = deps.stateStore.update((current) => (
+      current.activeTurnId === turnId ? { ...current, activeTurnId: null } : current
+    ));
+    if (cleared || state.activeTurnId !== turnId) broadcastHello(state);
+  };
+
+  const runModelCapacityRetry = async (retry: ModelCapacityRetry): Promise<void> => {
+    try {
+      const result = await startTurn({
+        threadId: retry.threadId,
+        text: MODEL_CAPACITY_RETRY_PROMPT,
+        options: retry.options,
+        clientUserMessageId: retry.operationId,
+      });
+      const turnId = extractTurnId(result);
+      if (!turnId) {
+        logWarn('Model-capacity retry turn/start returned no turn id; reconciling by client message id');
+        scheduleModelCapacityReconciliation(retry);
+        return;
+      }
+      const alreadyCompleted = hasCompletedTurn(retry.threadId, turnId);
+      const state = deps.stateStore.update((current) => {
+        const live = current.modelCapacityRetry;
+        if (!live || live.operationId !== retry.operationId) return current;
+        const acceptedRetry: ModelCapacityRetry = {
+          ...live,
+          status: 'inFlight',
+          retryAt: null,
+          claimedAt: live.claimedAt ?? Date.now(),
+          retryTurnId: turnId,
+          reconcileCursor: null,
+        };
+        return {
+          ...current,
+          activeTurnId: alreadyCompleted ? null : turnId,
+          modelCapacityRetry: alreadyCompleted && !live.cancelRequested ? live : acceptedRetry,
+        };
+      });
+      const acceptedRetry = state.modelCapacityRetry?.operationId === retry.operationId
+        ? state.modelCapacityRetry
+        : null;
+      if (state.activeThreadId === retry.threadId && state.activeTurnId === turnId) {
+        rememberTurnThreadPath(retry.threadId, turnId, state.activeThreadPath);
+        rememberTurnCwd(retry.threadId, turnId, state.activeCwd);
+        rememberLivePatchTurn(retry.threadId, turnId);
+        rememberObservedTurnStart(retry.threadId, turnId);
+      }
+      broadcastHello(state);
+      if (alreadyCompleted && acceptedRetry) {
+        scheduleModelCapacityReconciliation(acceptedRetry);
+      } else if (acceptedRetry?.cancelRequested) {
+        void interruptAcceptedModelCapacityRetry(acceptedRetry);
+      } else if (!alreadyCompleted) {
+        maybeSteerQueuedMessage();
+      }
+    } catch (error) {
+      if (isTurnStartTimeout(error)) {
+        scheduleModelCapacityReconciliation(retry);
+        return;
+      }
+      logWarn('Failed to start model-capacity retry turn', error);
+      rescheduleModelCapacityRetry(retry);
+    }
+  };
+
+  function armModelCapacityRetry(retry: ModelCapacityRetry | null): void {
+    if (modelCapacityRetryTimer) clearTimeout(modelCapacityRetryTimer);
+    modelCapacityRetryTimer = null;
+    if (!retry || retry.status !== 'scheduled' || retry.cancelRequested || retry.retryAt === null) return;
+    const remainingDelayMs = retry.retryAt - Date.now();
+    if (remainingDelayMs > MAX_TIMER_DELAY_MS) {
+      modelCapacityRetryTimer = setTimeout(() => {
+        modelCapacityRetryTimer = null;
+        armModelCapacityRetry(deps.stateStore.read().modelCapacityRetry);
+      }, MAX_TIMER_DELAY_MS);
+      modelCapacityRetryTimer.unref?.();
+      return;
+    }
+    modelCapacityRetryTimer = setTimeout(() => {
+      modelCapacityRetryTimer = null;
+      const health = deps.codex.health();
+      const state = deps.stateStore.update((current) => {
+        const live = current.modelCapacityRetry;
+        if (
+          !live ||
+          live.operationId !== retry.operationId ||
+          live.status !== 'scheduled' ||
+          live.cancelRequested ||
+          current.activeThreadId !== live.threadId ||
+          current.activeTurnId ||
+          !health.connected ||
+          health.dead ||
+          sessionChangeInFlight ||
+          runtimeOptionUpdates.has(live.threadId) ||
+          goalUpdates.has(live.threadId)
+        ) {
+          return current;
+        }
+        const claimedRetry: ModelCapacityRetry = {
+          ...live,
+          status: 'starting',
+          retryAt: null,
+          claimedAt: Date.now(),
+          retryTurnId: null,
+          reconcileCursor: null,
+        };
+        return { ...current, activeTurnId: pendingTurnStartTurnId(live.threadId), modelCapacityRetry: claimedRetry };
+      });
+      const claimed = state.modelCapacityRetry?.operationId === retry.operationId && state.modelCapacityRetry.status === 'starting'
+        ? state.modelCapacityRetry
+        : null;
+      if (!claimed) {
+        const live = state.modelCapacityRetry;
+        if (live?.operationId === retry.operationId && live.status === 'scheduled') {
+          const deferredRetry: ModelCapacityRetry = {
+            ...live,
+            retryAt: Math.max(Date.now() + 1_000, live.retryAt ?? 0),
+          };
+          const deferred = deps.stateStore.update((current) => (
+            current.modelCapacityRetry?.operationId === live.operationId
+              ? { ...current, modelCapacityRetry: deferredRetry }
+              : current
+          ));
+          armModelCapacityRetry(deferred.modelCapacityRetry);
+        }
+        return;
+      }
+      currentGenerationCapacityRetryOperations.add(claimed.operationId);
+      broadcastHello(state);
+      void runModelCapacityRetry(claimed);
+    }, Math.max(0, remainingDelayMs));
+    modelCapacityRetryTimer.unref?.();
+  }
+
+  const reconcilePersistedModelCapacityRetry = async (operationId: string): Promise<void> => {
+    const retry = deps.stateStore.read().modelCapacityRetry;
+    if (!retry || retry.operationId !== operationId || retry.status === 'scheduled') return;
+    if (retry.cancelRequested && retry.status === 'inFlight' && retry.retryTurnId) {
+      void interruptAcceptedModelCapacityRetry(retry);
+      return;
+    }
+    try {
+      await ensureThreadResumed(retry.threadId);
+      const sameGenerationAmbiguousStart = currentGenerationCapacityRetryOperations.has(retry.operationId);
+      let cursor: string | null = sameGenerationAmbiguousStart ? null : retry.reconcileCursor;
+      const seenCursors = new Set<string>(cursor ? [cursor] : []);
+      let authoritative = false;
+      let matchedTurn: unknown = null;
+      for (let page = 0; page < MODEL_CAPACITY_RECONCILE_MAX_PAGES; page += 1) {
+        const result: unknown = await requestCodex('thread/turns/list', {
+          threadId: retry.threadId,
+          cursor,
+          limit: MODEL_CAPACITY_RECONCILE_PAGE_LIMIT,
+          sortDirection: 'desc',
+          itemsView: 'summary',
+        }, THREAD_TURNS_LIST_RPC_TIMEOUT_MS);
+        const turns = turnsFromTurnListResult(result);
+        matchedTurn = turns.find((turn) => turnUserMessageClientId(turn) === retry.operationId) ?? null;
+        if (matchedTurn) {
+          authoritative = true;
+          break;
+        }
+        const nextCursor: string | null = getStringPath(result, ['nextCursor']) ?? getStringPath(result, ['next_cursor']);
+        const crossedBoundary = turns.some((turn) => {
+          const startedAt = finiteNumber(getValuePath(turn, ['startedAt']) ?? getValuePath(turn, ['started_at']));
+          return startedAt !== null && retry.claimedAt !== null && startedAt * 1000 < retry.claimedAt - 2_000;
+        });
+        if (!nextCursor || crossedBoundary) {
+          authoritative = true;
+          break;
+        }
+        if (seenCursors.has(nextCursor)) {
+          logWarn('Model-capacity retry reconciliation returned a repeated cursor', {
+            threadId: retry.threadId,
+            operationId: retry.operationId,
+          });
+          scheduleModelCapacityReconciliation(retry);
+          return;
+        }
+        seenCursors.add(nextCursor);
+        if (page === MODEL_CAPACITY_RECONCILE_MAX_PAGES - 1) {
+          if (!sameGenerationAmbiguousStart) {
+            deps.stateStore.update((current) => (
+              current.modelCapacityRetry?.operationId === retry.operationId
+                ? { ...current, modelCapacityRetry: { ...current.modelCapacityRetry, reconcileCursor: nextCursor } }
+                : current
+            ));
+          }
+          scheduleModelCapacityReconciliation(retry);
+          return;
+        }
+        cursor = nextCursor;
+      }
+      if (!authoritative) {
+        scheduleModelCapacityReconciliation(retry);
+        return;
+      }
+      if (!matchedTurn) {
+        if (sameGenerationAmbiguousStart) {
+          scheduleModelCapacityReconciliation(retry);
+        } else if (retry.cancelRequested) {
+          const cleared = clearModelCapacityRetry(retry.operationId);
+          if (cleared) broadcastHello(cleared);
+        } else {
+          rescheduleModelCapacityRetry(retry);
+        }
+        return;
+      }
+      const matchedTurnId = turnRecordId(matchedTurn);
+      const status = turnStatusText(getValuePath(matchedTurn, ['status']) ?? getValuePath(matchedTurn, ['state']));
+      if (status === 'inProgress' && matchedTurnId && currentGenerationCapacityRetryOperations.has(retry.operationId)) {
+        const adopted = deps.stateStore.update((current) => {
+          const live = current.modelCapacityRetry;
+          if (!live || live.operationId !== retry.operationId) return current;
+          return {
+            ...current,
+            activeTurnId: matchedTurnId,
+            modelCapacityRetry: {
+              ...live,
+              status: 'inFlight',
+              retryAt: null,
+              claimedAt: live.claimedAt ?? Date.now(),
+              retryTurnId: matchedTurnId,
+              reconcileCursor: null,
+            },
+          };
+        });
+        broadcastHello(adopted);
+        const adoptedRetry = adopted.modelCapacityRetry;
+        if (adoptedRetry?.operationId === retry.operationId && adoptedRetry.cancelRequested) {
+          void interruptAcceptedModelCapacityRetry(adoptedRetry);
+        }
+        return;
+      }
+      if (retry.cancelRequested) {
+        const cleared = clearModelCapacityRetry(retry.operationId);
+        if (cleared) broadcastHello(cleared);
+        return;
+      }
+      if (status === 'failed' && isModelCapacityError(getValuePath(matchedTurn, ['error']))) {
+        rescheduleModelCapacityRetry(retry, matchedTurnId ?? retry.failedTurnId);
+        return;
+      }
+      if (status === 'inProgress') {
+        rescheduleModelCapacityRetry(retry, matchedTurnId ?? retry.failedTurnId);
+        return;
+      }
+      const cleared = clearModelCapacityRetry(retry.operationId);
+      if (cleared) broadcastHello(cleared);
+    } catch (error) {
+      logWarn('Failed to reconcile persisted model-capacity retry', error);
+      scheduleModelCapacityReconciliation(retry);
     }
   };
 
@@ -2629,6 +3092,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
     const activeTurnId = state.activeTurnId;
     const activeThreadPath = state.activeThreadPath;
+    rememberCancelledTurn(threadId, activeTurnId);
     const health = deps.codex.health();
     if (!health.connected || health.dead) {
       await finalizeActiveTurnBeforeClear(threadId, activeTurnId, activeThreadPath);
@@ -2790,6 +3254,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     }
     let claim: QueuedTurnClaim | null = null;
     const claimed = deps.stateStore.update((current) => {
+      if (modelCapacityRetryForThread(current, threadId)) return current;
       if (current.activeThreadId !== threadId || current.activeTurnId || !current.activeThreadId) return current;
       const shifted = shiftQueuedMessage(current.queue, threadId, { runnableOnly: true });
       if (!shifted.next) return current;
@@ -2819,6 +3284,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
     let claim: QueuedSteerClaim | null = null;
     const claimed = deps.stateStore.update((current) => {
+      if (modelCapacityRetryForThread(current, current.activeThreadId)) return current;
       if (!current.activeThreadId || !current.activeTurnId) return current;
       if (goalUpdates.has(current.activeThreadId)) {
         const nextQueuedMessage = queueForThread(current.queue, current.activeThreadId, { runnableOnly: true })[0];
@@ -2962,6 +3428,29 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     const completedThreadId = notificationThreadId(message);
     const completedTurnId = notificationTurnId(message);
     const receiptState = deps.stateStore.read();
+    const legacyCapacityKey = completedTurnId ? turnKey(completedThreadId, completedTurnId) : null;
+    const cancelledCapacityTurn = Boolean(
+      completedTurnId &&
+      (
+        cancelledTurnKeys.has(turnKey(completedThreadId, completedTurnId)) ||
+        cancelledTurnKeys.has(turnKey(receiptState.activeThreadId, completedTurnId)) ||
+        cancelledTurnKeys.has(turnKey(null, completedTurnId))
+      ),
+    );
+    if (completedTurnId) {
+      cancelledTurnKeys.delete(turnKey(completedThreadId, completedTurnId));
+      cancelledTurnKeys.delete(turnKey(receiptState.activeThreadId, completedTurnId));
+      cancelledTurnKeys.delete(turnKey(null, completedTurnId));
+    }
+    const failedTurnCompleted =
+      message.method === 'turn/completed' && getStringPath(message.params, ['turn', 'status']) === 'failed';
+    const capacityFailure =
+      !cancelledCapacityTurn &&
+      (
+        isFailedModelCapacityCompletion(message) ||
+        Boolean(failedTurnCompleted && legacyCapacityKey && legacyModelCapacityFailureKeys.has(legacyCapacityKey))
+      );
+    if (legacyCapacityKey) legacyModelCapacityFailureKeys.delete(legacyCapacityKey);
     const noTurnActiveTarget: ActiveCompletionTarget | null =
       advanceQueue &&
       !completedTurnId &&
@@ -2974,6 +3463,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         : null;
     const noTurnVerificationKey = noTurnActiveTarget ? turnKey(noTurnActiveTarget.threadId, noTurnActiveTarget.turnId) : null;
     const steerAtReceipt = queuedSteerInFlight;
+    const retryAtReceipt = receiptState.modelCapacityRetry;
     let resumeSteeringAfterIgnoredNoTurn = false;
     if (noTurnVerificationKey) {
       verifyingUnscopedTerminalKeys.set(
@@ -3071,6 +3561,39 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     const afterFinalize = deps.stateStore.read();
     const activeCompletion = activeStateMatchesCompletionTarget(afterFinalize);
 
+    const matchingCapacityRetry =
+      retryAtReceipt &&
+      retryAtReceipt.threadId === (threadIdToFinalize ?? receiptState.activeThreadId) &&
+      (retryAtReceipt.retryTurnId === turnIdToFinalize ||
+        (retryAtReceipt.status === 'starting' && receiptState.activeTurnId === turnIdToFinalize))
+        ? retryAtReceipt
+        : null;
+    if (matchingCapacityRetry && (!capacityFailure || matchingCapacityRetry.cancelRequested)) {
+      const clearedRetry = clearModelCapacityRetry(matchingCapacityRetry.operationId);
+      if (clearedRetry) broadcastHello(clearedRetry);
+    }
+
+    const scheduleCapacityRetryAfterClear = (): void => {
+      if (!capacityFailure || !activeCompletionTarget?.threadId || !turnIdToFinalize) return;
+      if (matchingCapacityRetry) {
+        if (matchingCapacityRetry.cancelRequested) return;
+        scheduleModelCapacityRetry(
+          matchingCapacityRetry.threadId,
+          turnIdToFinalize,
+          matchingCapacityRetry.attempt + 1,
+          matchingCapacityRetry.options,
+          matchingCapacityRetry.operationId,
+        );
+        return;
+      }
+      scheduleModelCapacityRetry(
+        activeCompletionTarget.threadId,
+        turnIdToFinalize,
+        1,
+        runOptionsFromRuntimeState(receiptState),
+      );
+    };
+
     if (!activeCompletion) {
       if (advanceQueue && !afterFinalize.activeThreadId && afterFinalize.activeTurnId) {
         const cleared = deps.stateStore.update((state) => ({ ...state, activeTurnId: null }));
@@ -3094,6 +3617,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         return stillActiveCompletion ? { ...current, activeTurnId: null } : current;
       });
       broadcastHello(cleared);
+      if (!advanceQueue) scheduleCapacityRetryAfterClear();
       if (completionKey) {
         completingTurnKeys.delete(completionKey);
         if (finalizedForCompletionKey) {
@@ -3191,9 +3715,34 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
     const timedOutQueuedStart = candidateThreadId ? timedOutQueuedStarts.get(candidateThreadId) : undefined;
     const ambiguousTimedOutStart = Boolean(timedOutQueuedStart && pendingContextCandidate);
     const pendingContext = ambiguousTimedOutStart || retainedContextCandidate ? null : takePendingTurnStartContext(notifiedThreadId);
-    const current = deps.stateStore.read();
+    let current = deps.stateStore.read();
     const threadId = notifiedThreadId ?? pendingContext?.threadId ?? contextCandidate?.threadId ?? null;
     if (!threadId) return;
+    const capacityRetry = current.modelCapacityRetry;
+    if (capacityRetry?.threadId === threadId) {
+      clearModelCapacityTimers();
+      const reconciled = deps.stateStore.update((state) => {
+        const live = state.modelCapacityRetry;
+        if (!live || live.operationId !== capacityRetry.operationId) return state;
+        if (live.status === 'scheduled') return { ...state, modelCapacityRetry: null };
+        if (live.status !== 'starting' && live.retryTurnId !== turnId) return state;
+        const acceptedRetry: ModelCapacityRetry = {
+          ...live,
+          status: 'inFlight',
+          retryAt: null,
+          claimedAt: live.claimedAt ?? Date.now(),
+          retryTurnId: turnId,
+          reconcileCursor: null,
+        };
+        return { ...state, activeTurnId: turnId, modelCapacityRetry: acceptedRetry };
+      });
+      const acceptedRetry = reconciled.modelCapacityRetry?.operationId === capacityRetry.operationId
+        ? reconciled.modelCapacityRetry
+        : null;
+      current = reconciled;
+      broadcastHello(reconciled);
+      if (acceptedRetry?.cancelRequested) void interruptAcceptedModelCapacityRetry(acceptedRetry);
+    }
     const compaction = compactionsInFlight.get(threadId);
     if (compaction && isPendingCompactionTurnForThread(current.activeTurnId, threadId)) compaction.turnId = turnId;
     const threadPath =
@@ -3304,6 +3853,18 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   };
 
   const unsubscribeNotification = deps.codex.onNotification((message) => {
+    if (isTerminalModelCapacityErrorNotification(message)) {
+      const threadId = notificationThreadId(message);
+      const turnId = notificationTurnId(message);
+      if (turnId) {
+        legacyModelCapacityFailureKeys.add(turnKey(threadId, turnId));
+        while (legacyModelCapacityFailureKeys.size > 200) {
+          const oldest = legacyModelCapacityFailureKeys.values().next().value;
+          if (typeof oldest !== 'string') break;
+          legacyModelCapacityFailureKeys.delete(oldest);
+        }
+      }
+    }
     const forwardToBrowser = !UNFORWARDED_BROWSER_NOTIFICATION_METHODS.has(message.method);
     const seq = forwardToBrowser ? rememberNotification(message) : null;
     const isTaskStart = message.method === 'turn/started' || (message.method === 'event_msg' && isTaskStartedEvent(message));
@@ -3351,6 +3912,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const unsubscribeHealthChange = deps.codex.onHealthChange(() => {
     const health = deps.codex.health();
     if (!health.connected || health.dead) {
+      clearModelCapacityTimers();
       invalidateResumedThreads();
       pendingServerRequests.clear();
       const current = deps.stateStore.read();
@@ -3361,13 +3923,25 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         });
         return;
       }
+    } else {
+      const retry = deps.stateStore.read().modelCapacityRetry;
+      if (retry?.status === 'scheduled') armModelCapacityRetry(retry);
+      else if (retry) scheduleModelCapacityReconciliation(retry);
     }
     broadcastHello();
   });
 
+  const persistedModelCapacityRetry = deps.stateStore.read().modelCapacityRetry;
+  if (persistedModelCapacityRetry?.status === 'scheduled') {
+    armModelCapacityRetry(persistedModelCapacityRetry);
+  } else if (persistedModelCapacityRetry) {
+    queueMicrotask(() => void reconcilePersistedModelCapacityRetry(persistedModelCapacityRetry.operationId));
+  }
+
   const close = () => {
     if (closed) return;
     closed = true;
+    clearModelCapacityTimers();
     invalidateRetainedDirectStartContexts();
     compactionsInFlight.clear();
     suppressedGoalQueueStarts.clear();
@@ -3429,7 +4003,8 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
           const current = deps.stateStore.read();
-          if (current.activeTurnId) {
+          const cancelledCapacityRetry = current.modelCapacityRetry?.cancelRequested === true;
+          if (codexBusy(current) && !cancelledCapacityRetry) {
             send(ws, { type: 'rpc/error', id: request.id, error: 'cannot restart Codex while a turn is active' });
             return;
           }
@@ -3445,12 +4020,14 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             const options = runOptionsFromRuntimeState(current);
             const resumePath = activeThreadId ? resumePathForThread(activeThreadId, activeThreadPath) : null;
 
+            if (cancelledCapacityRetry) clearModelCapacityTimers();
             pendingServerRequests.clear();
             invalidateResumedThreads();
             await deps.codex.restart();
 
             let state = deps.stateStore.update((state) => ({
               ...state,
+              ...(cancelledCapacityRetry ? { activeTurnId: null, modelCapacityRetry: null } : {}),
               appServerUrl: deps.codex.getUrl(),
               appServerPid: deps.codex.getPid(),
             }));
@@ -3495,6 +4072,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
                       ...state,
                       activeThreadPath: nextThreadPath,
                       activeTurnId: null,
+                      ...(cancelledCapacityRetry ? { modelCapacityRetry: null } : {}),
                       activeCwd,
                       ...runtimeStatus,
                       recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
@@ -3572,6 +4150,12 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
 
+          const retryBeforeSessionStart = deps.stateStore.read().modelCapacityRetry;
+          if (retryBeforeSessionStart && retryBeforeSessionStart.status !== 'scheduled') {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'stop the model-capacity retry before changing sessions' });
+            return;
+          }
+
           const options = runOptionsFromParams(request.params);
           const params = applyThreadRunOptions<SessionStartParams & { experimentalRawEvents: boolean; persistExtendedHistory: boolean; [key: string]: unknown }>({
             cwd,
@@ -3580,7 +4164,9 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }, options);
           let result: unknown;
           let generation = appServerGeneration;
+          let sessionStarted = false;
           sessionChangeInFlight = true;
+          if (retryBeforeSessionStart) clearModelCapacityTimers();
           try {
             const starting = ensureCodexStarted();
             if (starting) await starting;
@@ -3590,8 +4176,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             if (generation !== appServerGeneration || !health.connected || health.dead) {
               throw new Error('Codex app-server changed while starting session');
             }
+            sessionStarted = true;
           } finally {
             sessionChangeInFlight = false;
+            if (!sessionStarted && retryBeforeSessionStart) armModelCapacityRetry(deps.stateStore.read().modelCapacityRetry);
           }
           invalidateRetainedDirectStartContexts();
           const activeCwd = extractThreadCwd(result) ?? cwd;
@@ -3609,6 +4197,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             activeThreadPath,
             activeTurnId: null,
             activeGoal: null,
+            modelCapacityRetry: null,
             activeCwd,
             ...runtimeStatus,
             recentCwds: rememberCwd(state.recentCwds, activeCwd),
@@ -3631,6 +4220,12 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
           const requestedThreadPath = getOptionalString(request.params, 'threadPath');
 
+          const retryBeforeSessionResume = deps.stateStore.read().modelCapacityRetry;
+          if (retryBeforeSessionResume && retryBeforeSessionResume.status !== 'scheduled') {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'stop the model-capacity retry before changing sessions' });
+            return;
+          }
+
           const options = runOptionsFromParams(request.params);
           const resumePath = resumePathForThread(threadId, requestedThreadPath);
           const params = applyThreadRunOptions<SessionResumeParams & { experimentalRawEvents: boolean; persistExtendedHistory: boolean; [key: string]: unknown }>({
@@ -3642,7 +4237,9 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }, options);
           let result: unknown;
           let generation = appServerGeneration;
+          let sessionResumed = false;
           sessionChangeInFlight = true;
+          if (retryBeforeSessionResume) clearModelCapacityTimers();
           try {
             const starting = ensureCodexStarted();
             if (starting) await starting;
@@ -3651,8 +4248,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
               if (isMissingThreadError(error)) clearMissingActiveThread(threadId, error);
               throw error;
             });
+            sessionResumed = true;
           } finally {
             sessionChangeInFlight = false;
+            if (!sessionResumed && retryBeforeSessionResume) armModelCapacityRetry(deps.stateStore.read().modelCapacityRetry);
           }
           invalidateRetainedDirectStartContexts();
           const health = deps.codex.health();
@@ -3670,6 +4269,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             activeThreadPath,
             activeTurnId: null,
             activeGoal: state.activeGoal?.threadId === threadId ? state.activeGoal : null,
+            modelCapacityRetry: null,
             activeCwd,
             ...runtimeStatus,
             recentCwds: activeCwd ? rememberCwd(state.recentCwds, activeCwd) : state.recentCwds,
@@ -3772,7 +4372,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             send(ws, { type: 'rpc/error', id: request.id, error: 'thread is not the active session' });
             return;
           }
-          if (current.activeTurnId) {
+          if (codexBusy(current, threadId)) {
             send(ws, { type: 'rpc/error', id: request.id, error: 'cannot change model or effort while Codex is working' });
             return;
           }
@@ -4030,7 +4630,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             send(ws, { type: 'rpc/error', id: request.id, error: 'compaction is already in progress' });
             return;
           }
-          if (state.activeTurnId && state.activeThreadId === threadId) {
+          if (state.activeThreadId === threadId && codexBusy(state, threadId)) {
             send(ws, { type: 'rpc/error', id: request.id, error: 'cannot compact while Codex is working' });
             return;
           }
@@ -4117,6 +4717,17 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           const status = getOptionalEnum(request.params, 'status', GOAL_STATUSES);
           if (status) params.status = status;
 
+          const capacityRetryToCancel = modelCapacityRetryForThread(state, threadId);
+          if (capacityRetryToCancel) {
+            const cancelsScheduledRetry =
+              capacityRetryToCancel.status === 'scheduled' &&
+              (status === 'paused' || status === 'complete' || status === 'blocked');
+            if (!cancelsScheduledRetry) {
+              send(ws, { type: 'rpc/error', id: request.id, error: 'stop the model-capacity retry before changing the goal' });
+              return;
+            }
+          }
+
           if (isRecord(request.params) && hasOwn(request.params, 'tokenBudget')) {
             const tokenBudget = request.params.tokenBudget;
             if (tokenBudget !== null && (typeof tokenBudget !== 'number' || !Number.isFinite(tokenBudget))) {
@@ -4132,18 +4743,22 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           }
 
           let result: unknown;
+          let goalSetSucceeded = false;
           goalUpdates.add(threadId);
           goalMutationGeneration += 1;
           const lifecycleBarrier = params.status === 'paused' || params.status === 'complete' || params.status === 'blocked';
           const shouldInterruptGoalTurn = lifecycleBarrier && shouldInterruptActiveGoalTurn(threadId);
+          if (capacityRetryToCancel) clearModelCapacityTimers();
           try {
             if (shouldInterruptGoalTurn) {
               const interrupted = await interruptActiveTurnForThread(threadId);
               if (interrupted) broadcastHello(interrupted);
             }
             result = await requestCodex('thread/goal/set', params);
+            goalSetSucceeded = true;
           } finally {
             goalUpdates.delete(threadId);
+            if (!goalSetSucceeded && capacityRetryToCancel) armModelCapacityRetry(deps.stateStore.read().modelCapacityRetry);
             wakeQueuedWorkAfterGoalUpdate(threadId, {
               allowSteer: !shouldInterruptGoalTurn,
               allowStart:
@@ -4153,6 +4768,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
                 !hasOwn(params, 'objective') &&
                 state.activeGoal?.status !== 'active',
             });
+          }
+          if (capacityRetryToCancel) {
+            const cleared = clearModelCapacityRetry(capacityRetryToCancel.operationId);
+            if (cleared) broadcastHello(cleared);
           }
           const goal = threadGoalFromResult(result);
           const next = goal ? setActiveGoalForThread(goal) : null;
@@ -4174,6 +4793,10 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           const threadId = getRequiredString(request.params, 'threadId') ?? state.activeThreadId;
           if (!threadId) {
             send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
+            return;
+          }
+          if (modelCapacityRetryForThread(state, threadId)) {
+            send(ws, { type: 'rpc/error', id: request.id, error: 'stop the model-capacity retry before changing the goal' });
             return;
           }
           if (turnStartInFlightForThread(threadId)) {
@@ -4315,6 +4938,13 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             send(ws, { type: 'rpc/error', id: request.id, error: 'threadId is required' });
             return;
           }
+          const capacityRetryToCancel = modelCapacityRetryForThread(state, threadId);
+          if (capacityRetryToCancel) {
+            if (capacityRetryToCancel.status !== 'scheduled') {
+              send(ws, { type: 'rpc/error', id: request.id, error: 'stop the model-capacity retry before changing the goal' });
+              return;
+            }
+          }
           if (turnStartInFlightForThread(threadId)) {
             send(ws, { type: 'rpc/error', id: request.id, error: 'turn start is in progress' });
             return;
@@ -4326,6 +4956,8 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
           goalUpdates.add(threadId);
           goalMutationGeneration += 1;
+          let goalClearSucceeded = false;
+          if (capacityRetryToCancel) clearModelCapacityTimers();
           try {
             const shouldInterruptGoalTurn = shouldInterruptActiveGoalTurn(threadId);
             if (shouldInterruptGoalTurn) {
@@ -4333,11 +4965,17 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
               if (interrupted) broadcastHello(interrupted);
             }
             const result = await requestCodex('thread/goal/clear', { threadId });
+            goalClearSucceeded = true;
+            if (capacityRetryToCancel) {
+              const clearedRetry = clearModelCapacityRetry(capacityRetryToCancel.operationId);
+              if (clearedRetry) broadcastHello(clearedRetry);
+            }
             const next = clearActiveGoalForThread(threadId);
             if (next) broadcastHello(next);
             send(ws, { type: 'rpc/result', id: request.id, result });
           } finally {
             goalUpdates.delete(threadId);
+            if (!goalClearSucceeded && capacityRetryToCancel) armModelCapacityRetry(deps.stateStore.read().modelCapacityRetry);
             wakeQueuedWorkAfterGoalUpdate(threadId, { allowSteer: false, allowStart: false });
           }
           return;
@@ -4732,7 +5370,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
             return;
           }
           const currentState = deps.stateStore.read();
-          if (currentState.activeThreadId === threadId && currentState.activeTurnId) {
+          if (currentState.activeThreadId === threadId && codexBusy(currentState, threadId)) {
             send(ws, { type: 'rpc/error', id: request.id, error: 'Codex is already working; queue the message instead' });
             return;
           }
@@ -4819,6 +5457,25 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
 
         if (request.method === 'webui/turn/interrupt') {
           const state = deps.stateStore.read();
+          const capacityRetry = modelCapacityRetryForThread(state, state.activeThreadId);
+          if (capacityRetry?.status === 'scheduled') {
+            const next = clearModelCapacityRetry(capacityRetry.operationId) ?? deps.stateStore.read();
+            send(ws, { type: 'rpc/result', id: request.id, result: { ok: true, cancelledModelCapacityRetry: true } });
+            broadcastHello(next);
+            return;
+          }
+          if (capacityRetry?.status === 'starting') {
+            markModelCapacityRetryCancelled(capacityRetry.operationId);
+            scheduleModelCapacityReconciliation({ ...capacityRetry, cancelRequested: true });
+            send(ws, { type: 'rpc/result', id: request.id, result: { ok: true, cancellationPending: true } });
+            return;
+          }
+          if (capacityRetry?.status === 'inFlight') {
+            const cancelled = markModelCapacityRetryCancelled(capacityRetry.operationId);
+            if (cancelled) await interruptAcceptedModelCapacityRetry(cancelled);
+            send(ws, { type: 'rpc/result', id: request.id, result: { ok: true, cancelledModelCapacityRetry: true } });
+            return;
+          }
           if (!state.activeTurnId) {
             throw new Error('no active turn to interrupt');
           }
@@ -4833,6 +5490,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
           const activeThreadId = state.activeThreadId;
           const activeTurnId = state.activeTurnId;
           const activeThreadPath = state.activeThreadPath;
+          rememberCancelledTurn(activeThreadId, activeTurnId);
           const health = deps.codex.health();
           if (!health.connected || health.dead) {
             await finalizeActiveTurnBeforeClear(activeThreadId, activeTurnId, activeThreadPath);

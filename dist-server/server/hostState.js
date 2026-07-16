@@ -14,6 +14,8 @@ const SANDBOX_MODES = new Set(['read-only', 'workspace-write', 'danger-full-acce
 const COLLABORATION_MODES = new Set(['default', 'plan']);
 const GIT_UNTRACKED_MODES = new Set(['normal', 'all', 'no']);
 const GOAL_STATUSES = new Set(['active', 'paused', 'blocked', 'usageLimited', 'budgetLimited', 'complete']);
+const MODEL_CAPACITY_RETRY_STATUSES = new Set(['scheduled', 'starting', 'inFlight']);
+const MAX_MODEL_CAPACITY_RETRY_FUTURE_MS = 24 * 60 * 60 * 1000;
 function safeHost(hostname) {
     return hostname.replace(/[^A-Za-z0-9_.-]/g, '_');
 }
@@ -29,6 +31,7 @@ function defaultState(hostname) {
         mode: null,
         sandbox: null,
         activeGoal: null,
+        modelCapacityRetry: null,
         authTokenHash: null,
         appServerUrl: null,
         appServerPid: null,
@@ -124,6 +127,57 @@ function sanitizeGoal(value) {
         updatedAt,
     };
 }
+function sanitizeModelCapacityRetry(value, activeThreadId) {
+    if (!value || typeof value !== 'object')
+        return null;
+    const candidate = value;
+    const status = optionalEnum(candidate.status, MODEL_CAPACITY_RETRY_STATUSES);
+    const threadId = sanitizeBoundedString(candidate.threadId, 256);
+    const failedTurnId = sanitizeBoundedString(candidate.failedTurnId, 256);
+    const operationId = sanitizeBoundedString(candidate.operationId, 256);
+    const retryTurnId = sanitizeBoundedString(candidate.retryTurnId, 256);
+    const reconcileCursor = sanitizeBoundedString(candidate.reconcileCursor, 4096);
+    const attempt = sanitizeFiniteNumber(candidate.attempt);
+    const retryAt = sanitizeFiniteNumber(candidate.retryAt);
+    const claimedAt = sanitizeFiniteNumber(candidate.claimedAt);
+    if (!status ||
+        !threadId ||
+        threadId !== activeThreadId ||
+        !failedTurnId ||
+        !operationId ||
+        attempt === null ||
+        !Number.isSafeInteger(attempt) ||
+        attempt < 1 ||
+        attempt >= Number.MAX_SAFE_INTEGER) {
+        return null;
+    }
+    if (status === 'scheduled' && (retryAt === null || claimedAt !== null || retryTurnId || reconcileCursor || candidate.cancelRequested === true))
+        return null;
+    if (status === 'starting' && (retryAt !== null || claimedAt === null || retryTurnId))
+        return null;
+    if (status === 'inFlight' && (retryAt !== null || claimedAt === null || !retryTurnId))
+        return null;
+    if (retryAt !== null && (!Number.isSafeInteger(retryAt) || retryAt < 0 || retryAt > Date.now() + MAX_MODEL_CAPACITY_RETRY_FUTURE_MS))
+        return null;
+    if (claimedAt !== null && (!Number.isSafeInteger(claimedAt) || claimedAt < 0 || claimedAt > Date.now() + MAX_MODEL_CAPACITY_RETRY_FUTURE_MS))
+        return null;
+    const retry = {
+        status,
+        threadId,
+        failedTurnId,
+        attempt,
+        retryAt: status === 'scheduled' ? retryAt : null,
+        claimedAt: status === 'scheduled' ? null : claimedAt,
+        operationId,
+        retryTurnId: status === 'inFlight' ? retryTurnId : null,
+        reconcileCursor: reconcileCursor ?? null,
+        cancelRequested: candidate.cancelRequested === true,
+    };
+    const options = sanitizeRunOptions(candidate.options);
+    if (options)
+        retry.options = options;
+    return retry;
+}
 function repoIdForPath(repoPath) {
     return `repo:${createHash('sha1').update(repoPath).digest('hex')}`;
 }
@@ -193,6 +247,7 @@ function sanitizeState(hostname, value, maxQueueItems, maxRecentCwds) {
         mode: model ? (optionalEnum(candidate.mode, COLLABORATION_MODES) ?? null) : null,
         sandbox: optionalEnum(candidate.sandbox, SANDBOX_MODES) ?? null,
         activeGoal: sanitizeGoal(candidate.activeGoal),
+        modelCapacityRetry: sanitizeModelCapacityRetry(candidate.modelCapacityRetry, activeThreadId),
         queue,
         recentCwds: sanitizeStringArray(candidate.recentCwds, maxRecentCwds),
         gitWorkspaces: sanitizeGitWorkspaces(candidate.gitWorkspaces),

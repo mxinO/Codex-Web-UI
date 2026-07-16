@@ -10,6 +10,7 @@ interface ChatTimelineProps {
   hasOlder: boolean;
   showJumpToLatest: boolean;
   showActivityRunning?: boolean;
+  activityRunningLabel?: string;
   loading?: boolean;
   loadError?: string | null;
   retryScheduled?: boolean;
@@ -82,6 +83,7 @@ export default function ChatTimeline({
   hasOlder,
   showJumpToLatest,
   showActivityRunning = false,
+  activityRunningLabel = 'Running',
   loading = false,
   loadError = null,
   retryScheduled = false,
@@ -253,6 +255,7 @@ export default function ChatTimeline({
               key={`activity:${entry[0]?.id ?? 'empty'}`}
               items={entry}
               running={runningAppendsToLastActivity && index === lastGroupIndex}
+              runningLabel={activityRunningLabel}
               onOpenDetail={onOpenDetail}
             />
           ) : (
@@ -269,7 +272,7 @@ export default function ChatTimeline({
           ),
         )}
         {showActivityRunning && !runningAppendsToLastActivity && (
-          <ActivityBlock key="activity:running" items={[]} running onOpenDetail={onOpenDetail} />
+          <ActivityBlock key="activity:running" items={[]} running runningLabel={activityRunningLabel} onOpenDetail={onOpenDetail} />
         )}
         {items.length === 0 && !showActivityRunning && (
           <div className={`chat-empty${loadError && !loading ? ' chat-empty--error' : ''}`}>

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Added persistent automatic resume for temporary model-capacity failures, with bounded backoff, Stop support, restart recovery, and a visible waiting state.
+
 ## 0.3.9 - 2026-06-30
 
 ### Fixed

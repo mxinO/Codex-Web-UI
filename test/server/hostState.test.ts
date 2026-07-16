@@ -34,6 +34,7 @@ describe('HostStateStore', () => {
         activeThreadId: null,
         model: null,
         effort: null,
+        modelCapacityRetry: null,
         queue: [],
         gitWorkspaces: [],
       });
@@ -248,6 +249,97 @@ describe('HostStateStore', () => {
         createdAt: 100,
         updatedAt: 200,
       });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('sanitizes persisted model capacity retry state', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codex-webui-state-'));
+    try {
+      writeFileSync(
+        join(dir, 'login-node.runtime.json'),
+        JSON.stringify({
+          activeThreadId: 'thread-1',
+          modelCapacityRetry: {
+            status: 'starting',
+            threadId: ' thread-1 ',
+            failedTurnId: ' turn-failed ',
+            attempt: 2,
+            retryAt: null,
+            claimedAt: 456,
+            operationId: ' retry-operation ',
+            retryTurnId: null,
+            reconcileCursor: 'cursor-1',
+            cancelRequested: true,
+            options: { model: ' gpt-5.5 ', effort: 'high', mode: 'plan', sandbox: 'workspace-write' },
+            extra: 'drop me',
+          },
+        }),
+      );
+
+      expect(new HostStateStore(dir, 'login-node').read().modelCapacityRetry).toEqual({
+        status: 'starting',
+        threadId: 'thread-1',
+        failedTurnId: 'turn-failed',
+        attempt: 2,
+        retryAt: null,
+        claimedAt: 456,
+        operationId: 'retry-operation',
+        retryTurnId: null,
+        reconcileCursor: 'cursor-1',
+        cancelRequested: true,
+        options: { model: 'gpt-5.5', effort: 'high', mode: 'plan', sandbox: 'workspace-write' },
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('drops invalid or cross-thread model capacity retry state', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codex-webui-state-'));
+    try {
+      const statePath = join(dir, 'login-node.runtime.json');
+      const base = {
+        activeThreadId: 'thread-1',
+        modelCapacityRetry: {
+          status: 'scheduled',
+          threadId: 'thread-2',
+          failedTurnId: 'turn-failed',
+          attempt: 1,
+          retryAt: 123,
+          claimedAt: null,
+          operationId: 'retry-operation',
+          retryTurnId: null,
+          reconcileCursor: null,
+          cancelRequested: false,
+        },
+      };
+      writeFileSync(statePath, JSON.stringify(base));
+      expect(new HostStateStore(dir, 'login-node').read().modelCapacityRetry).toBeNull();
+
+      writeFileSync(statePath, JSON.stringify({ ...base, modelCapacityRetry: { ...base.modelCapacityRetry, threadId: 'thread-1', retryAt: null } }));
+      expect(new HostStateStore(dir, 'login-node').read().modelCapacityRetry).toBeNull();
+
+      writeFileSync(statePath, JSON.stringify({
+        ...base,
+        modelCapacityRetry: {
+          ...base.modelCapacityRetry,
+          threadId: 'thread-1',
+          retryAt: Date.now() + 25 * 60 * 60 * 1000,
+        },
+      }));
+      expect(new HostStateStore(dir, 'login-node').read().modelCapacityRetry).toBeNull();
+
+      writeFileSync(statePath, JSON.stringify({
+        ...base,
+        modelCapacityRetry: {
+          ...base.modelCapacityRetry,
+          threadId: 'thread-1',
+          attempt: Number.MAX_SAFE_INTEGER,
+        },
+      }));
+      expect(new HostStateStore(dir, 'login-node').read().modelCapacityRetry).toBeNull();
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

@@ -612,4 +612,18 @@ describe('ChatTimeline', () => {
     expect(document.querySelector('.activity-block__header')?.textContent).toContain('running');
     expect(document.querySelector('.activity-card--running')?.textContent).toContain('Running');
   });
+
+  it('labels the running row while waiting for an automatic capacity retry', () => {
+    render(
+      <ChatTimeline
+        {...baseProps}
+        items={[]}
+        showActivityRunning
+        activityRunningLabel="Waiting for model capacity"
+      />,
+    );
+
+    expect(document.querySelector('.activity-card--running')?.textContent).toContain('Waiting for model capacity');
+    expect(document.querySelector('.activity-card--running')?.textContent).toContain('Automatic retry is scheduled');
+  });
 });
