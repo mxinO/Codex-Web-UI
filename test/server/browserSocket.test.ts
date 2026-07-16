@@ -3422,6 +3422,7 @@ describe('attachBrowserSocket model capacity retry', () => {
       expect.objectContaining({
         threadId: 'thread-1',
         clientUserMessageId: firstOperationId,
+        input: [{ type: 'text', text: 'The previous turn was aborted. Carefully resume the work.', text_elements: [] }],
         model: 'gpt-5.4',
         effort: 'high',
       }),
