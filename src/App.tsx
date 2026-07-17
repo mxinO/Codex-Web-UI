@@ -61,6 +61,7 @@ import {
   timelineItemsWithRetainedLiveTurnOverlay,
   visibleRetainedLiveTurnItemsForTimeline,
   visibleLiveTurnItemsForTimeline,
+  withHistoryUserMatchOffsets,
   type LiveNotificationWindow,
   type TimelineItem,
 } from './lib/timeline';
@@ -870,7 +871,13 @@ export default function App() {
         const claimedMessageId = claimedQueuedMessageIdFromPendingUserItem(item);
         return !claimedMessageId || !nextQueueIds.has(claimedMessageId);
       });
-      const additions = claimedQueuedUserItemsWithoutHistory(timeline.items, claimed.filter((item) => !existingIds.has(item.id)));
+      const additions = claimedQueuedUserItemsWithoutHistory(
+        timeline.items,
+        withHistoryUserMatchOffsets(
+          [...timeline.items, ...pendingUserItems, ...retained],
+          claimed.filter((item) => !existingIds.has(item.id)),
+        ),
+      );
       return additions.length === 0 && retained.length === current.length ? current : [...retained, ...additions];
     });
 
@@ -879,7 +886,7 @@ export default function App() {
       if (!nextQueueIds.has(id)) manuallyRemovedQueuedIdsRef.current.delete(id);
     }
     replaceQueue(nextQueue);
-  }, [activeThreadId, localSortOrder, replaceQueue, state?.activeTurnId, state?.queue, timeline.items]);
+  }, [activeThreadId, localSortOrder, pendingUserItems, replaceQueue, state?.activeTurnId, state?.queue, timeline.items]);
 
   useEffect(() => {
     activeFileSummaryScopeRef.current = { threadId: activeThreadId, threadPath: activeThreadPath, turnId: state?.activeTurnId ?? null };
@@ -1256,22 +1263,23 @@ export default function App() {
     const pendingWindow = { id, threadId: activeThreadId, startCount: socket.notificationCount };
     updateRetainedLiveTurnItems(timelineItemsForChat, visibleLiveTurnItems);
     setPendingTurnWindow(pendingWindow);
+    const pendingItem: UserTimelineItem = {
+      id,
+      kind: 'user',
+      timestamp: now,
+      sortOrder: localSortOrder(id),
+      text,
+      turnId: state?.activeTurnId ?? `turn-start-pending:${activeThreadId ?? 'unscoped'}`,
+    };
     setPendingUserItems((items) => [
       ...items,
-      {
-        id,
-        kind: 'user',
-        timestamp: now,
-        sortOrder: localSortOrder(id),
-        text,
-        turnId: state?.activeTurnId ?? `turn-start-pending:${activeThreadId ?? 'unscoped'}`,
-      },
+      ...withHistoryUserMatchOffsets([...timeline.items, ...claimedQueuedUserItems, ...items], [pendingItem]),
     ]);
     return () => {
       setPendingUserItems((items) => items.filter((item) => item.id !== id));
       setPendingTurnWindow((current) => (current?.id === pendingWindow.id ? null : current));
     };
-  }, [activeThreadId, localSortOrder, socket.notificationCount, state?.activeTurnId, timelineItemsForChat, updateRetainedLiveTurnItems, visibleLiveTurnItems]);
+  }, [activeThreadId, claimedQueuedUserItems, localSortOrder, socket.notificationCount, state?.activeTurnId, timeline.items, timelineItemsForChat, updateRetainedLiveTurnItems, visibleLiveTurnItems]);
 
   const addDirectSubmitError = useCallback((_: string, error: string) => {
     const id = `direct-submit-error:${Date.now()}:${(ephemeralCounterRef.current += 1)}`;

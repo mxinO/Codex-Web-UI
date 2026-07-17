@@ -4,7 +4,7 @@ import type { CodexRunOptions, RuntimeStatusResult } from '../types/ui';
 type TimelineItemOrder = { sortOrder?: number | null };
 
 export type TimelineItem = TimelineItemOrder & (
-  | { id: string; kind: 'user'; timestamp: number; text: string; turnId?: string | null }
+  | { id: string; kind: 'user'; timestamp: number; text: string; turnId?: string | null; historyMatchOffset?: number }
   | {
       id: string;
       kind: 'assistant';
@@ -367,20 +367,6 @@ function isFinalAssistantTimelineItem(item: TimelineItem): item is Extract<Timel
   return item.kind === 'assistant' && (item.phase === null || item.phase === 'final_answer' || item.phase === 'final');
 }
 
-function finalAssistantAfterLaterActivity(items: TimelineItem[]): TimelineItem[] {
-  const firstFinalIndex = items.findIndex(isFinalAssistantTimelineItem);
-  if (firstFinalIndex < 0) return items;
-  if (!items.slice(firstFinalIndex + 1).some(isTurnActivityItem)) return items;
-
-  const finals: TimelineItem[] = [];
-  const others: TimelineItem[] = [];
-  for (const item of items) {
-    if (isFinalAssistantTimelineItem(item)) finals.push(item);
-    else others.push(item);
-  }
-  return [...others, ...finals];
-}
-
 export function turnToTimelineItems(turn: CodexTurn): TimelineItem[] {
   const timestamp = (turn.startedAt ?? 0) * 1000;
   const items = Array.isArray(turn.items) ? turn.items : [];
@@ -428,7 +414,7 @@ export function turnToTimelineItems(turn: CodexTurn): TimelineItem[] {
     return [{ id, kind: 'tool', timestamp, item, turnId: turn.id }];
   });
   const summary = syntheticFileChangeSummaryItem(turn, items, timestamp) ?? fileChangeSummaryItem({ ...turn, items }, timestamp);
-  return finalAssistantAfterLaterActivity(summary ? [...timelineItems, summary] : timelineItems);
+  return summary ? [...timelineItems, summary] : timelineItems;
 }
 
 export function trimTimelineWindow<T>(items: T[], limit: number): T[] {
@@ -491,7 +477,7 @@ function initialTimelineOrder(items: TimelineItem[]): TimelineItem[] {
     }
   });
 
-  const orderedScopedItems = turnOrder.flatMap((turnId) => finalAssistantAfterLaterActivity(itemsByTurn.get(turnId) ?? []));
+  const orderedScopedItems = turnOrder.flatMap((turnId) => itemsByTurn.get(turnId) ?? []);
   const ordered = [...items];
   scopedPositions.forEach((position, index) => {
     ordered[position] = orderedScopedItems[index];
@@ -541,7 +527,15 @@ export function reconcileTimelineItemsByArrival(previousItems: TimelineItem[], c
   );
   matchRemainingByKey((item) => `${item.id}\0${item.kind}`);
   matchRemainingByKey((item) => item.id);
-  previousItems.forEach((previous, previousIndex) => {
+  const semanticPreviousIndexes = previousItems.map((_, index) => index);
+  semanticPreviousIndexes.sort((left, right) => {
+    const leftIsUser = previousItems[left].kind === 'user';
+    const rightIsUser = previousItems[right].kind === 'user';
+    if (leftIsUser !== rightIsUser) return leftIsUser ? 1 : -1;
+    return leftIsUser ? right - left : left - right;
+  });
+  semanticPreviousIndexes.forEach((previousIndex) => {
+    const previous = previousItems[previousIndex];
     if (matches.has(previousIndex)) return;
     let candidateIndex = -1;
     const start = previous.kind === 'user' ? candidateItems.length - 1 : 0;
@@ -915,11 +909,54 @@ export function appendLiveTurnNotifications(
     timestamp = now,
     sortOrder: number | null = null,
   ) => {
-    const clearCompletedStreaming = () => {
-      next.streamingIndexes.delete(liveStreamingMessageKey(turnId, null));
-      if (sourceId) next.streamingIndexes.delete(liveStreamingMessageKey(turnId, sourceId));
-      next.deltaIndex = null;
+    const clearCompletedStreaming = (completedIndex: number | null = null) => {
+      const sourceIndex = sourceId ? next.streamingIndexes.get(liveStreamingMessageKey(turnId, sourceId)) : undefined;
+      const index = completedIndex ?? sourceIndex ?? null;
+      if (index === null) return;
+      for (const [key, streamingIndex] of next.streamingIndexes) {
+        if (streamingIndex === index) next.streamingIndexes.delete(key);
+      }
+      if (next.deltaIndex === index) next.deltaIndex = null;
     };
+    const normalizedText = normalizedMessageBlock(text);
+    let sourceStreamingIndex = -1;
+    let exactStreamingIndex = -1;
+    let prefixStreamingIndex = -1;
+    if (normalizedText) {
+      for (let index = next.items.length - 1; index >= 0; index -= 1) {
+        const candidate = next.items[index];
+        if (candidate.kind !== 'streaming' || (candidate.turnId ?? null) !== turnId) continue;
+        const candidateText = normalizedMessageBlock(candidate.text);
+        if (sourceId && candidate.sourceId === sourceId) {
+          sourceStreamingIndex = index;
+          break;
+        }
+        if (exactStreamingIndex < 0 && candidateText === normalizedText) exactStreamingIndex = index;
+        else if (prefixStreamingIndex < 0 && candidateText && (candidateText.startsWith(normalizedText) || normalizedText.startsWith(candidateText))) {
+          prefixStreamingIndex = index;
+        }
+      }
+    }
+    const coveredStreamingIndex = sourceStreamingIndex >= 0 ? sourceStreamingIndex : exactStreamingIndex >= 0 ? exactStreamingIndex : prefixStreamingIndex;
+    if (coveredStreamingIndex >= 0) {
+      const previousStreaming = next.items[coveredStreamingIndex];
+      next.sequence += 1;
+      const id = liveAssistantItemId(turnId, sourceId, next.sequence);
+      next.items[coveredStreamingIndex] = {
+        id,
+        kind: 'assistant',
+        timestamp: previousStreaming.timestamp,
+        sortOrder: previousStreaming.sortOrder,
+        text,
+        phase,
+        turnId,
+        sourceId,
+        liveSource,
+      };
+      next.itemIndexes.set(id, coveredStreamingIndex);
+      clearCompletedStreaming(coveredStreamingIndex);
+      return;
+    }
     const previous = next.items.at(-1);
     if (previous?.kind === 'assistant' && shouldReplaceLiveAssistantSnapshot(previous, text, phase, turnId, sourceId)) {
       next.items[next.items.length - 1] = { ...previous, text, phase, turnId, sourceId, liveSource };
@@ -1082,8 +1119,6 @@ export function appendLiveTurnNotifications(
           sortOrder,
         );
       }
-      next.deltaIndex = null;
-      next.streamingIndexes.delete(liveStreamingMessageKey(notificationTurnId(notification) ?? scope.activeTurnId, null));
       continue;
     }
 
@@ -1100,7 +1135,6 @@ export function appendLiveTurnNotifications(
           timestamp,
           sortOrder,
         );
-        next.deltaIndex = null;
         continue;
       }
 
@@ -1182,10 +1216,16 @@ export function visibleLiveTurnItemsForTimeline(
   const consumedPersistedAssistantKeys = new Set<string>();
   const emittedAssistantIdentityKeys = new Set<string>();
   const emittedUnidentifiedAssistantTextKeys = new Set<string>();
-  const emittedIdentifiedAssistantTextSourceCounts = new Map<string, Map<string, number>>();
-  const consumedIdentifiedAssistantTextSourceCounts = new Map<string, Map<string, number>>();
+  const emittedIdentifiedAssistantTextKeys = new Set<string>();
   const visibleAssistantIndexes = new Set<number>();
-  const visibleAssistants: TimelineItem[] = [];
+  const assistantReplacements = new Map<number, AssistantTimelineItem>();
+  const transportAssistants: Array<{
+    index: number;
+    item: AssistantTimelineItem;
+    text: string;
+    turnId: string;
+  }> = [];
+  const pairedTransportAssistantIndexes = new Set<number>();
 
   const sourcesAreCompatible = (item: AssistantTimelineItem | StreamingTimelineItem, assistant: AssistantTimelineItem): boolean => {
     return !item.sourceId || !assistant.sourceId || item.sourceId === assistant.sourceId;
@@ -1221,25 +1261,31 @@ export function visibleLiveTurnItemsForTimeline(
     if (item.kind === 'assistant' && persistedIds.has(item.id)) reserveExactPersistedAssistant(item);
   }
 
-  const addIdentifiedAssistantTextSource = (textKey: string, source: string) => {
-    const counts = emittedIdentifiedAssistantTextSourceCounts.get(textKey) ?? new Map<string, number>();
-    counts.set(source, (counts.get(source) ?? 0) + 1);
-    emittedIdentifiedAssistantTextSourceCounts.set(textKey, counts);
-  };
-
-  const consumeIdentifiedAssistantTextFromOtherSource = (textKey: string, source: string): boolean => {
-    const emittedCounts = emittedIdentifiedAssistantTextSourceCounts.get(textKey);
-    if (!emittedCounts) return false;
-    const consumedCounts = consumedIdentifiedAssistantTextSourceCounts.get(textKey) ?? new Map<string, number>();
-    for (const [otherSource, emittedCount] of emittedCounts) {
-      if (otherSource === source) continue;
-      const consumedCount = consumedCounts.get(otherSource) ?? 0;
-      if (consumedCount >= emittedCount) continue;
-      consumedCounts.set(otherSource, consumedCount + 1);
-      consumedIdentifiedAssistantTextSourceCounts.set(textKey, consumedCounts);
-      return true;
-    }
-    return false;
+  const consumeTransportAssistant = (
+    item: AssistantTimelineItem,
+    index: number,
+    turnId: string,
+    text: string,
+  ): boolean => {
+    if (!item.liveSource) return false;
+    const candidates = transportAssistants.filter(
+      (candidate) =>
+        !pairedTransportAssistantIndexes.has(candidate.index) &&
+        candidate.turnId === turnId &&
+        candidate.item.liveSource !== item.liveSource &&
+        assistantPhaseGroup(candidate.item.phase) === assistantPhaseGroup(item.phase),
+    );
+    const exact = candidates.find((entry) => entry.text === text);
+    const prefix = candidates.find((entry) => {
+      if (!entry.text || !text || (!entry.text.startsWith(text) && !text.startsWith(entry.text))) return false;
+      return !liveItems.slice(entry.index + 1, index).some(isTurnActivityItem);
+    });
+    const candidate = exact ?? prefix;
+    if (!candidate) return false;
+    pairedTransportAssistantIndexes.add(candidate.index);
+    pairedTransportAssistantIndexes.add(index);
+    if (item.liveSource === 'item_completed') assistantReplacements.set(candidate.index, item);
+    return true;
   };
 
   for (const [index, item] of liveItems.entries()) {
@@ -1249,7 +1295,6 @@ export function visibleLiveTurnItemsForTimeline(
     const turnId = timelineItemTurnId(item);
     if (!turnId) {
       visibleAssistantIndexes.add(index);
-      visibleAssistants.push(item);
       continue;
     }
 
@@ -1260,25 +1305,22 @@ export function visibleLiveTurnItemsForTimeline(
     const textKey = assistantTextKey(turnId, item.phase, text);
     if (identityKey && emittedAssistantIdentityKeys.has(identityKey)) continue;
     if (identityKey && emittedUnidentifiedAssistantTextKeys.has(textKey)) continue;
-    if (
-      identityKey &&
-      item.liveSource &&
-      options.allowAssistantTextMatchAcrossSources &&
-      consumeIdentifiedAssistantTextFromOtherSource(textKey, item.liveSource)
-    ) {
-      continue;
-    }
-    if (!identityKey && (emittedUnidentifiedAssistantTextKeys.has(textKey) || emittedIdentifiedAssistantTextSourceCounts.has(textKey))) continue;
+    if (identityKey && consumeTransportAssistant(item, index, turnId, text)) continue;
+    if (!identityKey && (emittedUnidentifiedAssistantTextKeys.has(textKey) || emittedIdentifiedAssistantTextKeys.has(textKey))) continue;
     if (identityKey) {
       emittedAssistantIdentityKeys.add(identityKey);
-      if (item.liveSource) addIdentifiedAssistantTextSource(textKey, item.liveSource);
+      emittedIdentifiedAssistantTextKeys.add(textKey);
+      if (item.liveSource) transportAssistants.push({ index, item, text, turnId });
     } else {
       emittedUnidentifiedAssistantTextKeys.add(textKey);
     }
     visibleAssistantIndexes.add(index);
-    visibleAssistants.push(item);
   }
 
+  const visibleAssistants = Array.from(visibleAssistantIndexes)
+    .sort((left, right) => left - right)
+    .map((index) => assistantReplacements.get(index) ?? liveItems[index])
+    .filter((item): item is AssistantTimelineItem => item.kind === 'assistant');
   const visibleAssistantsByTurn = assistantItemsByTurn(visibleAssistants);
   const consumedStreamingCoveringAssistants = new Set<string>();
   const consumedSourceLessFinalFallbackAssistants = new Set<string>();
@@ -1303,10 +1345,11 @@ export function visibleLiveTurnItemsForTimeline(
 
       const textIsCovered = messageLikelyCovers(item.text, assistant.text);
       const textCoverAllowed =
-        textIsCovered && (sameSource || !item.sourceId || !assistant.sourceId || options.allowAssistantTextMatchAcrossSources);
+        textIsCovered &&
+        (sameSource || !item.sourceId || !assistant.sourceId || assistant.liveSource === 'event_msg' || options.allowAssistantTextMatchAcrossSources);
       const covered =
         (sameSource && ((!item.active && assistantIsFinal(assistant)) || textIsCovered)) ||
-        (textCoverAllowed && assistantIsFinal(assistant));
+        (textCoverAllowed && (assistantIsFinal(assistant) || (!item.active && assistant.liveSource === 'event_msg')));
       if (!covered) continue;
 
       const key = streamingCoveringAssistantKey(assistant);
@@ -1329,16 +1372,19 @@ export function visibleLiveTurnItemsForTimeline(
     return false;
   };
 
-  return liveItems.filter((item, index) => {
-    if (item.kind === 'assistant') return visibleAssistantIndexes.has(index);
+  return liveItems.flatMap((item, index): TimelineItem[] => {
+    if (item.kind === 'assistant') {
+      if (!visibleAssistantIndexes.has(index)) return [];
+      return [assistantReplacements.get(index) ?? item];
+    }
     if (persistedIds.has(item.id)) {
       if (item.kind === 'streaming') consumeStreamingCoveringAssistant(item);
-      return false;
+      return [];
     }
-    if (item.kind !== 'streaming') return true;
-    if (item.kind === 'streaming' && isCoveredByLaterStreaming(item, index)) return false;
-    if (consumeStreamingCoveringAssistant(item)) return false;
-    return true;
+    if (item.kind !== 'streaming') return [item];
+    if (isCoveredByLaterStreaming(item, index)) return [];
+    if (consumeStreamingCoveringAssistant(item)) return [];
+    return [item];
   });
 }
 
@@ -1412,40 +1458,66 @@ export function visibleRetainedLiveTurnItemsForTimeline(
   }).filter((item) => !currentLiveKeys.has(liveCurrentDuplicateKey(item)));
 }
 
+function syntheticUserItemsWithoutHistory<T extends Extract<TimelineItem, { kind: 'user' }>>(historyItems: TimelineItem[], pendingItems: T[]): T[] {
+  const historyCounts = new Map<string, number>();
+  for (const item of historyItems) {
+    if (item.kind !== 'user' || !item.turnId || isSyntheticPendingTurnId(item.turnId)) continue;
+    const key = `${item.turnId}\0${item.text.trim()}`;
+    historyCounts.set(key, (historyCounts.get(key) ?? 0) + 1);
+  }
+
+  const pendingOccurrences = new Map<string, number>();
+  return pendingItems.filter((pending) => {
+    if (!pending.turnId || isSyntheticPendingTurnId(pending.turnId)) return true;
+    const key = `${pending.turnId}\0${pending.text.trim()}`;
+    const historyCount = historyCounts.get(key) ?? 0;
+    if (typeof pending.historyMatchOffset === 'number') return historyCount <= pending.historyMatchOffset;
+    const occurrence = pendingOccurrences.get(key) ?? 0;
+    pendingOccurrences.set(key, occurrence + 1);
+    return historyCount <= occurrence;
+  });
+}
+
+export function withHistoryUserMatchOffsets<T extends Extract<TimelineItem, { kind: 'user' }>>(historyItems: TimelineItem[], items: T[]): T[] {
+  const nextOffsets = new Map<string, number>();
+  for (const item of historyItems) {
+    if (item.kind !== 'user' || !item.turnId || isSyntheticPendingTurnId(item.turnId)) continue;
+    const key = `${item.turnId}\0${item.text.trim()}`;
+    const nextOffset = typeof item.historyMatchOffset === 'number' ? item.historyMatchOffset + 1 : (nextOffsets.get(key) ?? 0) + 1;
+    nextOffsets.set(key, Math.max(nextOffsets.get(key) ?? 0, nextOffset));
+  }
+
+  return items.map((item) => {
+    if (!item.turnId || isSyntheticPendingTurnId(item.turnId)) return item;
+    const key = `${item.turnId}\0${item.text.trim()}`;
+    if (typeof item.historyMatchOffset === 'number') {
+      nextOffsets.set(key, Math.max(nextOffsets.get(key) ?? 0, item.historyMatchOffset + 1));
+      return item;
+    }
+    const historyMatchOffset = nextOffsets.get(key) ?? 0;
+    nextOffsets.set(key, historyMatchOffset + 1);
+    return { ...item, historyMatchOffset };
+  });
+}
+
 export function pendingUserItemsWithoutHistory<T extends Extract<TimelineItem, { kind: 'user' }>>(historyItems: TimelineItem[], pendingItems: T[]): T[] {
-  return pendingItems.filter(
-    (pending) =>
-      !historyItems.some(
-        (item) =>
-          item.kind === 'user' &&
-          item.text.trim() === pending.text.trim() &&
-          Boolean(pending.turnId && !isSyntheticPendingTurnId(pending.turnId) && item.turnId === pending.turnId),
-      ),
-  );
+  return syntheticUserItemsWithoutHistory(historyItems, pendingItems);
 }
 
 export function claimedQueuedUserItemsWithoutHistory<T extends Extract<TimelineItem, { kind: 'user' }>>(historyItems: TimelineItem[], pendingItems: T[]): T[] {
-  const visible = pendingItems.filter(
-    (pending) =>
-      !historyItems.some(
-        (item) =>
-          item.kind === 'user' &&
-          item.text.trim() === pending.text.trim() &&
-          Boolean(pending.turnId && !isSyntheticPendingTurnId(pending.turnId) && item.turnId === pending.turnId),
-      ),
-  );
+  const visible = syntheticUserItemsWithoutHistory(historyItems, pendingItems);
   return visible.length > CLAIMED_QUEUED_USER_ITEM_LIMIT ? visible.slice(-CLAIMED_QUEUED_USER_ITEM_LIMIT) : visible;
 }
 
 export function retargetSyntheticUserItemsToTurn<T extends Extract<TimelineItem, { kind: 'user' }>>(items: T[], turnId: string | null | undefined): T[] {
   if (!turnId || isSyntheticPendingTurnId(turnId)) return items;
   let changed = false;
-  const next = items.map((item) => {
+  const retargeted = items.map((item) => {
     if (!item.turnId || !isSyntheticPendingTurnId(item.turnId)) return item;
     changed = true;
     return { ...item, turnId };
   });
-  return changed ? next : items;
+  return changed ? withHistoryUserMatchOffsets([], retargeted) : items;
 }
 
 function liveCurrentDuplicateKey(item: TimelineItem): string {
@@ -1555,26 +1627,52 @@ export function timelineItemsWithLiveTurnOverlay(items: TimelineItem[], liveItem
   if (!activeTurnId || liveItems.length === 0) return items;
 
   const liveIds = new Set(liveItems.map((item) => item.id));
-  const liveAssistantSourceIds = new Set<string>();
-  const liveUnidentifiedAssistantTexts = new Set<string>();
+  const liveAssistantSourceCounts = new Map<string, number>();
+  const liveAssistantTextCounts = new Map<string, number>();
   for (const item of liveItems) {
     if (item.kind !== 'assistant') continue;
     if (item.sourceId) {
-      liveAssistantSourceIds.add(item.sourceId);
-      continue;
+      liveAssistantSourceCounts.set(item.sourceId, (liveAssistantSourceCounts.get(item.sourceId) ?? 0) + 1);
     }
     const text = normalizedMessageBlock(item.text);
-    if (text) liveUnidentifiedAssistantTexts.add(text);
+    if (!text || (item.sourceId && item.liveSource !== 'event_msg')) continue;
+    const key = assistantTextKey(activeTurnId, item.phase, text);
+    liveAssistantTextCounts.set(key, (liveAssistantTextCounts.get(key) ?? 0) + 1);
   }
 
-  return items.filter((item) => {
-    if (timelineItemTurnId(item) !== activeTurnId) return true;
-    if (liveIds.has(item.id)) return false;
-    if (item.kind === 'assistant') {
-      if (item.sourceId && liveAssistantSourceIds.has(item.sourceId)) return false;
-      if (!item.sourceId && liveUnidentifiedAssistantTexts.has(normalizedMessageBlock(item.text))) return false;
-    }
+  const consumeLiveAssistantText = (item: Extract<TimelineItem, { kind: 'assistant' }>): boolean => {
+    const text = normalizedMessageBlock(item.text);
+    if (!text) return false;
+    const key = assistantTextKey(activeTurnId, item.phase, text);
+    const count = liveAssistantTextCounts.get(key) ?? 0;
+    if (count <= 0) return false;
+    if (count === 1) liveAssistantTextCounts.delete(key);
+    else liveAssistantTextCounts.set(key, count - 1);
     return true;
+  };
+
+  const exactAssistantIndexes = new Set<number>();
+  for (const [index, item] of items.entries()) {
+    if (timelineItemTurnId(item) !== activeTurnId || item.kind !== 'assistant' || !item.sourceId) continue;
+    const count = liveAssistantSourceCounts.get(item.sourceId) ?? 0;
+    if (count <= 0) continue;
+    exactAssistantIndexes.add(index);
+    if (count === 1) liveAssistantSourceCounts.delete(item.sourceId);
+    else liveAssistantSourceCounts.set(item.sourceId, count - 1);
+  }
+  for (const index of exactAssistantIndexes) {
+    const item = items[index];
+    if (item.kind === 'assistant') consumeLiveAssistantText(item);
+  }
+
+  return items.filter((item, index) => {
+    if (timelineItemTurnId(item) !== activeTurnId) return true;
+    if (item.kind === 'assistant') {
+      if (exactAssistantIndexes.has(index)) return false;
+      if (consumeLiveAssistantText(item)) return false;
+      return true;
+    }
+    return !liveIds.has(item.id);
   });
 }
 

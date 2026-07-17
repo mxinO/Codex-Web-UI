@@ -30,12 +30,13 @@ import {
   trimTimelineWindow,
   visibleRetainedLiveTurnItemsForTimeline,
   visibleLiveTurnItemsForTimeline,
+  withHistoryUserMatchOffsets,
 } from '../../src/lib/timeline';
 import type { TimelineItem } from '../../src/lib/timeline';
 import type { CodexTurn } from '../../src/types/codex';
 
 describe('timeline', () => {
-  it('moves a terminal final assistant after later same-turn activity', () => {
+  it('preserves the native item order returned by Codex', () => {
     const turn: CodexTurn = {
       id: 'turn-1',
       status: 'completed',
@@ -48,7 +49,7 @@ describe('timeline', () => {
       ],
     };
 
-    expect(turnToTimelineItems(turn).map((item) => item.kind)).toEqual(['user', 'command', 'assistant']);
+    expect(turnToTimelineItems(turn).map((item) => item.kind)).toEqual(['user', 'assistant', 'command']);
   });
 
   it('keeps chronological file edit cards and appends a per-turn file summary', () => {
@@ -89,7 +90,7 @@ describe('timeline', () => {
     ]);
   });
 
-  it('places the per-turn file summary before the terminal final assistant', () => {
+  it('appends the synthetic per-turn file summary without moving native messages', () => {
     const turn: CodexTurn = {
       id: 'turn-file',
       status: 'completed',
@@ -101,10 +102,10 @@ describe('timeline', () => {
       ],
     };
 
-    expect(turnToTimelineItems(turn).map((item) => item.kind)).toEqual(['fileChange', 'fileChangeSummary', 'assistant']);
+    expect(turnToTimelineItems(turn).map((item) => item.kind)).toEqual(['fileChange', 'assistant', 'fileChangeSummary']);
   });
 
-  it('places later notice activity before the terminal final assistant', () => {
+  it('does not reinterpret a final phase as an ordering instruction', () => {
     const turn: CodexTurn = {
       id: 'turn-notice',
       status: 'completed',
@@ -116,7 +117,7 @@ describe('timeline', () => {
       ],
     };
 
-    expect(turnToTimelineItems(turn).map((item) => item.kind)).toEqual(['notice', 'assistant']);
+    expect(turnToTimelineItems(turn).map((item) => item.kind)).toEqual(['assistant', 'notice']);
   });
 
   it('splits multiple raw changes from one Codex fileChange item into per-edit history cards', () => {
@@ -331,6 +332,172 @@ describe('timeline', () => {
     ]);
   });
 
+  it('matches repeated pending user messages to persisted occurrences without swapping them', () => {
+    const firstPending: TimelineItem = {
+      id: 'pending:user:1',
+      kind: 'user',
+      timestamp: 1000,
+      text: 'continue',
+      turnId: 'turn-1',
+    };
+    const reply: TimelineItem = {
+      id: 'turn-1:a1',
+      kind: 'assistant',
+      timestamp: 1000,
+      text: 'first reply',
+      phase: 'commentary',
+      turnId: 'turn-1',
+    };
+    const secondPending: TimelineItem = {
+      id: 'pending:user:2',
+      kind: 'user',
+      timestamp: 2000,
+      text: 'continue',
+      turnId: 'turn-1',
+    };
+    const firstPersisted: TimelineItem = {
+      id: 'turn-1:u1',
+      kind: 'user',
+      timestamp: 0,
+      text: 'continue',
+      turnId: 'turn-1',
+    };
+    const secondPersisted: TimelineItem = {
+      id: 'turn-1:u2',
+      kind: 'user',
+      timestamp: 0,
+      text: 'continue',
+      turnId: 'turn-1',
+    };
+
+    expect(
+      reconcileTimelineItemsByArrival(
+        [firstPending, reply, secondPending],
+        [firstPersisted, reply, secondPersisted],
+      ).map((item) => item.id),
+    ).toEqual(['turn-1:u1', 'turn-1:a1', 'turn-1:u2']);
+  });
+
+  it('keeps the later repeated pending user when only the first occurrence has persisted', () => {
+    const firstPending: Extract<TimelineItem, { kind: 'user' }> = {
+      id: 'pending:user:1',
+      kind: 'user',
+      timestamp: 1000,
+      text: 'continue',
+      turnId: 'turn-1',
+    };
+    const secondPending: Extract<TimelineItem, { kind: 'user' }> = {
+      id: 'pending:user:2',
+      kind: 'user',
+      timestamp: 2000,
+      text: 'continue',
+      turnId: 'turn-1',
+    };
+    const firstPersisted: TimelineItem = {
+      id: 'turn-1:u1',
+      kind: 'user',
+      timestamp: 0,
+      text: 'continue',
+      turnId: 'turn-1',
+    };
+    const reply: TimelineItem = {
+      id: 'turn-1:a1',
+      kind: 'assistant',
+      timestamp: 0,
+      text: 'first reply',
+      phase: 'commentary',
+      turnId: 'turn-1',
+    };
+
+    const visiblePending = pendingUserItemsWithoutHistory([firstPersisted, reply], [firstPending, secondPending]);
+    expect(visiblePending).toEqual([secondPending]);
+    expect(
+      reconcileTimelineItemsByArrival(
+        [firstPending, reply, secondPending],
+        [firstPersisted, reply, ...visiblePending],
+      ).map((item) => item.id),
+    ).toEqual(['turn-1:u1', 'turn-1:a1', 'pending:user:2']);
+  });
+
+  it('does not let older same-text history consume a newly claimed user occurrence', () => {
+    const oldHistory: TimelineItem = {
+      id: 'turn-1:u1',
+      kind: 'user',
+      timestamp: 0,
+      text: 'continue',
+      turnId: 'turn-1',
+    };
+    const newClaim: Extract<TimelineItem, { kind: 'user' }> = {
+      id: 'claimed-queued:user:q2',
+      kind: 'user',
+      timestamp: 2000,
+      text: 'continue',
+      turnId: 'turn-1',
+      historyMatchOffset: 1,
+    };
+
+    expect(claimedQueuedUserItemsWithoutHistory([oldHistory], [newClaim])).toEqual([newClaim]);
+    expect(
+      claimedQueuedUserItemsWithoutHistory(
+        [oldHistory, { ...oldHistory, id: 'turn-1:u2' }],
+        [newClaim],
+      ),
+    ).toEqual([]);
+  });
+
+  it('keeps repeated claimed user occurrences stable across cleanup passes', () => {
+    const claims = withHistoryUserMatchOffsets(
+      [],
+      [
+        { id: 'claimed-queued:user:q1', kind: 'user', timestamp: 1000, text: 'continue', turnId: 'turn-1' },
+        { id: 'claimed-queued:user:q2', kind: 'user', timestamp: 2000, text: 'continue', turnId: 'turn-1' },
+      ] satisfies Extract<TimelineItem, { kind: 'user' }>[],
+    );
+    const firstHistory: TimelineItem = {
+      id: 'turn-1:u1',
+      kind: 'user',
+      timestamp: 0,
+      text: 'continue',
+      turnId: 'turn-1',
+    };
+
+    const afterFirstPass = claimedQueuedUserItemsWithoutHistory([firstHistory], claims);
+    expect(afterFirstPass.map((item) => item.id)).toEqual(['claimed-queued:user:q2']);
+    expect(claimedQueuedUserItemsWithoutHistory([firstHistory], afterFirstPass).map((item) => item.id)).toEqual([
+      'claimed-queued:user:q2',
+    ]);
+    expect(
+      claimedQueuedUserItemsWithoutHistory(
+        [firstHistory, { ...firstHistory, id: 'turn-1:u2' }],
+        afterFirstPass,
+      ),
+    ).toEqual([]);
+  });
+
+  it('allocates one occurrence sequence across pending and claimed user collections', () => {
+    const [pending] = withHistoryUserMatchOffsets(
+      [],
+      [{ id: 'pending:user:1', kind: 'user', timestamp: 1000, text: 'continue', turnId: 'turn-1' }],
+    );
+    const [claimed] = withHistoryUserMatchOffsets(
+      [pending],
+      [{ id: 'claimed-queued:user:q1', kind: 'user', timestamp: 2000, text: 'continue', turnId: 'turn-1' }],
+    );
+    const firstHistory: TimelineItem = {
+      id: 'turn-1:u1',
+      kind: 'user',
+      timestamp: 0,
+      text: 'continue',
+      turnId: 'turn-1',
+    };
+
+    expect(pending).toMatchObject({ historyMatchOffset: 0 });
+    expect(claimed).toMatchObject({ historyMatchOffset: 1 });
+    expect(pendingUserItemsWithoutHistory([firstHistory], [pending])).toEqual([]);
+    expect(claimedQueuedUserItemsWithoutHistory([firstHistory], [claimed])).toEqual([claimed]);
+    expect(claimedQueuedUserItemsWithoutHistory([firstHistory], [claimed])).toEqual([claimed]);
+  });
+
   it('updates a same-id row without moving it past later rows', () => {
     const streaming: TimelineItem = { id: 'message-1', kind: 'streaming', timestamp: 1000, text: 'Hel', active: true, turnId: 'turn-1' };
     const later: TimelineItem = { id: 'tool-1', kind: 'notice', timestamp: 2000, text: 'Working', turnId: 'turn-1' };
@@ -447,7 +614,7 @@ describe('timeline', () => {
     expect(reconcileTimelineItemsByArrival([partial, later], [later, final])).toEqual([final, later]);
   });
 
-  it('normalizes same-turn final/activity order only when seeding a timeline', () => {
+  it('preserves same-turn candidate order when seeding a timeline', () => {
     const final: TimelineItem = { id: 'turn-1:final', kind: 'assistant', timestamp: 1000, text: 'Done.', phase: 'final_answer', turnId: 'turn-1' };
     const command: TimelineItem = {
       id: 'turn-1:command',
@@ -472,9 +639,9 @@ describe('timeline', () => {
     };
 
     expect(reconcileTimelineItemsByArrival([], [final, bang, command]).map((item) => item.id)).toEqual([
-      'turn-1:command',
-      'bang:1',
       'turn-1:final',
+      'bang:1',
+      'turn-1:command',
     ]);
     expect(reconcileTimelineItemsByArrival([final, bang], [final, bang, command]).map((item) => item.id)).toEqual([
       'turn-1:final',
@@ -762,7 +929,7 @@ describe('timeline', () => {
       100,
     );
 
-    expect(liveItems.map((item) => item.kind)).toEqual(['streaming', 'assistant']);
+    expect(liveItems.map((item) => item.kind)).toEqual(['assistant']);
     expect(visibleLiveTurnItemsForTimeline([], liveItems).map((item) => item.kind)).toEqual(['assistant']);
   });
 
@@ -784,7 +951,7 @@ describe('timeline', () => {
       100,
     );
 
-    expect(liveItems[0]).toMatchObject({ kind: 'streaming', active: false });
+    expect(liveItems[0]).toMatchObject({ kind: 'assistant', text: 'Created the file.' });
     expect(visibleLiveTurnItemsForTimeline([], liveItems).map((item) => item.kind)).toEqual(['assistant']);
   });
 
@@ -822,9 +989,8 @@ describe('timeline', () => {
       100,
     );
 
-    expect(liveItems.map((item) => item.kind)).toEqual(['streaming', 'assistant', 'streaming']);
+    expect(liveItems.map((item) => item.kind)).toEqual(['assistant', 'streaming']);
     expect(liveItems.map((item) => (item.kind === 'streaming' ? `${item.text}:${item.active}` : item.kind === 'assistant' ? item.text : item.id))).toEqual([
-      'First:false',
       'First finalized.',
       'Second:true',
     ]);
@@ -1179,10 +1345,150 @@ describe('timeline', () => {
       100,
     );
 
-    expect(visibleLiveTurnItemsForTimeline([], liveItems).map((item) => item.id)).toEqual(['turn-1:transport-1', 'turn-1:persisted-1']);
+    expect(visibleLiveTurnItemsForTimeline([], liveItems).map((item) => item.id)).toEqual(['turn-1:persisted-1']);
     expect(visibleLiveTurnItemsForTimeline([], liveItems, { allowAssistantTextMatchAcrossSources: true }).map((item) => item.id)).toEqual([
-      'turn-1:transport-1',
+      'turn-1:persisted-1',
     ]);
+  });
+
+  it('dedupes event-message and completed-message snapshots while the turn is active', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', id: 'transport-1', message: 'Inspecting now.', phase: 'commentary', turn_id: 'turn-1' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'persisted-1', text: 'Inspecting now.', phase: 'commentary' },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      100,
+    );
+
+    expect(visibleLiveTurnItemsForTimeline([], liveItems).map((item) => item.id)).toEqual(['turn-1:persisted-1']);
+  });
+
+  it('replaces a shorter raw-event snapshot with its structured completion in place', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', id: 'transport-1', message: 'Inspecting', phase: 'commentary', turn_id: 'turn-1' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'persisted-1', text: 'Inspecting now.', phase: 'commentary' },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      100,
+    );
+
+    expect(visibleLiveTurnItemsForTimeline([], liveItems)).toEqual([
+      expect.objectContaining({ id: 'turn-1:persisted-1', kind: 'assistant', text: 'Inspecting now.' }),
+    ]);
+  });
+
+  it('does not prefix-pair distinct transport messages across activity', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'event_msg', params: { type: 'agent_message', id: 'transport-1', message: 'Inspecting', phase: 'commentary', turn_id: 'turn-1' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'commandExecution', id: 'cmd-1', command: 'pwd', cwd: '/repo', status: 'completed', aggregatedOutput: '/repo\n', exitCode: 0 },
+          },
+        },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'persisted-1', text: 'Inspecting now.', phase: 'commentary' },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      100,
+    );
+
+    expect(visibleLiveTurnItemsForTimeline([], liveItems).map((item) => item.id)).toEqual([
+      'turn-1:transport-1',
+      'turn-1:cmd-1',
+      'turn-1:persisted-1',
+    ]);
+  });
+
+  it('replaces an inactive delta stream at its original slot across transport ids', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        {
+          method: 'item/agentMessage/delta',
+          params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'delta-1', delta: 'Inspecting now.' },
+        },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'commandExecution', id: 'cmd-1', command: 'pwd', cwd: '/repo', status: 'completed', aggregatedOutput: '/repo\n', exitCode: 0 },
+          },
+        },
+        {
+          method: 'event_msg',
+          params: { type: 'agent_message', id: 'transport-1', message: 'Inspecting now.', phase: 'commentary', turn_id: 'turn-1' },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      100,
+    );
+
+    expect(visibleLiveTurnItemsForTimeline([], liveItems).map((item) => item.id)).toEqual([
+      'turn-1:transport-1',
+      'turn-1:cmd-1',
+    ]);
+  });
+
+  it('matches a delayed final to its source before a newer prefix-sharing stream', () => {
+    const liveItems = liveTurnItemsFromNotifications(
+      [
+        { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'a1', delta: 'Inspecting' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'commandExecution', id: 'cmd-1', command: 'pwd', cwd: '/repo', status: 'completed', aggregatedOutput: '/repo\n', exitCode: 0 },
+          },
+        },
+        { method: 'item/agentMessage/delta', params: { threadId: 'thread-1', turnId: 'turn-1', itemId: 'a2', delta: 'Inspecting now.' } },
+        {
+          method: 'item/completed',
+          params: {
+            threadId: 'thread-1',
+            turnId: 'turn-1',
+            item: { type: 'agentMessage', id: 'a1', text: 'Inspecting', phase: 'commentary' },
+          },
+        },
+      ],
+      { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      true,
+      100,
+    );
+
+    expect(liveItems.map((item) => item.id)).toEqual(['turn-1:a1', 'turn-1:cmd-1', 'turn-1:a2']);
+    expect(liveItems.map((item) => item.kind)).toEqual(['assistant', 'command', 'streaming']);
+    expect(liveItems[2]).toMatchObject({ kind: 'streaming', active: true });
   });
 
   it('dedupes repeated event/completed assistant pairs without collapsing legitimate repeated text', () => {
@@ -1212,9 +1518,13 @@ describe('timeline', () => {
       100,
     );
 
+    expect(visibleLiveTurnItemsForTimeline([], liveItems).map((item) => item.id)).toEqual([
+      'turn-1:persisted-1',
+      'turn-1:persisted-2',
+    ]);
     expect(visibleLiveTurnItemsForTimeline([], liveItems, { allowAssistantTextMatchAcrossSources: true }).map((item) => item.id)).toEqual([
-      'turn-1:transport-1',
-      'turn-1:transport-2',
+      'turn-1:persisted-1',
+      'turn-1:persisted-2',
     ]);
   });
 
@@ -1370,7 +1680,7 @@ describe('timeline', () => {
     };
 
     expect(visibleLiveTurnItemsForTimeline([], [visibleAssistant, duplicateAssistant, first, second], { allowAssistantTextMatchAcrossSources: true })).toEqual([
-      visibleAssistant,
+      duplicateAssistant,
       second,
     ]);
   });
@@ -1566,6 +1876,82 @@ describe('timeline', () => {
     ];
 
     expect(timelineItemsWithLiveTurnOverlay(history, live, 'turn-1').map((item) => item.id)).toEqual(['turn-1:a2']);
+  });
+
+  it('replaces persisted history with an equivalent raw-event assistant snapshot', () => {
+    const history: TimelineItem[] = [
+      { id: 'turn-1:persisted', kind: 'assistant', timestamp: 100, text: 'Inspecting now.', phase: 'commentary', turnId: 'turn-1', sourceId: 'persisted' },
+    ];
+    const live: TimelineItem[] = [
+      {
+        id: 'turn-1:transport',
+        kind: 'assistant',
+        timestamp: 200,
+        text: 'Inspecting now.',
+        phase: 'commentary',
+        turnId: 'turn-1',
+        sourceId: 'transport',
+        liveSource: 'event_msg',
+      },
+    ];
+
+    expect(timelineItemsWithLiveTurnOverlay(history, live, 'turn-1')).toEqual([]);
+  });
+
+  it('matches raw-event overlays to repeated persisted text one occurrence at a time', () => {
+    const history: TimelineItem[] = [
+      { id: 'turn-1:first', kind: 'assistant', timestamp: 100, text: 'Still working.', phase: 'commentary', turnId: 'turn-1', sourceId: 'first' },
+      { id: 'turn-1:second', kind: 'assistant', timestamp: 101, text: 'Still working.', phase: 'commentary', turnId: 'turn-1', sourceId: 'second' },
+    ];
+    const live: TimelineItem[] = [
+      {
+        id: 'turn-1:transport',
+        kind: 'assistant',
+        timestamp: 200,
+        text: 'Still working.',
+        phase: 'commentary',
+        turnId: 'turn-1',
+        sourceId: 'transport',
+        liveSource: 'event_msg',
+      },
+    ];
+
+    expect(timelineItemsWithLiveTurnOverlay(history, live, 'turn-1').map((item) => item.id)).toEqual(['turn-1:second']);
+  });
+
+  it('reserves an exact completed-item history match before applying raw-event text overlays', () => {
+    const history: TimelineItem[] = [
+      { id: 'turn-1:first', kind: 'assistant', timestamp: 100, text: 'Done.', phase: 'commentary', turnId: 'turn-1', sourceId: 'first' },
+      { id: 'turn-1:cmd', kind: 'command', timestamp: 101, command: 'pwd', cwd: '/repo', output: '/repo\n', status: 'completed', exitCode: 0, turnId: 'turn-1' },
+      { id: 'turn-1:second', kind: 'assistant', timestamp: 102, text: 'Done.', phase: 'commentary', turnId: 'turn-1', sourceId: 'second' },
+    ];
+    const live: TimelineItem[] = [
+      {
+        id: 'turn-1:transport',
+        kind: 'assistant',
+        timestamp: 200,
+        text: 'Done.',
+        phase: 'commentary',
+        turnId: 'turn-1',
+        sourceId: 'transport',
+        liveSource: 'event_msg',
+      },
+      {
+        id: 'turn-1:second',
+        kind: 'assistant',
+        timestamp: 201,
+        text: 'Done.',
+        phase: 'commentary',
+        turnId: 'turn-1',
+        sourceId: 'second',
+        liveSource: 'item_completed',
+      },
+    ];
+
+    expect(timelineItemsWithLiveTurnOverlay(history, live, 'turn-1').map((item) => item.id)).toEqual([
+      'turn-1:first',
+      'turn-1:cmd',
+    ]);
   });
 
   it('hides retained streaming once the current live item has finalized for the same source id', () => {
@@ -1975,7 +2361,7 @@ describe('timeline', () => {
     ]);
   });
 
-  it('keeps a retained file summary before the matching persisted final assistant', () => {
+  it('keeps a retained file summary at the turn tail without moving native messages', () => {
     const history: TimelineItem[] = [
       { id: 'turn-1:u1', kind: 'user', timestamp: 1000, text: 'question', turnId: 'turn-1' },
       { id: 'turn-1:final', kind: 'assistant', timestamp: 1000, text: 'Done.', phase: 'final_answer', turnId: 'turn-1' },
@@ -1992,8 +2378,8 @@ describe('timeline', () => {
 
     expect(merged.map((item) => (item.kind === 'assistant' || item.kind === 'user' ? item.text : item.id))).toEqual([
       'question',
-      'turn-1:file-summary',
       'Done.',
+      'turn-1:file-summary',
     ]);
   });
 
@@ -2205,7 +2591,7 @@ describe('timeline', () => {
 
     const retargeted = retargetSyntheticUserItemsToTurn(claimed, 'turn-real');
 
-    expect(retargeted).toEqual([{ ...claimed[0], turnId: 'turn-real' }]);
+    expect(retargeted).toEqual([{ ...claimed[0], turnId: 'turn-real', historyMatchOffset: 0 }]);
     expect(
       claimedQueuedUserItemsWithoutHistory(
         [{ id: 'turn-real:u1', kind: 'user', timestamp: 1000, text: 'started from queue', turnId: 'turn-real' }],
