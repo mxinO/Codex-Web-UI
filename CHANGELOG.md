@@ -8,7 +8,7 @@
 
 ### Fixed
 
-- Allowed the required `better-sqlite3` install script during `codex-web-ui --update` while keeping other dependency install scripts blocked.
+- Allowed dependency install scripts during `codex-web-ui --update`, ensuring native dependencies such as `better-sqlite3` are installed correctly.
 
 ## 0.3.9 - 2026-06-30
 

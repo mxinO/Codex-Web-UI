@@ -276,7 +276,7 @@ export async function runUpdate(args, options = {}) {
     let child;
 
     try {
-      child = spawn(npmCommand(platform), ['install', '-g', '--allow-scripts=better-sqlite3', updateOptions.source], {
+      child = spawn(npmCommand(platform), ['install', '-g', '--dangerously-allow-all-scripts', updateOptions.source], {
         env: process.env,
         stdio: ['inherit', 'inherit', 'pipe'],
       });
