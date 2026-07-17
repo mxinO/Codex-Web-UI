@@ -6,6 +6,10 @@
 
 - Added persistent automatic resume for temporary model-capacity failures, with bounded backoff, Stop support, restart recovery, and a visible waiting state.
 
+### Fixed
+
+- Allowed the required `better-sqlite3` install script during `codex-web-ui --update` while keeping other dependency install scripts blocked.
+
 ## 0.3.9 - 2026-06-30
 
 ### Fixed

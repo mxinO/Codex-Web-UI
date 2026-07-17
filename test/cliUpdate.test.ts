@@ -97,7 +97,7 @@ describe('CLI update helper', () => {
     child.exit(0);
 
     await expect(resultPromise).resolves.toBe(0);
-    expect(spawn).toHaveBeenCalledWith('npm', ['install', '-g', DEFAULT_UPDATE_SOURCE], expect.objectContaining({
+    expect(spawn).toHaveBeenCalledWith('npm', ['install', '-g', '--allow-scripts=better-sqlite3', DEFAULT_UPDATE_SOURCE], expect.objectContaining({
       stdio: ['inherit', 'inherit', 'pipe'],
     }));
     expect(stdout.write).toHaveBeenCalledWith(expect.stringContaining('Updating codex-web-ui 0.1.0'));
@@ -215,7 +215,7 @@ describe('CLI update helper', () => {
     child.exit(0);
 
     await expect(resultPromise).resolves.toBe(0);
-    expect(spawn).toHaveBeenCalledWith('npm', ['install', '-g', 'file:///tmp/codex-web-ui.tgz'], expect.any(Object));
+    expect(spawn).toHaveBeenCalledWith('npm', ['install', '-g', '--allow-scripts=better-sqlite3', 'file:///tmp/codex-web-ui.tgz'], expect.any(Object));
   });
 
   it('rejects a missing update source value before spawning npm', async () => {
@@ -277,13 +277,13 @@ describe('CLI update helper', () => {
       expect(spawn).toHaveBeenNthCalledWith(
         1,
         'npm',
-        ['install', '-g', DEFAULT_UPDATE_SOURCE],
+        ['install', '-g', '--allow-scripts=better-sqlite3', DEFAULT_UPDATE_SOURCE],
         expect.objectContaining({ stdio: ['inherit', 'inherit', 'pipe'] }),
       );
       expect(spawn).toHaveBeenNthCalledWith(
         2,
         'npm',
-        ['install', '-g', DEFAULT_UPDATE_SOURCE],
+        ['install', '-g', '--allow-scripts=better-sqlite3', DEFAULT_UPDATE_SOURCE],
         expect.objectContaining({ stdio: ['inherit', 'inherit', 'pipe'] }),
       );
       expect(capturedText(stderr)).toBe(diagnostic);
