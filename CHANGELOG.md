@@ -8,6 +8,7 @@
 
 ### Fixed
 
+- Prevented repeated turn-start and experimental raw completion events from dropping goal activity cards or clearing the live Running state.
 - Allowed dependency install scripts during `codex-web-ui --update`, ensuring native dependencies such as `better-sqlite3` are installed correctly.
 - Added browser WebSocket heartbeats and stale-connection recovery so live progress resumes automatically after silent network or SSH tunnel failures.
 

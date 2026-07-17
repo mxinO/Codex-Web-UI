@@ -342,6 +342,60 @@ describe('App queued message tray', () => {
     ]));
   });
 
+  it('does not discard earlier activity when turn started is repeated for the active turn', async () => {
+    mocks.activeGoal = {
+      threadId: 'thread-1', objective: 'Keep working', status: 'active', tokenBudget: null,
+      tokensUsed: 1, timeUsedSeconds: 1, createdAt: 100, updatedAt: 100,
+    };
+    mocks.notifications = [
+      { method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'inProgress' } } },
+      {
+        method: 'item/completed',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'commandExecution', id: 'cmd-1', command: 'pwd', cwd: '/repo', status: 'completed',
+            aggregatedOutput: '/repo\n', exitCode: 0,
+          },
+        },
+      },
+    ];
+    mocks.notificationCount = 2;
+
+    renderApp();
+    await flushReact();
+    expect(mocks.chatTimelineItems).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'turn-1:cmd-1', kind: 'command', turnId: 'turn-1' }),
+    ]));
+
+    mocks.activeGoal = { ...mocks.activeGoal, tokensUsed: 2, updatedAt: 200 };
+    mocks.notifications = [
+      ...mocks.notifications,
+      { method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'inProgress' } } },
+      {
+        method: 'item/started',
+        params: {
+          threadId: 'thread-1',
+          turnId: 'turn-1',
+          item: {
+            type: 'mcpToolCall', id: 'subagent-1', server: 'multi_agent_v1', tool: 'wait_agent',
+            arguments: { targets: ['agent-1'] }, status: 'inProgress',
+          },
+        },
+      },
+    ];
+    mocks.notificationCount = 4;
+    rerenderApp();
+    await flushReact();
+
+    expect(mocks.chatTimelineItems).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: 'turn-1:cmd-1', kind: 'command', turnId: 'turn-1' }),
+      expect.objectContaining({ id: 'turn-1:subagent-1', kind: 'tool', turnId: 'turn-1' }),
+    ]));
+    expect(mocks.chatTimelineProps?.showActivityRunning).toBe(true);
+  });
+
   afterEach(() => {
     act(() => {
       root?.unmount();

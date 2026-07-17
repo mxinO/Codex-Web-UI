@@ -61,6 +61,7 @@ import {
   timelineItemsWithRetainedLiveTurnOverlay,
   visibleRetainedLiveTurnItemsForTimeline,
   visibleLiveTurnItemsForTimeline,
+  type LiveNotificationWindow,
   type TimelineItem,
 } from './lib/timeline';
 import type { CodexThread } from './types/codex';
@@ -325,7 +326,12 @@ export default function App() {
   const transientSessionMessageTimerRef = useRef<number | null>(null);
   const manuallyRemovedQueuedIdsRef = useRef(new Set<string>());
   const finalizedFileSummaryFetchesRef = useRef(new Set<string>());
-  const liveNotificationWindowRef = useRef({ activeThreadId, activeTurnId: state?.activeTurnId ?? null, startCount: socket.notificationCount });
+  const liveNotificationWindowRef = useRef<LiveNotificationWindow>({
+    activeThreadId,
+    activeTurnId: state?.activeTurnId ?? null,
+    startCount: socket.notificationCount,
+    startIsProvisional: Boolean(state?.activeTurnId && !isSyntheticPendingTurnId(state.activeTurnId)),
+  });
   const lastHandledCompletionCountRef = useRef<number | null>(null);
   const fileOpenGenerationRef = useRef(0);
   const fileOpenAbortRef = useRef<AbortController | null>(null);

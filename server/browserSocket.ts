@@ -3888,7 +3888,16 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
         }
       }
     }
-    const forwardToBrowser = !UNFORWARDED_BROWSER_NOTIFICATION_METHODS.has(message.method);
+    const notificationState = deps.stateStore.read();
+    const terminalDisposition = notificationTerminalDisposition(message);
+    const suppressRawGoalTerminal = Boolean(
+      terminalDisposition &&
+      message.method === 'event_msg' &&
+      notificationState.activeGoal?.status === 'active' &&
+      notificationState.activeGoal.threadId === notificationState.activeThreadId &&
+      (!notificationThreadId(message) || notificationThreadId(message) === notificationState.activeThreadId)
+    );
+    const forwardToBrowser = !suppressRawGoalTerminal && !UNFORWARDED_BROWSER_NOTIFICATION_METHODS.has(message.method);
     const seq = forwardToBrowser ? rememberNotification(message) : null;
     const isTaskStart = message.method === 'turn/started' || (message.method === 'event_msg' && isTaskStartedEvent(message));
     if (isTaskStart) handleTaskStarted(message);
@@ -3920,8 +3929,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
       enqueuePatchApplyEnd(message);
     }
     if (message.method === 'item/completed') enqueueStructuredFileChange(message);
-    const terminalDisposition = notificationTerminalDisposition(message);
-    if (terminalDisposition) void handleTurnCompleted(message, terminalDisposition);
+    if (terminalDisposition && !suppressRawGoalTerminal) void handleTurnCompleted(message, terminalDisposition);
   });
 
   const unsubscribeServerRequest = deps.codex.onServerRequest((message) => {

@@ -63,6 +63,7 @@ export interface LiveNotificationWindow {
   activeThreadId: string | null;
   activeTurnId: string | null;
   startCount: number;
+  startIsProvisional?: boolean;
 }
 
 interface VisibleLiveTurnOptions {
@@ -665,7 +666,7 @@ export function notificationCountBeforeTurnStart(
 ): number | null {
   if (!scope.activeTurnId) return null;
   const firstNotificationCount = totalCount - notifications.length + 1;
-  for (let index = notifications.length - 1; index >= 0; index -= 1) {
+  for (let index = 0; index < notifications.length; index += 1) {
     const notification = notifications[index];
     if (!isRecord(notification) || notification.method !== 'turn/started') continue;
     if (!notificationMatchesActiveTurn(notification, scope)) continue;
@@ -1586,19 +1587,36 @@ export function nextLiveNotificationWindow(
   const pendingStartCount = typeof options.pendingStartCount === 'number' ? options.pendingStartCount : null;
   const turnStartCount = typeof options.turnStartCount === 'number' ? options.turnStartCount : null;
   const newWindowStartCount = pendingStartCount ?? turnStartCount ?? notificationCount;
+  const needsTurnStartAnchor = Boolean(
+    scope.activeTurnId &&
+    !isSyntheticPendingTurnId(scope.activeTurnId) &&
+    pendingStartCount === null &&
+    turnStartCount === null
+  );
 
   if (current.activeThreadId !== scope.activeThreadId) {
-    return { ...scope, startCount: newWindowStartCount };
+    return {
+      ...scope,
+      startCount: newWindowStartCount,
+      ...(needsTurnStartAnchor ? { startIsProvisional: true } : {}),
+    };
   }
   if (pendingStartCount !== null && !scope.activeTurnId) {
     return { ...scope, startCount: pendingStartCount };
   }
   if (scope.activeTurnId && current.activeTurnId !== scope.activeTurnId) {
     const keepCurrentStart = current.activeTurnId === null || isSyntheticPendingTurnId(current.activeTurnId);
-    return { ...scope, startCount: keepCurrentStart ? current.startCount : newWindowStartCount };
+    const startIsProvisional = keepCurrentStart
+      ? current.startIsProvisional
+      : needsTurnStartAnchor;
+    return {
+      ...scope,
+      startCount: keepCurrentStart ? current.startCount : newWindowStartCount,
+      ...(startIsProvisional ? { startIsProvisional: true } : {}),
+    };
   }
-  if (scope.activeTurnId && current.activeTurnId === scope.activeTurnId && turnStartCount !== null && turnStartCount !== current.startCount) {
-    return { ...current, startCount: turnStartCount };
+  if (scope.activeTurnId && current.activeTurnId === scope.activeTurnId && current.startIsProvisional && turnStartCount !== null) {
+    return { ...scope, startCount: turnStartCount };
   }
   if (!current.activeTurnId && !scope.activeTurnId) {
     return { ...scope, startCount: notificationCount };

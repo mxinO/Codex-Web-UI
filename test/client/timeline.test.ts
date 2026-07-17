@@ -611,6 +611,7 @@ describe('timeline', () => {
       activeThreadId: 'thread-1',
       activeTurnId: 'turn-2',
       startCount: 25,
+      startIsProvisional: true,
     });
     expect(nextLiveNotificationWindow(current, { activeThreadId: 'thread-2', activeTurnId: null }, 30)).toEqual({
       activeThreadId: 'thread-2',
@@ -644,15 +645,45 @@ describe('timeline', () => {
     expect(notificationsSinceCount(notifications, 25, window.startCount)).toEqual(notifications);
   });
 
+  it('keeps the original turn start anchor when the same start is repeated', () => {
+    const notifications = [
+      { method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'inProgress' } } },
+      { method: 'item/completed', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'cmd-1' } } },
+      { method: 'turn/started', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'inProgress' } } },
+      { method: 'item/started', params: { threadId: 'thread-1', turnId: 'turn-1', item: { id: 'tool-1' } } },
+    ];
+
+    expect(
+      notificationCountBeforeTurnStart(
+        notifications,
+        14,
+        { activeThreadId: 'thread-1', activeTurnId: 'turn-1' },
+      ),
+    ).toBe(10);
+  });
+
   it('moves a provisional autonomous window forward when its delayed start anchor arrives', () => {
     expect(
       nextLiveNotificationWindow(
-        { activeThreadId: 'thread-1', activeTurnId: 'turn-2', startCount: 20 },
+        { activeThreadId: 'thread-1', activeTurnId: 'turn-2', startCount: 20, startIsProvisional: true },
         { activeThreadId: 'thread-1', activeTurnId: 'turn-2' },
         24,
         { turnStartCount: 22 },
       ),
     ).toEqual({ activeThreadId: 'thread-1', activeTurnId: 'turn-2', startCount: 22 });
+  });
+
+  it('does not move an established turn anchor after its original start is evicted', () => {
+    const current = { activeThreadId: 'thread-1', activeTurnId: 'turn-2', startCount: 20 };
+
+    expect(
+      nextLiveNotificationWindow(
+        current,
+        { activeThreadId: 'thread-1', activeTurnId: 'turn-2' },
+        5000,
+        { turnStartCount: 3999 },
+      ),
+    ).toBe(current);
   });
 
   it('does not create an empty waiting chat item for an active turn with no assistant text', () => {
