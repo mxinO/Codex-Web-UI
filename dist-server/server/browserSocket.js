@@ -128,6 +128,7 @@ const MODEL_CAPACITY_RETRY_PROMPT = 'The previous turn was aborted. Carefully re
 const MODEL_CAPACITY_RECONCILE_PAGE_LIMIT = 100;
 const MODEL_CAPACITY_RECONCILE_MAX_PAGES = 20;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const BROWSER_HEARTBEAT_INTERVAL_MS = 15_000;
 function getOptionalString(params, key) {
     if (!isRecord(params) || !hasOwn(params, key))
         return null;
@@ -1186,6 +1187,29 @@ function patchApplyPayload(message) {
 }
 export function attachBrowserSocket(server, deps) {
     const wss = new WebSocketServer({ server, path: '/ws' });
+    const responsiveBrowserClients = new WeakSet();
+    const heartbeatIntervalMs = deps.browserHeartbeatIntervalMs ?? BROWSER_HEARTBEAT_INTERVAL_MS;
+    const heartbeatTimer = setInterval(() => {
+        const sentAt = Date.now();
+        for (const client of wss.clients) {
+            if (client.readyState !== WebSocket.OPEN)
+                continue;
+            if (!responsiveBrowserClients.has(client)) {
+                client.terminate();
+                continue;
+            }
+            responsiveBrowserClients.delete(client);
+            try {
+                client.ping();
+                send(client, { type: 'server/heartbeat', sentAt });
+            }
+            catch (error) {
+                logWarn('Browser WebSocket heartbeat failed', error);
+                client.terminate();
+            }
+        }
+    }, heartbeatIntervalMs);
+    heartbeatTimer.unref();
     let closed = false;
     let queuedStartInFlight = null;
     let queuedSteerInFlight = null;
@@ -3666,6 +3690,7 @@ export function attachBrowserSocket(server, deps) {
         if (closed)
             return;
         closed = true;
+        clearInterval(heartbeatTimer);
         clearModelCapacityTimers();
         invalidateRetainedDirectStartContexts();
         compactionsInFlight.clear();
@@ -3687,6 +3712,8 @@ export function attachBrowserSocket(server, deps) {
         logWarn('Browser WebSocket server error', err);
     });
     wss.on('connection', (ws, req) => {
+        responsiveBrowserClients.add(ws);
+        ws.on('pong', () => responsiveBrowserClients.add(ws));
         ws.on('error', (err) => {
             logWarn('Browser WebSocket client error', err);
         });

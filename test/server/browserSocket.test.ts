@@ -72,6 +72,7 @@ async function makeHarness(
     headers?: Record<string, string>;
     modelCapacityRetryDelayMs?: number;
     modelCapacityReconcileDelayMs?: number;
+    browserHeartbeatIntervalMs?: number;
   } = {},
 ) {
   const server = http.createServer();
@@ -116,6 +117,7 @@ async function makeHarness(
     startCwd: options.startCwd,
     modelCapacityRetryDelayMs: options.modelCapacityRetryDelayMs,
     modelCapacityReconcileDelayMs: options.modelCapacityReconcileDelayMs,
+    browserHeartbeatIntervalMs: options.browserHeartbeatIntervalMs,
   });
 
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -145,7 +147,7 @@ async function makeHarness(
     healthHandler?.();
   };
 
-  return { ws, stateStore, notify, notifyRaw, requestFromServer, emitHealthChange, respond, start, restart, health, port, initialHello };
+  return { ws, stateStore, notify, notifyRaw, requestFromServer, emitHealthChange, respond, start, restart, health, port, initialHello, cleanup };
 }
 
 function nextMessage(ws: WebSocket): Promise<RpcMessage> {
@@ -159,6 +161,22 @@ function nextMessages(ws: WebSocket, count: number): Promise<RpcMessage[]> {
     const messages: RpcMessage[] = [];
     const onMessage = (data: RawData) => {
       messages.push(JSON.parse(String(data)) as RpcMessage);
+      if (messages.length === count) {
+        ws.off('message', onMessage);
+        resolve(messages);
+      }
+    };
+    ws.on('message', onMessage);
+  });
+}
+
+function nextMessagesOfType(ws: WebSocket, type: string, count: number): Promise<RpcMessage[]> {
+  return new Promise((resolve) => {
+    const messages: RpcMessage[] = [];
+    const onMessage = (data: RawData) => {
+      const message = JSON.parse(String(data)) as RpcMessage;
+      if (message.type !== type) return;
+      messages.push(message);
       if (messages.length === count) {
         ws.off('message', onMessage);
         resolve(messages);
@@ -329,6 +347,41 @@ describe('attachBrowserSocket auth', () => {
 
     expect(initialHello).toEqual({ type: 'auth/error' });
     expect(request).not.toHaveBeenCalled();
+  });
+});
+
+describe('attachBrowserSocket heartbeat', () => {
+  it('keeps responsive clients alive and isolates a client that does not pong', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ data: [] });
+    const { ws, port } = await makeHarness(request, { browserHeartbeatIntervalMs: 20 });
+    const responsiveHeartbeats = nextMessagesOfType(ws, 'server/heartbeat', 3);
+    const unresponsive = new WebSocket(`ws://127.0.0.1:${port}/ws`, { autoPong: false });
+    cleanups.push(() => unresponsive.terminate());
+
+    await new Promise<void>((resolve) => unresponsive.once('open', resolve));
+    await new Promise<void>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('unresponsive browser socket was not terminated')), 1_000);
+      unresponsive.once('close', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+
+    expect(await responsiveHeartbeats).toHaveLength(3);
+    expect(ws.readyState).toBe(WebSocket.OPEN);
+    expect(await nextMessagesOfType(ws, 'server/heartbeat', 1)).toHaveLength(1);
+  });
+
+  it('closes clients and stops cleanly while the heartbeat interval is active', async () => {
+    const request = vi.fn<CodexAppServer['request']>().mockResolvedValue({ data: [] });
+    const { ws, cleanup } = await makeHarness(request, { browserHeartbeatIntervalMs: 20 });
+    await nextMessagesOfType(ws, 'server/heartbeat', 1);
+    const closed = new Promise<void>((resolve) => ws.once('close', () => resolve()));
+
+    cleanup.close();
+
+    await closed;
+    expect(ws.readyState).toBe(WebSocket.CLOSED);
   });
 });
 

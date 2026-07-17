@@ -3,7 +3,7 @@
 import { act } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { useCodexSocket } from '../../src/hooks/useCodexSocket';
+import { BROWSER_SOCKET_LIVENESS_TIMEOUT_MS, useCodexSocket } from '../../src/hooks/useCodexSocket';
 import { timelineNotificationMeta } from '../../src/lib/timeline';
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -73,6 +73,7 @@ beforeEach(() => {
   window.sessionStorage.clear();
   vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response('{}', { status: 200 })));
   vi.stubGlobal('WebSocket', MockWebSocket);
+  Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
 });
 
 afterEach(() => {
@@ -292,6 +293,118 @@ describe('useCodexSocket', () => {
 
     expect(currentSocket?.reconnectEpoch).toBe(1);
     expect(currentSocket?.notifications).toHaveLength(1);
+  });
+
+  it('keeps a socket live when server heartbeats arrive without retaining them', async () => {
+    await renderHook();
+    const ws = MockWebSocket.instances[0];
+    act(() => ws.open());
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(BROWSER_SOCKET_LIVENESS_TIMEOUT_MS - 1_000);
+    });
+    act(() => {
+      ws.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({ type: 'server/heartbeat', sentAt: Date.now() }),
+        }),
+      );
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(BROWSER_SOCKET_LIVENESS_TIMEOUT_MS - 1_000);
+    });
+
+    expect(currentSocket?.connectionState).toBe('connected');
+    expect(currentSocket?.notifications).toEqual([]);
+    expect(currentSocket?.notificationCount).toBe(0);
+    expect(MockWebSocket.instances).toHaveLength(1);
+  });
+
+  it('defers stale-socket recovery while hidden and reconnects once when visible', async () => {
+    await renderHook();
+    const first = MockWebSocket.instances[0];
+    act(() => first.open());
+    Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(BROWSER_SOCKET_LIVENESS_TIMEOUT_MS * 2);
+    });
+    expect(currentSocket?.connectionState).toBe('connected');
+    expect(MockWebSocket.instances).toHaveLength(1);
+
+    act(() => {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    expect(currentSocket?.connectionState).toBe('disconnected');
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+      await Promise.resolve();
+    });
+    expect(MockWebSocket.instances).toHaveLength(2);
+  });
+
+  it('recovers a stale socket with its replay cursor and ignores late old-socket callbacks', async () => {
+    await renderHook();
+    const first = MockWebSocket.instances[0];
+    act(() => {
+      first.open();
+      first.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'codex/notification',
+            streamId: 'stream-1',
+            seq: 7,
+            message: { method: 'item/agentMessage/delta', params: { itemId: 'agent-1', delta: 'before-timeout' } },
+          }),
+        }),
+      );
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(125);
+    });
+    const pendingRpc = currentSocket!.rpc('slow.method', {}, 120_000);
+    const rejection = expect(pendingRpc).rejects.toThrow('socket heartbeat timed out');
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(BROWSER_SOCKET_LIVENESS_TIMEOUT_MS - 125);
+    });
+    await rejection;
+
+    expect(currentSocket?.connectionState).toBe('disconnected');
+    expect(currentSocket?.notifications).toHaveLength(1);
+    expect(window.localStorage.getItem(`codex-web-ui:notificationReplay:${window.location.host}`)).toBe(
+      JSON.stringify({ streamId: 'stream-1', seq: 7 }),
+    );
+
+    act(() => {
+      first.onmessage?.(
+        new MessageEvent('message', {
+          data: JSON.stringify({
+            type: 'codex/notification',
+            streamId: 'stream-1',
+            seq: 8,
+            message: { method: 'item/agentMessage/delta', params: { itemId: 'agent-1', delta: 'late' } },
+          }),
+        }),
+      );
+      first.onclose?.();
+    });
+    expect(currentSocket?.notifications).toHaveLength(1);
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(250);
+      await Promise.resolve();
+    });
+    expect(MockWebSocket.instances).toHaveLength(2);
+    const second = MockWebSocket.instances[1];
+    act(() => second.open());
+    expect(JSON.parse(second.sent[0])).toEqual({
+      type: 'client/hello',
+      params: { lastNotificationStreamId: 'stream-1', lastNotificationSeq: 7 },
+    });
+    expect(currentSocket?.reconnectEpoch).toBe(1);
   });
 
   it('increments replay gap epoch when the server cannot replay a contiguous notification range', async () => {

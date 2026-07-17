@@ -9,6 +9,7 @@
 ### Fixed
 
 - Allowed dependency install scripts during `codex-web-ui --update`, ensuring native dependencies such as `better-sqlite3` are installed correctly.
+- Added browser WebSocket heartbeats and stale-connection recovery so live progress resumes automatically after silent network or SSH tunnel failures.
 
 ## 0.3.9 - 2026-06-30
 

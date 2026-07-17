@@ -37,6 +37,7 @@ interface ServerHello {
 
 type ServerMessage =
   | ServerHello
+  | { type: 'server/heartbeat'; sentAt: number }
   | { type: 'rpc/result'; id: number; result: unknown }
   | { type: 'rpc/error'; id: number; error: string }
   | { type: 'codex/notification'; streamId?: string; seq?: number; message: unknown }
@@ -48,6 +49,7 @@ type ServerMessage =
 const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 const MAX_RETAINED_NOTIFICATIONS = 5000;
 const NOTIFICATION_FLUSH_DELAY_MS = 125;
+export const BROWSER_SOCKET_LIVENESS_TIMEOUT_MS = 45_000;
 const TRANSIENT_AUTH_REJECTION_RETRIES = 3;
 const AUTH_CHECK_TIMEOUT_MS = 10_000;
 const UNRETAINED_OUTPUT_NOTIFICATION_METHODS = new Set([
@@ -410,6 +412,16 @@ export function useCodexSocket() {
   useEffect(() => {
     let stopped = false;
     let retry = 250;
+    let socketLivenessTimer: number | null = null;
+    let socketLivenessOwner: WebSocket | null = null;
+    let lastInboundAt = 0;
+
+    const clearSocketLiveness = (owner?: WebSocket) => {
+      if (owner && socketLivenessOwner !== owner) return;
+      if (socketLivenessTimer !== null) window.clearTimeout(socketLivenessTimer);
+      socketLivenessTimer = null;
+      socketLivenessOwner = null;
+    };
 
     const clearReconnectTimer = () => {
       if (reconnectTimerRef.current === null) return;
@@ -425,6 +437,45 @@ export function useCodexSocket() {
         void connect();
       }, retry);
       retry = Math.min(5_000, retry * 1.6);
+    };
+
+    const detachStaleSocket = (ws: WebSocket) => {
+      if (stopped || wsRef.current !== ws) return;
+      wsRef.current = null;
+      clearSocketLiveness(ws);
+      flushNotifications();
+      rejectPending(new Error('socket heartbeat timed out'));
+      setTrackedConnectionState('disconnected');
+      ws.close();
+      scheduleReconnect();
+    };
+
+    const checkSocketLiveness = (ws: WebSocket) => {
+      if (stopped || wsRef.current !== ws || socketLivenessOwner !== ws) return;
+      if (socketLivenessTimer !== null) window.clearTimeout(socketLivenessTimer);
+      socketLivenessTimer = null;
+      const remaining = BROWSER_SOCKET_LIVENESS_TIMEOUT_MS - (Date.now() - lastInboundAt);
+      if (remaining > 0) {
+        socketLivenessTimer = window.setTimeout(() => checkSocketLiveness(ws), remaining);
+        return;
+      }
+      if (document.visibilityState === 'hidden') return;
+      detachStaleSocket(ws);
+    };
+
+    const markSocketLive = (ws: WebSocket) => {
+      if (stopped || wsRef.current !== ws) return;
+      if (socketLivenessTimer !== null) window.clearTimeout(socketLivenessTimer);
+      socketLivenessOwner = ws;
+      lastInboundAt = Date.now();
+      socketLivenessTimer = window.setTimeout(() => checkSocketLiveness(ws), BROWSER_SOCKET_LIVENESS_TIMEOUT_MS);
+    };
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState !== 'visible') return;
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      checkSocketLiveness(ws);
     };
 
     const handleAuthRejected = (options: { schedule: boolean }) => {
@@ -495,6 +546,7 @@ export function useCodexSocket() {
         }
         hasConnectedRef.current = true;
         setTrackedConnectionState('connected');
+        markSocketLive(ws);
         const replayState = storedReplayStateRef.current;
         ws.send(
           JSON.stringify({
@@ -512,8 +564,11 @@ export function useCodexSocket() {
         if (typeof event.data !== 'string') return;
         const message = parseServerMessage(event.data);
         if (!message) return;
+        markSocketLive(ws);
 
-        if (message.type === 'server/hello') {
+        if (message.type === 'server/heartbeat') {
+          return;
+        } else if (message.type === 'server/hello') {
           forceWebSocketTokenRef.current = false;
           authRejectionCountRef.current = 0;
           rememberNotificationStream(message.notificationStreamId);
@@ -562,6 +617,7 @@ export function useCodexSocket() {
       ws.onclose = () => {
         if (wsRef.current !== ws) return;
         wsRef.current = null;
+        clearSocketLiveness(ws);
         flushNotifications();
         rejectPending(new Error('socket closed'));
         if (stopped || connectionStateRef.current === 'auth-error') return;
@@ -575,11 +631,14 @@ export function useCodexSocket() {
       };
     };
 
+    document.addEventListener('visibilitychange', handleVisibilityChange);
     void connect();
 
     return () => {
       stopped = true;
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
       clearReconnectTimer();
+      clearSocketLiveness();
       rejectPending(new Error('socket closed'));
       clearNotificationBuffer();
       wsRef.current?.close();

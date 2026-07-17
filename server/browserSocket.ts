@@ -62,6 +62,7 @@ interface BrowserSocketDeps {
   startCwd?: string;
   modelCapacityRetryDelayMs?: number;
   modelCapacityReconcileDelayMs?: number;
+  browserHeartbeatIntervalMs?: number;
 }
 
 interface BrowserRequest {
@@ -244,6 +245,7 @@ const MODEL_CAPACITY_RETRY_PROMPT = 'The previous turn was aborted. Carefully re
 const MODEL_CAPACITY_RECONCILE_PAGE_LIMIT = 100;
 const MODEL_CAPACITY_RECONCILE_MAX_PAGES = 20;
 const MAX_TIMER_DELAY_MS = 2_147_483_647;
+const BROWSER_HEARTBEAT_INTERVAL_MS = 15_000;
 
 function getOptionalString(params: unknown, key: string): string | null {
   if (!isRecord(params) || !hasOwn(params, key)) return null;
@@ -1372,6 +1374,27 @@ function patchApplyPayload(message: { params?: unknown; payload?: unknown }): Re
 
 export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps): BrowserSocketCleanup {
   const wss = new WebSocketServer({ server, path: '/ws' });
+  const responsiveBrowserClients = new WeakSet<WebSocket>();
+  const heartbeatIntervalMs = deps.browserHeartbeatIntervalMs ?? BROWSER_HEARTBEAT_INTERVAL_MS;
+  const heartbeatTimer = setInterval(() => {
+    const sentAt = Date.now();
+    for (const client of wss.clients) {
+      if (client.readyState !== WebSocket.OPEN) continue;
+      if (!responsiveBrowserClients.has(client)) {
+        client.terminate();
+        continue;
+      }
+      responsiveBrowserClients.delete(client);
+      try {
+        client.ping();
+        send(client, { type: 'server/heartbeat', sentAt });
+      } catch (error) {
+        logWarn('Browser WebSocket heartbeat failed', error);
+        client.terminate();
+      }
+    }
+  }, heartbeatIntervalMs);
+  heartbeatTimer.unref();
   let closed = false;
   let queuedStartInFlight: { threadId: string; queuedMessage: QueuedMessage } | null = null;
   let queuedSteerInFlight: QueuedSteerInFlight | null = null;
@@ -3941,6 +3964,7 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   const close = () => {
     if (closed) return;
     closed = true;
+    clearInterval(heartbeatTimer);
     clearModelCapacityTimers();
     invalidateRetainedDirectStartContexts();
     compactionsInFlight.clear();
@@ -3964,6 +3988,8 @@ export function attachBrowserSocket(server: http.Server, deps: BrowserSocketDeps
   });
 
   wss.on('connection', (ws, req) => {
+    responsiveBrowserClients.add(ws);
+    ws.on('pong', () => responsiveBrowserClients.add(ws));
     ws.on('error', (err) => {
       logWarn('Browser WebSocket client error', err);
     });
